@@ -1,0 +1,8 @@
+.env
+.git
+.zig-cache
+zig-out
+deploy/config
+deploy/data
+deploy/downloads
+deploy/incomplete-downloads
