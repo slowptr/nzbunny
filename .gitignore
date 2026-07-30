@@ -1,0 +1,10 @@
+/.env
+/.zig-cache/
+/zig-out/
+/nzigbunny.db
+/nzigbunny.db-shm
+/nzigbunny.db-wal
+/deploy/config/
+/deploy/data/
+/deploy/downloads/
+/deploy/incomplete-downloads/
