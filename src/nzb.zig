@@ -91,6 +91,8 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
     }
     var in_file = false;
     var in_segment = false;
+    var in_head = false;
+    var in_password_meta = false;
     var saw_root = false;
     var segment_number: u32 = 0;
     var segment_bytes: u64 = 0;
@@ -131,11 +133,15 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
             continue;
         }
         if (node_type == c.XML_READER_TYPE_ELEMENT) {
-            validateNamespace(reader) catch |err| {
-                setDiag(diag, reader);
-                return err;
-            };
             const name = xmlText(c.xmlTextReaderConstLocalName(reader));
+            const is_structural = std.mem.eql(u8, name, "nzb") or std.mem.eql(u8, name, "file") or
+                std.mem.eql(u8, name, "segments") or std.mem.eql(u8, name, "segment");
+            if (!in_head or is_structural) {
+                validateNamespace(reader) catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                };
+            }
             if (!saw_root) {
                 if (!std.mem.eql(u8, name, "nzb")) {
                     setDiag(diag, reader);
@@ -150,6 +156,8 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                 }
                 in_file = true;
                 current_segments.clearRetainingCapacity();
+            } else if (std.mem.eql(u8, name, "head")) {
+                in_head = true;
             } else if (std.mem.eql(u8, name, "segment") and in_file) {
                 in_segment = true;
                 segment_number = (attrInt(u32, reader, "number") catch |err| {
@@ -175,10 +183,8 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                     return error.InvalidSegmentBytes;
                 }
             } else if (std.mem.eql(u8, name, "meta")) {
-                if (hasPasswordMeta(reader)) {
-                    setDiag(diag, reader);
-                    return error.PasswordProtectedNzb;
-                }
+                in_password_meta = false;
+                if (hasPasswordMeta(reader)) in_password_meta = true;
             }
             continue;
         }
@@ -204,10 +210,23 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
             }
             continue;
         }
+        if (node_type == c.XML_READER_TYPE_TEXT and in_password_meta) {
+            const trimmed = std.mem.trim(u8, xmlText(c.xmlTextReaderConstValue(reader)), " \t\r\n");
+            if (trimmed.len > 0) {
+                setDiag(diag, reader);
+                return error.PasswordProtectedNzb;
+            }
+            continue;
+        }
         if (node_type == c.XML_READER_TYPE_END_ELEMENT) {
             const name = xmlText(c.xmlTextReaderConstLocalName(reader));
             if (std.mem.eql(u8, name, "segment")) {
                 in_segment = false;
+            } else if (std.mem.eql(u8, name, "head")) {
+                in_head = false;
+                in_password_meta = false;
+            } else if (std.mem.eql(u8, name, "meta")) {
+                in_password_meta = false;
             } else if (std.mem.eql(u8, name, "file") and in_file) {
                 validateSegments(current_segments.items) catch |err| {
                     setDiag(diag, reader);
@@ -477,6 +496,51 @@ test "entity references inside comments are not rejected" {
 test "entity declarations inside comments are not rejected" {
     const text =
         \\<nzb><!-- <!ENTITY foo "bar"> --><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    var doc = try parse(std.testing.allocator, text);
+    doc.deinit(std.testing.allocator);
+}
+
+test "silently skips foreign-namespaced elements inside head" {
+    const text =
+        \\<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+        \\  <head>
+        \\    <meta type="x" xmlns="http://other.com/ns">value</meta>
+        \\  </head>
+        \\  <file><segments><segment bytes="1" number="1">a@b</segment></segments></file>
+        \\</nzb>
+    ;
+    var doc = try parse(std.testing.allocator, text);
+    doc.deinit(std.testing.allocator);
+}
+
+test "foreign-namespaced structural element inside head is still rejected" {
+    const text =
+        \\<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+        \\  <head>
+        \\    <file xmlns="http://other.com/ns"><segments><segment bytes="1" number="1">a@b</segment></segments></file>
+        \\  </head>
+        \\  <file><segments><segment bytes="2" number="1">b@c</segment></segments></file>
+        \\</nzb>
+    ;
+    try std.testing.expectError(error.UnsupportedNzbNamespace, parse(std.testing.allocator, text));
+}
+
+test "empty password meta is not rejected" {
+    const text =
+        \\<nzb><head><meta type="password"></meta></head><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    var doc = try parse(std.testing.allocator, text);
+    doc.deinit(std.testing.allocator);
+}
+
+test "whitespace-only password meta is not rejected" {
+    const text =
+        \\<nzb><head><meta type="password">   </meta></head><file><segments>
         \\<segment bytes="1" number="1">a@b</segment>
         \\</segments></file></nzb>
     ;

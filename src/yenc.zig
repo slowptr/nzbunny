@@ -172,11 +172,22 @@ fn optionalHex(line: []const u8, key: []const u8) !?u32 {
 }
 
 fn field(line: []const u8, key: []const u8) !?[]const u8 {
-    const start = std.mem.indexOf(u8, line, key) orelse return null;
-    if (std.mem.indexOfPos(u8, line, start + key.len, key) != null) return error.DuplicateYencField;
+    const start = findFieldKey(line, key, 0) orelse return null;
+    if (findFieldKey(line, key, start + 1) != null) return error.DuplicateYencField;
     const rest = line[start + key.len ..];
+    if (std.mem.eql(u8, key, "name=")) return rest;
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return rest[0..end];
+}
+
+fn findFieldKey(line: []const u8, key: []const u8, offset: usize) ?usize {
+    var pos = offset;
+    while (pos < line.len) {
+        const found = std.mem.indexOfPos(u8, line, pos, key) orelse return null;
+        if (found == 0 or line[found - 1] == ' ') return found;
+        pos = found + 1;
+    }
+    return null;
 }
 
 fn validateName(name: []const u8) !void {
@@ -265,4 +276,16 @@ test "max size rejects yEnc exceeding artifact limit" {
     var decoder = Decoder.init(std.testing.allocator, &out.writer, 10);
     defer decoder.deinit();
     try std.testing.expectError(error.YencSizeExceedsBudget, decoder.consumeLine("=ybegin line=128 size=11 name=a.bin"));
+}
+
+test "field key inside name value does not cause false match" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin line=128 size=3 name=size=5.bin");
+    try decoder.consumeLine("\x8b\x8c\x8d");
+    try decoder.consumeLine("=yend size=3");
+    _ = try decoder.finish();
+    try std.testing.expectEqualStrings("abc", out.writer.buffered());
 }

@@ -334,6 +334,9 @@ fn fetchItemOnce(
         }
     }
     const meta = try decoder.finish();
+    if (ctx.files[file_index].segments.len == 1) {
+        if (meta.part != 0) return error.YencPartMismatch;
+    } else if (meta.part != segment.number) return error.YencPartMismatch;
     try file_writer.interface.flush();
     try out_file.sync(ctx.io);
 

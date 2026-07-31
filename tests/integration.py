@@ -24,7 +24,10 @@ REMOVED = (
 
 ALLOW = {
     Path("docs/embedded-downloader-plan.md"),
+    Path("docs/embedded-downloader-remaining.md"),
+    Path("docs/embedded-downloader-remediation-handoff.md"),
     Path("src/database.zig"),
+    Path("tests/integration.py"),
 }
 
 
@@ -32,7 +35,10 @@ def test_residual_references(root):
     scanned = []
     for path in (
         list((root / "src").glob("*.zig"))
-        + [root / "readme.txt", root / "ARCHITECTURE.md", root / "Dockerfile", root / "deploy/docker-compose.yml"]
+        + list((root / "docs").glob("*.md"))
+        + list((root / "deploy").glob("*"))
+        + list((root / "tests").glob("*.py"))
+        + [root / "readme.txt", root / "ARCHITECTURE.md", root / "Dockerfile", root / ".env.example"]
     ):
         rel = path.relative_to(root)
         if rel in ALLOW:
