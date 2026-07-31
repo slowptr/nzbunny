@@ -26,6 +26,7 @@ const Limits = struct {
 
 const max_entries = 10_000;
 const max_depth = 128;
+const io_buffer_size = 64 * 1024;
 
 pub fn prepare(
     allocator: std.mem.Allocator,
@@ -34,6 +35,8 @@ pub fn prepare(
     source: []const u8,
     max_bytes: u64,
 ) !Result {
+    const io_buffer = try allocator.alloc(u8, io_buffer_size);
+    defer allocator.free(io_buffer);
     var source_buffer: [c.PATH_MAX]u8 = undefined;
     const resolved = try paths.resolveContained(root, source, &source_buffer);
     try paths.rejectSymlinks(root, source);
@@ -104,7 +107,7 @@ pub fn prepare(
     if (mode == c.S_IFREG) {
         const source_size: u64 = @intCast(source_fd.stat.st_size);
         if (source_size > max_bytes) return error.ArtifactTooLarge;
-        try copyFd(source_fd.fd, temp_fd, source_size);
+        try copyFd(source_fd.fd, temp_fd, source_size, io_buffer);
     } else {
         const archive = c.archive_write_new() orelse return error.ArchiveCreateFailed;
         defer _ = c.archive_write_free(archive);
@@ -116,7 +119,7 @@ pub fn prepare(
             if (archive_open) _ = c.archive_write_close(archive);
         }
         var limits = Limits{ .max_bytes = max_bytes };
-        try walkFd(archive, source_fd.fd, "", &limits, 0);
+        try walkFd(archive, source_fd.fd, "", &limits, 0, io_buffer);
         if (c.archive_write_close(archive) != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
         archive_open = false;
     }
@@ -156,6 +159,7 @@ fn walkFd(
     prefix: []const u8,
     limits: *Limits,
     depth: usize,
+    io_buffer: []u8,
 ) !void {
     if (depth > max_depth) return error.DirectoryTooDeep;
     const scan_fd = c.dup(dir_fd);
@@ -188,7 +192,7 @@ fn walkFd(
             var child_prefix: [c.PATH_MAX + 1]u8 = undefined;
             const next_prefix = std.fmt.bufPrint(&child_prefix, "{s}{s}/", .{ prefix, name }) catch
                 return error.NameTooLong;
-            try walkFd(archive, opened.fd, next_prefix, limits, depth + 1);
+            try walkFd(archive, opened.fd, next_prefix, limits, depth + 1, io_buffer);
             continue;
         }
         const mode = opened.stat.st_mode & c.S_IFMT;
@@ -199,16 +203,15 @@ fn walkFd(
         var entry_name: [c.PATH_MAX + 1]u8 = undefined;
         const archive_name = std.fmt.bufPrint(&entry_name, "{s}{s}", .{ prefix, name }) catch
             return error.NameTooLong;
-        try addFd(archive, opened.fd, archive_name, size);
+        try addFd(archive, opened.fd, archive_name, size, io_buffer);
     }
 }
 
-fn copyFd(source_fd: c_int, destination_fd: c_int, expected_size: u64) !void {
+fn copyFd(source_fd: c_int, destination_fd: c_int, expected_size: u64, buffer: []u8) !void {
     var copied: u64 = 0;
-    var buffer: [64 * 1024]u8 = undefined;
     while (copied < expected_size) {
         const wanted: usize = @intCast(@min(expected_size - copied, buffer.len));
-        const read_count = c.read(source_fd, &buffer, wanted);
+        const read_count = c.read(source_fd, buffer.ptr, wanted);
         if (read_count < 0) {
             if (std.c._errno().* == c.EINTR) continue;
             return error.ArtifactReadFailed;
@@ -257,7 +260,7 @@ fn openChild(parent_fd: c_int, name: [:0]const u8) !Opened {
     return .{ .fd = fd, .stat = stat, .is_dir = (stat.st_mode & c.S_IFMT) == c.S_IFDIR };
 }
 
-fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64) !void {
+fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buffer: []u8) !void {
     const entry = c.archive_entry_new() orelse return error.ArchiveEntryFailed;
     defer c.archive_entry_free(entry);
     var name_z: [c.PATH_MAX + 1]u8 = undefined;
@@ -266,12 +269,11 @@ fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64) !vo
     c.archive_entry_set_perm(entry, 0o600);
     c.archive_entry_set_size(entry, @intCast(size));
     if (c.archive_write_header(archive, entry) != c.ARCHIVE_OK) return error.ArchiveHeaderFailed;
-    var buffer: [64 * 1024]u8 = undefined;
     while (true) {
-        const n = c.read(fd, &buffer, buffer.len);
+        const n = c.read(fd, buffer.ptr, buffer.len);
         if (n == 0) break;
         if (n < 0) return error.ArtifactReadFailed;
-        if (c.archive_write_data(archive, &buffer, @intCast(n)) != n) return error.ArchiveWriteFailed;
+        if (c.archive_write_data(archive, buffer.ptr, @intCast(n)) != n) return error.ArchiveWriteFailed;
     }
 }
 

@@ -11,13 +11,70 @@ const SabResult = struct {
     storage: []const u8 = "",
 };
 
+const max_concurrent_finalizers = 2;
+
+const Finalizers = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db: *Database,
+    cfg: Config,
+    root: []const u8,
+    group: std.Io.Group = .init,
+    mutex: std.Io.Mutex = .init,
+    active: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *Finalizers) void {
+        self.group.cancel(self.io);
+        self.active.deinit(self.allocator);
+    }
+
+    fn schedule(self: *Finalizers, job: Job) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.active.contains(job.id) or self.active.count() >= max_concurrent_finalizers) return;
+
+        const task = try self.allocator.create(FinalizeTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .owner = self,
+            .id = try self.allocator.dupe(u8, job.id),
+            .download_path = undefined,
+        };
+        errdefer self.allocator.free(task.id);
+        task.download_path = try self.allocator.dupe(u8, job.download_path);
+        errdefer self.allocator.free(task.download_path);
+        try self.active.put(self.allocator, task.id, {});
+        self.group.async(self.io, runFinalize, .{task});
+    }
+
+    fn finished(self: *Finalizers, id: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        _ = self.active.remove(id);
+    }
+};
+
+const FinalizeTask = struct {
+    owner: *Finalizers,
+    id: []u8,
+    download_path: []u8,
+};
+
 pub fn run(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8) void {
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
+    var finalizers = Finalizers{
+        .allocator = allocator,
+        .io = io,
+        .db = db,
+        .cfg = cfg,
+        .root = root,
+    };
+    defer finalizers.deinit();
     var last_cleanup: i64 = 0;
     while (true) {
         const now = std.Io.Clock.real.now(io).toSeconds();
-        cycle(allocator, io, db, cfg, root, &client, now) catch |err|
+        cycle(allocator, io, db, cfg, &client, &finalizers, now) catch |err|
             std.log.err("The worker cycle failed: {t}", .{err});
         if (now - last_cleanup >= cfg.cleanup_seconds) {
             cleanup(allocator, io, db, cfg, root, &client, now) catch |err|
@@ -33,8 +90,8 @@ fn cycle(
     io: std.Io,
     db: *Database,
     cfg: Config,
-    root: []const u8,
     client: *std.http.Client,
+    finalizers: *Finalizers,
     now: i64,
 ) !void {
     const jobs = try db.listWork(io);
@@ -51,11 +108,8 @@ fn cycle(
                 std.log.err("Job {s} reconciliation failed: {t}", .{ job.id, err }),
             .processing => pollProcessing(job_allocator, io, db, cfg, client, job, now) catch |err|
                 std.log.err("Job {s} poll failed: {t}", .{ job.id, err }),
-            .finalizing => finalize(job_allocator, io, db, cfg, root, job, now) catch |err| {
-                std.log.err("Job {s} finalization failed: {t}", .{ job.id, err });
-                db.fail(io, job.id, "The output artifact could not be prepared.", now) catch |db_err|
-                    std.log.err("Job {s} failure state could not be saved: {t}", .{ job.id, db_err });
-            },
+            .finalizing => finalizers.schedule(job) catch |err|
+                std.log.err("Job {s} finalization could not be scheduled: {t}", .{ job.id, err }),
             else => {},
         }
     }
@@ -143,23 +197,39 @@ fn pollProcessing(
     }
 }
 
+fn runFinalize(task: *FinalizeTask) void {
+    const owner = task.owner;
+    defer {
+        owner.finished(task.id);
+        owner.allocator.free(task.download_path);
+        owner.allocator.free(task.id);
+        owner.allocator.destroy(task);
+    }
+    var arena = std.heap.ArenaAllocator.init(owner.allocator);
+    defer arena.deinit();
+    const now = std.Io.Clock.real.now(owner.io).toSeconds();
+    finalize(arena.allocator(), owner, task.id, task.download_path, now) catch |err| {
+        std.log.err("Job {s} finalization failed: {t}", .{ task.id, err });
+        owner.db.fail(owner.io, task.id, "The output artifact could not be prepared.", now) catch |db_err|
+            std.log.err("Job {s} failure state could not be saved: {t}", .{ task.id, db_err });
+    };
+}
+
 fn finalize(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    db: *Database,
-    cfg: Config,
-    root: []const u8,
-    job: Job,
+    owner: *Finalizers,
+    id: []const u8,
+    download_path: []const u8,
     now: i64,
 ) !void {
-    const result = try artifact.prepare(allocator, root, job.id, job.download_path, cfg.max_artifact_bytes);
+    const result = try artifact.prepare(allocator, owner.root, id, download_path, owner.cfg.max_artifact_bytes);
     var attempts: usize = 0;
     while (attempts < 4) : (attempts += 1) {
         var random: [32]u8 = undefined;
-        io.random(&random);
+        owner.io.random(&random);
         var token: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&token, "{x}", .{random}) catch unreachable;
-        const saved = db.complete(io, job.id, result.relative_path, result.size, &token, now + cfg.retention_seconds, now) catch |err| switch (err) {
+        const saved = owner.db.complete(owner.io, id, result.relative_path, result.size, &token, now + owner.cfg.retention_seconds, now) catch |err| switch (err) {
             error.DuplicateToken => continue,
             else => return err,
         };
@@ -362,8 +432,8 @@ fn fetchJson(
     headers: []const std.http.Header,
     timeout_seconds: u32,
 ) !std.json.Value {
-    const response_bytes = try allocator.alloc(u8, 2 * 1024 * 1024);
-    var response = std.Io.Writer.fixed(response_bytes);
+    var response = std.Io.Writer.Allocating.init(allocator);
+    defer response.deinit();
     const uri = std.Uri.parse(url) catch return error.InvalidSabnzbdUrl;
     var request = try client.request(method, uri, .{
         .keep_alive = false,
@@ -388,21 +458,16 @@ fn fetchJson(
     } else {
         try request.sendBodiless();
     }
-    var response_head = request.receiveHead(&.{}) catch |err| {
-        if (response.end == response.buffer.len) return error.SabnzbdResponseTooLarge;
-        return err;
-    };
+    var response_head = try request.receiveHead(&.{});
     if (response_head.head.status.class() != .success) return error.SabnzbdHttpError;
     const reader = response_head.reader(&.{});
-    _ = reader.streamRemaining(&response) catch |err| {
-        if (response.end == response.buffer.len) return error.SabnzbdResponseTooLarge;
+    _ = reader.streamRemaining(&response.writer) catch |err| {
         return switch (err) {
             error.ReadFailed => response_head.bodyErr().?,
             else => |stream_err| stream_err,
         };
     };
-    if (response.end == response_bytes.len) return error.SabnzbdResponseTooLarge;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.buffered(), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.writer.buffered(), .{});
     return parsed.value;
 }
 

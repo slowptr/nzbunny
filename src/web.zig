@@ -237,11 +237,29 @@ fn upload(
     const boundary = parseBoundary(content_type) catch
         return respondText(request, .bad_request, "The multipart boundary is not valid.");
 
-    const body = try allocator.alloc(u8, @intCast(length));
+    var random: [16]u8 = undefined;
+    context.io.random(&random);
+    var temp_name_buffer: [64]u8 = undefined;
+    const temp_name = std.fmt.bufPrint(&temp_name_buffer, ".nzigbunny-upload-{x}.tmp", .{random}) catch unreachable;
+    const temp_file = context.root_dir.createFile(context.io, temp_name, .{
+        .read = true,
+        .exclusive = true,
+        .permissions = @enumFromInt(0o600),
+    }) catch return respondText(request, .internal_server_error, "The upload could not be staged.");
+    defer temp_file.close(context.io);
+    defer context.root_dir.deleteFile(context.io, temp_name) catch |err|
+        std.log.err("Temporary upload cleanup failed for {s}: {t}", .{ temp_name, err });
+
     var body_buffer: [8192]u8 = undefined;
     const reader = try request.readerExpectContinue(&body_buffer);
-    reader.readSliceAll(body) catch return respondText(request, .bad_request, "The upload body is incomplete.");
-    const part = parseMultipart(body, boundary, context.cfg.max_upload_bytes) catch |err| switch (err) {
+    const part = streamMultipart(
+        allocator,
+        reader,
+        boundary,
+        temp_file,
+        context.io,
+        context.cfg.max_upload_bytes,
+    ) catch |err| switch (err) {
         error.FileTooLarge => return respondText(request, .payload_too_large, "The NZB file is too large."),
         error.EmptyFile => return respondText(request, .bad_request, "Select a non-empty NZB file."),
         error.UnsafeFilename => return respondText(request, .bad_request, "The file name is not safe."),
@@ -249,10 +267,11 @@ fn upload(
         else => return respondText(request, .bad_request, "The multipart upload is not valid."),
     };
     const filename = try normalizeFilename(allocator, part.filename);
-    const id = (context.db.createIfCapacity(
+    const id = (context.db.createFileIfCapacity(
         context.io,
         filename,
-        part.content,
+        temp_file,
+        part.size,
         now,
         context.cfg.max_active_jobs,
     ) catch return respondText(request, .internal_server_error, "The job could not be saved.")) orelse
@@ -376,6 +395,90 @@ fn download(
 }
 
 const MultipartPart = struct { filename: []const u8, content: []const u8 };
+const StreamedMultipartPart = struct { filename: []const u8, size: u64 };
+
+fn streamMultipart(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    boundary: []const u8,
+    file: std.Io.File,
+    io: std.Io,
+    max: u64,
+) !StreamedMultipartPart {
+    var opening_buffer: [76]u8 = undefined;
+    const opening = try std.fmt.bufPrint(&opening_buffer, "--{s}\r\n", .{boundary});
+    var actual_opening: [76]u8 = undefined;
+    reader.readSliceAll(actual_opening[0..opening.len]) catch return error.InvalidMultipart;
+    if (!std.mem.eql(u8, opening, actual_opening[0..opening.len])) return error.InvalidMultipart;
+
+    var headers = std.Io.Writer.Allocating.init(allocator);
+    defer headers.deinit();
+    while (true) {
+        if (headers.writer.end >= 16 * 1024) return error.InvalidMultipart;
+        const byte = reader.takeByte() catch return error.InvalidMultipart;
+        try headers.writer.writeByte(byte);
+        if (std.mem.endsWith(u8, headers.writer.buffered(), "\r\n\r\n")) break;
+    }
+    const header_bytes = headers.writer.buffered()[0 .. headers.writer.end - 4];
+    const raw_filename = try parsePartHeaders(header_bytes);
+    const filename = try allocator.dupe(u8, raw_filename);
+
+    var closing_buffer: [80]u8 = undefined;
+    const closing = try std.fmt.bufPrint(&closing_buffer, "\r\n--{s}--\r\n", .{boundary});
+    const chunk = try allocator.alloc(u8, 64 * 1024 + closing.len);
+    defer allocator.free(chunk);
+    var pending: usize = 0;
+    var size: u64 = 0;
+    var file_buffer: [8192]u8 = undefined;
+    var file_writer = file.writer(io, &file_buffer);
+    while (true) {
+        const count = reader.readSliceShort(chunk[pending..]) catch return error.InvalidMultipart;
+        const available = pending + count;
+        if (std.mem.findPosLinear(u8, chunk[0..available], 0, closing)) |pos| {
+            size = std.math.add(u64, size, pos) catch return error.FileTooLarge;
+            if (size > max) return error.FileTooLarge;
+            try file_writer.interface.writeAll(chunk[0..pos]);
+            if (pos + closing.len != available) return error.InvalidMultipart;
+            var extra: [1]u8 = undefined;
+            if ((reader.readSliceShort(&extra) catch return error.InvalidMultipart) != 0)
+                return error.InvalidMultipart;
+            try file_writer.interface.flush();
+            if (size == 0) return error.EmptyFile;
+            return .{ .filename = filename, .size = size };
+        }
+        if (count == 0) return error.InvalidMultipart;
+        if (available > closing.len) {
+            const write_len = available - closing.len;
+            size = std.math.add(u64, size, write_len) catch return error.FileTooLarge;
+            if (size > max) return error.FileTooLarge;
+            try file_writer.interface.writeAll(chunk[0..write_len]);
+            std.mem.copyForwards(u8, chunk[0..closing.len], chunk[write_len..available]);
+            pending = closing.len;
+        } else {
+            pending = available;
+        }
+    }
+}
+
+fn parsePartHeaders(headers: []const u8) ![]const u8 {
+    var filename: ?[]const u8 = null;
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "Content-Disposition:")) {
+            if (filename != null or std.mem.findPosLinear(u8, line, 0, "name=\"nzbfile\"") == null or
+                std.mem.findPosLinear(u8, line, 0, "filename*=") != null) return error.InvalidMultipart;
+            const key = "filename=\"";
+            const start = std.mem.findPosLinear(u8, line, 0, key) orelse return error.InvalidMultipart;
+            const rest = line[start + key.len ..];
+            const end = std.mem.findScalar(u8, rest, '"') orelse return error.InvalidMultipart;
+            filename = rest[0..end];
+        }
+    }
+    const name = filename orelse return error.InvalidMultipart;
+    if (name.len == 0 or std.mem.findAny(u8, name, "/\\\r\n\x00") != null) return error.UnsafeFilename;
+    if (!endsWithIgnoreCase(name, ".nzb")) return error.WrongFileType;
+    return name;
+}
 
 pub fn parseBoundary(content_type: []const u8) ![]const u8 {
     if (!std.ascii.startsWithIgnoreCase(content_type, "multipart/form-data;")) return error.InvalidBoundary;
@@ -396,22 +499,7 @@ pub fn parseMultipart(body: []const u8, boundary: []const u8, max: u64) !Multipa
     const head_end = std.mem.findPosLinear(u8, body, head_start, "\r\n\r\n") orelse return error.InvalidMultipart;
     const headers = body[head_start..head_end];
     if (std.mem.findPosLinear(u8, headers, 0, "\r\n\r\n") != null) return error.InvalidMultipart;
-    var filename: ?[]const u8 = null;
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        if (std.ascii.startsWithIgnoreCase(line, "Content-Disposition:")) {
-            if (filename != null or std.mem.findPosLinear(u8, line, 0, "name=\"nzbfile\"") == null or
-                std.mem.findPosLinear(u8, line, 0, "filename*=") != null) return error.InvalidMultipart;
-            const key = "filename=\"";
-            const start = std.mem.findPosLinear(u8, line, 0, key) orelse return error.InvalidMultipart;
-            const rest = line[start + key.len ..];
-            const end = std.mem.findScalar(u8, rest, '"') orelse return error.InvalidMultipart;
-            filename = rest[0..end];
-        }
-    }
-    const name = filename orelse return error.InvalidMultipart;
-    if (name.len == 0 or std.mem.findAny(u8, name, "/\\\r\n\x00") != null) return error.UnsafeFilename;
-    if (!endsWithIgnoreCase(name, ".nzb")) return error.WrongFileType;
+    const name = try parsePartHeaders(headers);
     const data_start = head_end + 4;
     var closing_buffer: [80]u8 = undefined;
     const closing = try std.fmt.bufPrint(&closing_buffer, "\r\n--{s}--\r\n", .{boundary});
