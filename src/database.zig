@@ -640,3 +640,68 @@ test "SQLite job transitions use compare and set" {
     try std.testing.expectEqual(@as(u64, 42), complete_job.artifact_size);
     try std.testing.expect(!try db.complete(io, id, "other.zip", 1, token, 200, 106));
 }
+
+test "schema version 1 migration converts in-flight jobs and preserves completed jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/v1.db", .{root_buffer[0..root_len]});
+    defer std.testing.allocator.free(db_path);
+
+    // Create a raw V1 database
+    const zpath = try std.heap.page_allocator.dupeZ(u8, db_path);
+    defer std.heap.page_allocator.free(zpath);
+    var handle: ?*c.sqlite3 = null;
+    const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_open_v2(zpath.ptr, &handle, flags, null));
+    const raw_db = handle.?;
+    defer _ = c.sqlite3_close(raw_db);
+
+    try exec(raw_db,
+        \\CREATE TABLE nzbunny_schema (version INTEGER NOT NULL);
+        \\INSERT INTO nzbunny_schema VALUES (1);
+        \\CREATE TABLE jobs (
+        \\  id TEXT PRIMARY KEY,
+        \\  filename TEXT NOT NULL,
+        \\  content BLOB,
+        \\  status TEXT NOT NULL,
+        \\  download_path TEXT,
+        \\  artifact_path TEXT,
+        \\  artifact_size INTEGER NOT NULL DEFAULT 0,
+        \\  download_token TEXT UNIQUE,
+        \\  fail_reason TEXT,
+        \\  created_at INTEGER NOT NULL,
+        \\  updated_at INTEGER NOT NULL,
+        \\  expires_at INTEGER,
+        \\  sab_name TEXT,
+        \\  nzo_id TEXT
+        \\);
+        \\INSERT INTO jobs VALUES ('j1', 'a.nzb', 'data', 'PENDING', NULL, NULL, 0, NULL, NULL, 100, 100, NULL, 'sab1', 'nzo1');
+        \\INSERT INTO jobs VALUES ('j2', 'b.nzb', NULL, 'PROCESSING', 'dl2', NULL, 0, NULL, NULL, 100, 100, NULL, 'sab2', 'nzo2');
+        \\INSERT INTO jobs VALUES ('j3', 'c.nzb', NULL, 'SUBMITTING', NULL, NULL, 0, NULL, NULL, 100, 100, NULL, 'sab3', 'nzo3');
+        \\INSERT INTO jobs VALUES ('j4', 'd.nzb', NULL, 'COMPLETE', 'dl4', 'art4.zip', 10, 'tok4', NULL, 100, 100, 500, 'sab4', 'nzo4');
+    );
+
+    // Open database via Database.open, triggering migration
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = try Database.open(arena.allocator(), db_path);
+    defer db.close();
+    const io = std.testing.io;
+
+    const j1 = (try db.get(io, "j1")).?;
+    try std.testing.expectEqual(Status.pending, j1.status);
+
+    const j2 = (try db.get(io, "j2")).?;
+    try std.testing.expectEqual(Status.failed, j2.status);
+    try std.testing.expectEqualStrings("Download was interrupted by the downloader upgrade; upload the NZB again.", j2.fail_reason);
+
+    const j3 = (try db.get(io, "j3")).?;
+    try std.testing.expectEqual(Status.failed, j3.status);
+
+    const j4 = (try db.getByToken(io, "tok4")).?;
+    try std.testing.expectEqual(Status.complete, j4.status);
+    try std.testing.expectEqualStrings("art4.zip", j4.artifact_path);
+}
+

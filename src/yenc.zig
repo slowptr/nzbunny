@@ -37,6 +37,7 @@ pub const Decoder = struct {
         }
         if (std.mem.startsWith(u8, line, "=ypart ")) {
             if (self.meta == null or !self.in_data) return error.YpartBeforeYbegin;
+            if (self.meta.?.part == 0) return error.YpartInSinglepart;
             const range = try parseYpart(line);
             var meta = self.meta.?;
             if (range.begin == 0 or range.end < range.begin or range.end > meta.size) return error.InvalidYencRange;
@@ -52,6 +53,8 @@ pub const Decoder = struct {
             if (end.part) |part| {
                 if (meta.part == 0) return error.UnexpectedMultipartEnd;
                 if (part != meta.part) return error.InvalidYencPart;
+            } else if (meta.part != 0) {
+                return error.MissingYencPart;
             }
             if (end.size != meta.decoded) return error.InvalidYencDecodedSize;
             if (meta.part != 0) {
@@ -139,26 +142,27 @@ fn parseYend(line: []const u8) !End {
 }
 
 fn requiredText(line: []const u8, key: []const u8) ![]const u8 {
-    return field(line, key) orelse error.MissingYencField;
+    return (try field(line, key)) orelse error.MissingYencField;
 }
 
 fn requiredInt(comptime T: type, line: []const u8, key: []const u8) !T {
-    const value = field(line, key) orelse return error.MissingYencField;
+    const value = (try field(line, key)) orelse return error.MissingYencField;
     return std.fmt.parseInt(T, value, 10) catch error.InvalidYencInteger;
 }
 
 fn optionalInt(comptime T: type, line: []const u8, key: []const u8) !?T {
-    const value = field(line, key) orelse return null;
+    const value = (try field(line, key)) orelse return null;
     return std.fmt.parseInt(T, value, 10) catch error.InvalidYencInteger;
 }
 
 fn optionalHex(line: []const u8, key: []const u8) !?u32 {
-    const value = field(line, key) orelse return null;
+    const value = (try field(line, key)) orelse return null;
     return std.fmt.parseInt(u32, value, 16) catch error.InvalidYencCrc;
 }
 
-fn field(line: []const u8, key: []const u8) ?[]const u8 {
+fn field(line: []const u8, key: []const u8) !?[]const u8 {
     const start = std.mem.indexOf(u8, line, key) orelse return null;
+    if (std.mem.indexOfPos(u8, line, start + key.len, key) != null) return error.DuplicateYencField;
     const rest = line[start + key.len ..];
     const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
     return rest[0..end];
@@ -208,3 +212,21 @@ test "rejects invalid multipart range" {
     try decoder.consumeLine("=ybegin part=1 line=128 size=3 name=a.bin");
     try std.testing.expectError(error.InvalidYencRange, decoder.consumeLine("=ypart begin=3 end=2"));
 }
+
+test "rejects duplicate yenc fields" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    defer decoder.deinit();
+    try std.testing.expectError(error.DuplicateYencField, decoder.consumeLine("=ybegin line=128 size=3 size=5 name=a.bin"));
+}
+
+test "rejects ypart for single-part yenc" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin line=128 size=3 name=a.bin");
+    try std.testing.expectError(error.YpartInSinglepart, decoder.consumeLine("=ypart begin=1 end=3"));
+}
+

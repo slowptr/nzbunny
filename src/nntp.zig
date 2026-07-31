@@ -52,10 +52,7 @@ pub const Session = struct {
         const host: std.Io.net.HostName = .{ .bytes = self.host };
         const stream = try std.Io.net.HostName.connect(host, self.io, self.port, .{
             .mode = .stream,
-            .timeout = .{ .duration = .{
-                .raw = std.Io.Duration.fromSeconds(self.timeout_seconds),
-                .clock = .awake,
-            } },
+            .timeout = .none,
         });
         self.stream = stream;
         self.stream_reader = stream.reader(self.io, &self.read_buffer);
@@ -79,30 +76,33 @@ pub const Session = struct {
                 .realtime_now = std.Io.Clock.real.now(self.io),
             },
         );
-        const greeting = try self.readStatus();
-        if (greeting.code != 200 and greeting.code != 201) return error.InvalidNntpGreeting;
+        const greeting_code = try self.readStatus();
+        if (greeting_code.code != 200 and greeting_code.code != 201) return error.NntpGreetingFailed;
         try self.authenticate();
     }
 
     pub fn probe(self: *Session) !void {
         if (self.tls == null) try self.connect();
-        try self.command("NOOP");
+        try self.command("DATE");
         const status = try self.readStatus();
-        if (status.code != 200) return error.NntpProbeFailed;
+        if (status.code != 111) return error.NntpProbeFailed;
     }
 
     pub fn requestBody(self: *Session, message_id: []const u8) !void {
         if (message_id.len == 0 or "BODY ".len + 1 + message_id.len + 1 + "\r\n".len > 512)
             return error.InvalidMessageId;
         for (message_id) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidMessageId;
+        if (self.tls == null) try self.connect();
+
         try self.writer().writeAll("BODY <");
         try self.writer().writeAll(message_id);
         try self.writer().writeAll(">\r\n");
-        try self.writer().flush();
+        try self.flushWriter();
         const status = try self.readStatus();
         if (status.code == 430) return error.MissingArticle;
         if (status.code >= 400 and status.code < 500) return error.PermanentNntpResponse;
-        if (status.code != 222) return error.TransientNntpResponse;
+        if (status.code >= 500) return error.PermanentNntpResponse;
+        if (status.code != 222) return error.NntpBodyRequestFailed;
     }
 
     pub fn readBodyLine(self: *Session, allocator: std.mem.Allocator) !BodyLine {
@@ -129,18 +129,23 @@ pub const Session = struct {
         self.stream_writer = null;
     }
 
+    fn flushWriter(self: *Session) !void {
+        try self.writer().flush();
+        if (self.stream_writer) |*sw| try sw.interface.flush();
+    }
+
     fn authenticate(self: *Session) !void {
         try self.writer().writeAll("AUTHINFO USER ");
         try self.writer().writeAll(self.user);
         try self.writer().writeAll("\r\n");
-        try self.writer().flush();
+        try self.flushWriter();
         const user_status = try self.readStatus();
         if (user_status.code == 281) return;
         if (user_status.code != 381) return error.NntpAuthenticationFailed;
         try self.writer().writeAll("AUTHINFO PASS ");
         try self.writer().writeAll(self.pass);
         try self.writer().writeAll("\r\n");
-        try self.writer().flush();
+        try self.flushWriter();
         const pass_status = try self.readStatus();
         if (pass_status.code != 281) return error.NntpAuthenticationFailed;
     }
@@ -148,7 +153,7 @@ pub const Session = struct {
     fn command(self: *Session, text: []const u8) !void {
         try self.writer().writeAll(text);
         try self.writer().writeAll("\r\n");
-        try self.writer().flush();
+        try self.flushWriter();
     }
 
     const Status = struct { code: u16 };
@@ -165,15 +170,22 @@ pub const Session = struct {
     fn readLine(self: *Session, allocator: std.mem.Allocator, max: usize) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
+        var prev_was_cr = false;
         while (true) {
             if (out.writer.end >= max) return error.NntpLineTooLong;
             const byte = self.reader().takeByte() catch return error.NntpReadFailed;
-            if (byte == '\n') break;
-            try out.writer.writeByte(byte);
+            if (byte == '\n') {
+                if (!prev_was_cr) return error.InvalidNntpFraming;
+                break;
+            }
+            if (prev_was_cr) return error.InvalidNntpFraming;
+            if (byte == '\r') {
+                prev_was_cr = true;
+            } else {
+                try out.writer.writeByte(byte);
+            }
         }
-        var line = out.writer.buffered();
-        if (line.len != 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        return allocator.dupe(u8, line);
+        return allocator.dupe(u8, out.writer.buffered());
     }
 
     fn reader(self: *Session) *std.Io.Reader {
@@ -212,3 +224,4 @@ test "BODY command length limit includes brackets and CRLF" {
     var session = makeSession(std.testing.allocator, std.testing.io, "example.test", 563, "u", "p", &store, 1);
     try std.testing.expectError(error.InvalidMessageId, session.requestBody("a" ** 506));
 }
+

@@ -15,6 +15,7 @@ pub fn run(
     nzb_bytes: []const u8,
     cfg: anytype,
     ca_store: *nntp.CaStore,
+    deadline_seconds: i64,
 ) !Result {
     const document = try nzb.parse(allocator, nzb_bytes);
     defer document.deinit(allocator);
@@ -23,33 +24,59 @@ pub fn run(
     try ensureDir(io, root_dir, ".nzbunny-work");
     try ensureDir(io, root_dir, ".nzbunny-downloads");
     const work_root = try std.fmt.allocPrint(allocator, ".nzbunny-work/{s}", .{job_id});
+    defer allocator.free(work_root);
     const output_root = try std.fmt.allocPrint(allocator, ".nzbunny-downloads/{s}", .{job_id});
+    defer allocator.free(output_root);
+    const tmp_output_root = try std.fmt.allocPrint(allocator, ".nzbunny-downloads/.tmp-{s}", .{job_id});
+    defer allocator.free(tmp_output_root);
+
     try removeTree(io, root_dir, work_root);
     try removeTree(io, root_dir, output_root);
+    try removeTree(io, root_dir, tmp_output_root);
     errdefer removeTree(io, root_dir, work_root) catch {};
     errdefer removeTree(io, root_dir, output_root) catch {};
+    errdefer removeTree(io, root_dir, tmp_output_root) catch {};
     try ensureDir(io, root_dir, work_root);
-    try ensureDir(io, root_dir, output_root);
+    try ensureDir(io, root_dir, tmp_output_root);
 
     const outputs = try allocator.alloc(OutputFile, document.files.len);
+    @memset(outputs, .{});
     defer {
         for (outputs) |output| output.deinit(allocator);
         allocator.free(outputs);
     }
     var total_size: u64 = 0;
     for (document.files, 0..) |file, file_index| {
-        outputs[file_index] = try fetchFile(allocator, io, root_dir, work_root, file_index, file, cfg, ca_store);
+        outputs[file_index] = try fetchFile(allocator, io, root_dir, work_root, file_index, file, cfg, ca_store, deadline_seconds);
+        std.log.info("file {d}/{d} downloaded: {s} ({d} segments)", .{ file_index + 1, document.files.len, outputs[file_index].name, file.segments.len });
         total_size = std.math.add(u64, total_size, outputs[file_index].size) catch return error.ArtifactTooLarge;
         if (total_size > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
     }
     try rejectDuplicateNames(outputs);
     try rejectUnsupportedSet(outputs);
     for (outputs, 0..) |output, file_index| {
-        try assembleFile(allocator, io, root_dir, output_root, file_index, output);
+        try assembleFile(allocator, io, root_dir, tmp_output_root, file_index, output, deadline_seconds);
     }
+
+    // Flush temporary output directory
+    var tmp_dir_file = try root_dir.openFile(io, tmp_output_root, .{ .allow_directory = true, .follow_symlinks = false });
+    try tmp_dir_file.sync(io);
+    tmp_dir_file.close(io);
+
+    // Atomically rename temporary output directory to final output_root
+    try root_dir.rename(tmp_output_root, root_dir, output_root, io);
+
+    // Flush .nzbunny-downloads directory
+    var downloads_dir_file = try root_dir.openFile(io, ".nzbunny-downloads", .{ .allow_directory = true, .follow_symlinks = false });
+    try downloads_dir_file.sync(io);
+    downloads_dir_file.close(io);
+
+    // Cleanup work root after successful publication
+    try removeTree(io, root_dir, work_root);
+
     if (document.files.len == 1)
         return .{ .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, outputs[0].name }) };
-    return .{ .relative_path = output_root };
+    return .{ .relative_path = try allocator.dupe(u8, output_root) };
 }
 
 const OutputFile = struct {
@@ -70,18 +97,20 @@ const Part = struct {
     rel_path: []const u8,
 };
 
-const SegmentTask = struct {
+const WorkerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     root_dir: std.Io.Dir,
     file_work: []const u8,
-    index: usize,
-    segment: nzb.Segment,
+    segments: []const nzb.Segment,
     cfg: @import("config.zig").Config,
     ca_store: *nntp.CaStore,
+    deadline_seconds: i64,
     parts: []Part,
     expected_name: []const u8,
     expected_size: u64,
+    next_segment: *std.atomic.Value(usize),
+    canceled: *std.atomic.Value(bool),
     mutex: *std.Io.Mutex,
     first_error: *?anyerror,
 };
@@ -95,83 +124,103 @@ fn fetchFile(
     file: nzb.File,
     cfg: anytype,
     ca_store: *nntp.CaStore,
+    deadline_seconds: i64,
 ) !OutputFile {
+    if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
     var file_work_buffer: [256]u8 = undefined;
     const file_work = try std.fmt.bufPrint(&file_work_buffer, "{s}/{d}", .{ work_root, file_index });
     try ensureDir(io, root_dir, file_work);
     var parts = try allocator.alloc(Part, file.segments.len);
     errdefer allocator.free(parts);
+    for (parts) |*p| p.* = .{ .begin = 0, .end = 0, .rel_path = "" };
+    errdefer for (parts) |p| if (p.rel_path.len != 0) allocator.free(p.rel_path);
+
     var name: []const u8 = "";
     var size: u64 = 0;
-    const first = try fetchSegment(allocator, io, root_dir, file_work, 0, file.segments[0], cfg, ca_store);
+    const first = try fetchSegment(allocator, io, root_dir, file_work, 0, file.segments[0], cfg, ca_store, deadline_seconds);
     defer allocator.free(first.name);
     parts[0] = .{ .begin = first.begin, .end = first.end, .rel_path = first.rel_path };
     name = try allocator.dupe(u8, first.name);
+    errdefer allocator.free(name);
     size = first.size;
     try rejectUnsupportedName(name);
 
-    var next: usize = 1;
-    while (next < file.segments.len) {
-        const end = @min(file.segments.len, next + cfg.nntp_connections);
-        var group: std.Io.Group = .init;
+    if (file.segments.len > 1) {
+        var next_segment: std.atomic.Value(usize) = .init(1);
+        var canceled: std.atomic.Value(bool) = .init(false);
         var mutex: std.Io.Mutex = .init;
         var first_error: ?anyerror = null;
-        for (file.segments[next..end], next..) |segment, index| {
-            const task = SegmentTask{
-                .allocator = allocator,
-                .io = io,
-                .root_dir = root_dir,
-                .file_work = file_work,
-                .index = index,
-                .segment = segment,
-                .cfg = cfg,
-                .ca_store = ca_store,
-                .parts = parts,
-                .expected_name = name,
-                .expected_size = size,
-                .mutex = &mutex,
-                .first_error = &first_error,
-            };
-            group.concurrent(io, fetchSegmentTask, .{task}) catch fetchSegmentTask(task);
+        var group: std.Io.Group = .init;
+
+        const worker_count = @min(file.segments.len - 1, cfg.nntp_connections);
+        const ctx = WorkerContext{
+            .allocator = allocator,
+            .io = io,
+            .root_dir = root_dir,
+            .file_work = file_work,
+            .segments = file.segments,
+            .cfg = cfg,
+            .ca_store = ca_store,
+            .deadline_seconds = deadline_seconds,
+            .parts = parts,
+            .expected_name = name,
+            .expected_size = size,
+            .next_segment = &next_segment,
+            .canceled = &canceled,
+            .mutex = &mutex,
+            .first_error = &first_error,
+        };
+
+        var w: usize = 0;
+        while (w < worker_count) : (w += 1) {
+            group.concurrent(io, fetchSegmentWorker, .{ctx}) catch fetchSegmentWorker(ctx);
         }
         try group.await(io);
         if (first_error) |err| return err;
-        next = end;
     }
-    validatePartRanges(parts, size) catch |err| {
-        if (name.len != 0) allocator.free(name);
-        return err;
-    };
+
+    validatePartRanges(parts, size) catch |err| return err;
     return .{ .name = name, .size = size, .parts = parts };
 }
 
-fn fetchSegmentTask(task: SegmentTask) void {
-    const decoded = fetchSegment(
-        task.allocator,
-        task.io,
-        task.root_dir,
-        task.file_work,
-        task.index,
-        task.segment,
-        task.cfg,
-        task.ca_store,
-    ) catch |err| {
-        recordSegmentError(task, err);
-        return;
-    };
-    defer task.allocator.free(decoded.name);
-    if (!std.mem.eql(u8, task.expected_name, decoded.name) or task.expected_size != decoded.size) {
-        task.allocator.free(decoded.rel_path);
-        recordSegmentError(task, error.InconsistentYencMetadata);
-        return;
+fn fetchSegmentWorker(ctx: WorkerContext) void {
+    while (!ctx.canceled.load(.acquire)) {
+        if (std.Io.Clock.real.now(ctx.io).toSeconds() >= ctx.deadline_seconds) {
+            recordSegmentError(ctx, error.Timeout);
+            return;
+        }
+        const index = ctx.next_segment.fetchAdd(1, .monotonic);
+        if (index >= ctx.segments.len) break;
+        const segment = ctx.segments[index];
+        const decoded = fetchSegment(
+            ctx.allocator,
+            ctx.io,
+            ctx.root_dir,
+            ctx.file_work,
+            index,
+            segment,
+            ctx.cfg,
+            ctx.ca_store,
+            ctx.deadline_seconds,
+        ) catch |err| {
+            recordSegmentError(ctx, err);
+            return;
+        };
+        defer ctx.allocator.free(decoded.name);
+        if (!std.mem.eql(u8, ctx.expected_name, decoded.name) or ctx.expected_size != decoded.size) {
+            ctx.allocator.free(decoded.rel_path);
+            recordSegmentError(ctx, error.InconsistentYencMetadata);
+            return;
+        }
+        ctx.parts[index] = .{ .begin = decoded.begin, .end = decoded.end, .rel_path = decoded.rel_path };
     }
-    task.parts[task.index] = .{ .begin = decoded.begin, .end = decoded.end, .rel_path = decoded.rel_path };
 }
 
-fn recordSegmentError(task: SegmentTask, err: anyerror) void {
-    task.mutex.lockUncancelable(task.io);
-    defer task.mutex.unlock(task.io);
-    if (task.first_error.* == null) task.first_error.* = err;
+fn recordSegmentError(ctx: WorkerContext, err: anyerror) void {
+    ctx.mutex.lockUncancelable(ctx.io);
+    defer ctx.mutex.unlock(ctx.io);
+    if (ctx.first_error.* == null) ctx.first_error.* = err;
+    ctx.canceled.store(true, .release);
 }
 
 const DecodedPart = struct {
@@ -191,11 +240,14 @@ fn fetchSegment(
     segment: nzb.Segment,
     cfg: anytype,
     ca_store: *nntp.CaStore,
+    deadline_seconds: i64,
 ) !DecodedPart {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
+        if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
         return fetchSegmentOnce(allocator, io, root_dir, file_work, index, segment, cfg, ca_store) catch |err| {
             if (attempt >= 3 or !retryable(err)) return err;
+            if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
             std.Io.sleep(io, .fromSeconds(@as(i64, 1) << @intCast(attempt)), .awake) catch {};
             continue;
         };
@@ -248,6 +300,11 @@ fn fetchSegmentOnce(
     const meta = try decoder.finish();
     try file_writer.interface.flush();
     try out_file.sync(io);
+
+    // Validate declared yEnc segment byte count
+    const part_bytes = meta.end - meta.begin + 1;
+    if (part_bytes != segment.declared_bytes) return error.InconsistentSegmentSize;
+
     try root_dir.rename(tmp_path, root_dir, part_path, io);
     return .{
         .name = meta.name,
@@ -265,18 +322,19 @@ fn assembleFile(
     output_root: []const u8,
     file_index: usize,
     output: OutputFile,
+    deadline_seconds: i64,
 ) !void {
     _ = file_index;
-    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.tmp", .{ output_root, output.name });
-    defer allocator.free(out_path);
+    if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
     defer allocator.free(final_path);
-    var out = try root_dir.createFile(io, out_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
+    var out = try root_dir.createFile(io, final_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
     defer out.close(io);
     var out_buffer: [64 * 1024]u8 = undefined;
     var writer = out.writer(io, &out_buffer);
     var buffer: [64 * 1024]u8 = undefined;
     for (output.parts) |part| {
+        if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
         var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
         defer input.close(io);
         const size = part.end - part.begin + 1;
@@ -286,7 +344,6 @@ fn assembleFile(
     }
     try writer.interface.flush();
     try out.sync(io);
-    try root_dir.rename(out_path, root_dir, final_path, io);
 }
 
 fn validatePartRanges(parts: []Part, size: u64) !void {
@@ -342,7 +399,6 @@ fn retryable(err: anyerror) bool {
     return err == error.Timeout or
         err == error.ConnectionResetByPeer or
         err == error.NntpReadFailed or
-        err == error.TransientNntpResponse or
         err == error.YencCrcMismatch;
 }
 
@@ -368,3 +424,4 @@ test "rejects split archive names" {
     try std.testing.expectError(error.Par2Rejected, rejectUnsupportedName("movie.par2"));
     try rejectUnsupportedName("movie.rar");
 }
+

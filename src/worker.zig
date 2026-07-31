@@ -11,6 +11,7 @@ pub var provider_ready: std.atomic.Value(bool) = .init(false);
 
 const max_concurrent_finalizers = 2;
 const max_concurrent_cleanup = 8;
+const max_finalize_attempts = 3;
 
 const Finalizers = struct {
     allocator: std.mem.Allocator,
@@ -21,10 +22,12 @@ const Finalizers = struct {
     group: std.Io.Group = .init,
     mutex: std.Io.Mutex = .init,
     active: std.StringHashMapUnmanaged(void) = .empty,
+    finalize_attempts: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinit(self: *Finalizers) void {
         self.group.cancel(self.io);
         self.active.deinit(self.allocator);
+        self.finalize_attempts.deinit(self.allocator);
     }
 
     fn schedule(self: *Finalizers, job: Job) !void {
@@ -38,6 +41,10 @@ const Finalizers = struct {
             .id = try self.allocator.dupe(u8, job.id),
             .download_path = try self.allocator.dupe(u8, job.download_path),
         };
+        const gop = try self.finalize_attempts.getOrPut(self.allocator, task.id);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        task.attempt = gop.value_ptr.*;
         try self.active.put(self.allocator, task.id, {});
         self.group.async(self.io, runFinalize, .{task});
     }
@@ -53,6 +60,7 @@ const FinalizeTask = struct {
     owner: *Finalizers,
     id: []u8,
     download_path: []u8,
+    attempt: u32 = 0,
 };
 
 const CleanupTask = struct {
@@ -187,24 +195,23 @@ fn processPending(
     };
     if (!try db.beginProcessing(io, job.id, now)) return;
     const started = std.Io.Clock.real.now(io).toSeconds();
-    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store) catch |err| {
+    const deadline = started + cfg.download_timeout_seconds;
+    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store, deadline) catch |err| {
         const root_dir = std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false }) catch null;
         if (root_dir) |dir| {
             defer dir.close(io);
             cleanupWorkDirs(io, dir, job.id) catch {};
         }
         if (providerFailure(err)) provider_ready.store(false, .release);
-        const message = if (providerFailure(err))
+        const message = if (err == error.Timeout)
+            "The download exceeded DOWNLOAD_TIMEOUT."
+        else if (providerFailure(err))
             "The NNTP provider is unavailable; the job failed after retries."
         else
             "The NZB file or downloaded data is not supported.";
         try db.fail(io, job.id, message, std.Io.Clock.real.now(io).toSeconds());
         return;
     };
-    if (std.Io.Clock.real.now(io).toSeconds() - started > cfg.download_timeout_seconds) {
-        try db.fail(io, job.id, "The download exceeded DOWNLOAD_TIMEOUT.", now);
-        return;
-    }
     _ = try db.beginFinalizing(io, job.id, result.relative_path, std.Io.Clock.real.now(io).toSeconds());
 }
 
@@ -226,6 +233,7 @@ fn probeProvider(
     );
     defer session.deinit();
     try session.connect();
+    try session.probe();
     provider_ready.store(true, .release);
 }
 
@@ -241,9 +249,12 @@ fn runFinalize(task: *FinalizeTask) void {
     defer arena.deinit();
     const now = std.Io.Clock.real.now(owner.io).toSeconds();
     finalize(arena.allocator(), owner, task.id, task.download_path, now) catch |err| {
-        std.log.err("Job {s} finalization failed: {t}", .{ task.id, err });
-        owner.db.fail(owner.io, task.id, "The output artifact could not be prepared.", now) catch |db_err|
-            std.log.err("Job {s} failure state could not be saved: {t}", .{ task.id, db_err });
+        std.log.err("Job {s} finalization failed (attempt {d}/{d}): {t}", .{ task.id, task.attempt, max_finalize_attempts, err });
+        if (task.attempt >= max_finalize_attempts) {
+            owner.db.fail(owner.io, task.id, "The output artifact could not be prepared after multiple attempts.", now) catch |db_err|
+                std.log.err("Job {s} failure state could not be saved: {t}", .{ task.id, db_err });
+        }
+        // Otherwise preserve FINALIZING state for retry on next worker cycle
     };
 }
 
@@ -336,8 +347,7 @@ fn providerFailure(err: anyerror) bool {
         err == error.ConnectionRefused or
         err == error.ConnectionResetByPeer or
         err == error.NetworkUnreachable or
-        err == error.NntpReadFailed or
-        err == error.TransientNntpResponse;
+        err == error.NntpReadFailed;
 }
 
 test "provider readiness starts false" {

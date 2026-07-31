@@ -147,6 +147,16 @@ SECURITY
      available from a different host, place it behind a reverse proxy that
      provides authentication.
 
+TESTING
+     Unit tests:
+           zig build test
+
+     ReleaseSafe unit tests:
+           ZIG_GLOBAL_CACHE_DIR=/tmp/nzbunny-zig-global zig build test -Doptimize=ReleaseSafe
+
+     Python integration test suite:
+           python3 tests/integration.py zig-out/bin/nzbunny
+
 SEE ALSO
      sqlite3(1)
 

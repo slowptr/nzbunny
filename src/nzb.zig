@@ -53,6 +53,19 @@ pub const ParseError = error{
 };
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Document {
+    return parseWithDiagnostic(allocator, bytes, null);
+}
+
+pub const Diagnostic = struct {
+    line: c_int = 0,
+    column: c_int = 0,
+};
+
+pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic) ParseError!Document {
+    if (containsOutsideMarkup(bytes, "<!entity")) {
+        return error.InternalEntityRejected;
+    }
+
     const options = c.XML_PARSE_NONET;
     const reader = c.xmlReaderForMemory(
         @ptrCast(bytes.ptr),
@@ -75,50 +88,113 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Documen
     }
     var in_file = false;
     var in_segment = false;
+    var saw_root = false;
     var segment_number: u32 = 0;
     var segment_bytes: u64 = 0;
     var total_segments: usize = 0;
 
+    const setDiag = struct {
+        fn set(d: ?*Diagnostic, r: *c.xmlTextReader) void {
+            if (d) |target| {
+                target.line = c.xmlTextReaderGetParserLineNumber(r);
+                target.column = c.xmlTextReaderGetParserColumnNumber(r);
+            }
+        }
+    }.set;
+
     while (true) {
         const rc = c.xmlTextReaderRead(reader);
         if (rc == 0) break;
-        if (rc < 0) return error.NzbParseFailed;
+        if (rc < 0) {
+            setDiag(diag, reader);
+            if (containsEntityReference(bytes)) return error.EntityReferenceRejected;
+            return error.NzbParseFailed;
+        }
         const node_type = c.xmlTextReaderNodeType(reader);
-        if (node_type == c.XML_READER_TYPE_ENTITY_REFERENCE) return error.EntityReferenceRejected;
+        if (node_type == c.XML_READER_TYPE_ENTITY_REFERENCE) {
+            setDiag(diag, reader);
+            return error.EntityReferenceRejected;
+        }
+        if (node_type == c.XML_READER_TYPE_ENTITY) {
+            setDiag(diag, reader);
+            return error.InternalEntityRejected;
+        }
         if (node_type == c.XML_READER_TYPE_DOCUMENT_TYPE) {
             const value = xmlText(c.xmlTextReaderConstValue(reader));
-            if (std.mem.indexOf(u8, value, "<!ENTITY") != null or std.mem.indexOf(u8, value, "<!entity") != null)
+            if (std.ascii.indexOfIgnoreCase(value, "<!entity") != null) {
+                setDiag(diag, reader);
                 return error.InternalEntityRejected;
+            }
             continue;
         }
         if (node_type == c.XML_READER_TYPE_ELEMENT) {
-            try validateNamespace(reader);
+            validateNamespace(reader) catch |err| {
+                setDiag(diag, reader);
+                return err;
+            };
             const name = xmlText(c.xmlTextReaderConstLocalName(reader));
+            if (!saw_root) {
+                if (!std.mem.eql(u8, name, "nzb")) {
+                    setDiag(diag, reader);
+                    return error.UnsupportedNzbNamespace;
+                }
+                saw_root = true;
+            }
             if (std.mem.eql(u8, name, "file")) {
-                if (files.items.len >= max_files) return error.TooManyNzbFiles;
+                if (files.items.len >= max_files) {
+                    setDiag(diag, reader);
+                    return error.TooManyNzbFiles;
+                }
                 in_file = true;
                 current_segments.clearRetainingCapacity();
             } else if (std.mem.eql(u8, name, "segment") and in_file) {
                 in_segment = true;
-                segment_number = try attrInt(u32, reader, "number") orelse return error.MissingSegmentNumber;
-                segment_bytes = try attrInt(u64, reader, "bytes") orelse return error.MissingSegmentBytes;
-                if (segment_number == 0) return error.InvalidSegmentNumber;
+                segment_number = (attrInt(u32, reader, "number") catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                }) orelse {
+                    setDiag(diag, reader);
+                    return error.MissingSegmentNumber;
+                };
+                segment_bytes = (attrInt(u64, reader, "bytes") catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                }) orelse {
+                    setDiag(diag, reader);
+                    return error.MissingSegmentBytes;
+                };
+                if (segment_number == 0) {
+                    setDiag(diag, reader);
+                    return error.InvalidSegmentNumber;
+                }
             } else if (std.mem.eql(u8, name, "meta")) {
-                if (hasPasswordMeta(reader)) return error.PasswordProtectedNzb;
+                if (hasPasswordMeta(reader)) {
+                    setDiag(diag, reader);
+                    return error.PasswordProtectedNzb;
+                }
             }
             continue;
         }
         if (node_type == c.XML_READER_TYPE_TEXT and in_segment) {
             const value = std.mem.trim(u8, xmlText(c.xmlTextReaderConstValue(reader)), " \t\r\n");
-            const message_id = try normalizeMessageId(allocator, value);
+            const message_id = normalizeMessageId(allocator, value) catch |err| {
+                setDiag(diag, reader);
+                return err;
+            };
             errdefer allocator.free(message_id);
-            try current_segments.append(allocator, .{
+            current_segments.append(allocator, .{
                 .number = segment_number,
                 .declared_bytes = segment_bytes,
                 .message_id = message_id,
-            });
+            }) catch |err| {
+                setDiag(diag, reader);
+                return err;
+            };
             total_segments += 1;
-            if (total_segments > max_segments) return error.TooManyNzbSegments;
+            if (total_segments > max_segments) {
+                setDiag(diag, reader);
+                return error.TooManyNzbSegments;
+            }
             continue;
         }
         if (node_type == c.XML_READER_TYPE_END_ELEMENT) {
@@ -126,9 +202,18 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Documen
             if (std.mem.eql(u8, name, "segment")) {
                 in_segment = false;
             } else if (std.mem.eql(u8, name, "file") and in_file) {
-                try validateSegments(current_segments.items);
-                const owned = try current_segments.toOwnedSlice(allocator);
-                try files.append(allocator, .{ .segments = owned });
+                validateSegments(current_segments.items) catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                };
+                const owned = current_segments.toOwnedSlice(allocator) catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                };
+                files.append(allocator, .{ .segments = owned }) catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                };
                 current_segments = .empty;
                 in_file = false;
             }
@@ -145,7 +230,7 @@ fn validateNamespace(reader: *c.xmlTextReader) !void {
 
 fn hasPasswordMeta(reader: *c.xmlTextReader) bool {
     const value = std.mem.trim(u8, attrValue(reader, "type") orelse return false, " \t\r\n");
-    return std.ascii.eqlIgnoreCase(value, "password") and c.xmlTextReaderIsEmptyElement(reader) == 0;
+    return std.ascii.eqlIgnoreCase(value, "password");
 }
 
 fn attrInt(comptime T: type, reader: *c.xmlTextReader, comptime name: []const u8) !?T {
@@ -180,6 +265,74 @@ fn validateSegments(segments: []Segment) !void {
         if (segment.number < expected) return error.DuplicateSegmentNumber;
         if (segment.number != expected) return error.NonContiguousSegmentNumbers;
     }
+}
+
+// Skips over XML comment and CDATA regions before checking for entity
+// references to avoid false positives when &custom; appears inside
+// markup regions.
+fn containsEntityReference(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (skipMarkupRegion(bytes, i)) |end| {
+            i = end;
+            continue;
+        }
+        if (bytes[i] == '&') {
+            if (i + 1 < bytes.len and bytes[i + 1] != '#') {
+                const rest = bytes[i + 1 ..];
+                const semi = std.mem.indexOfScalar(u8, rest, ';') orelse {
+                    i += 1;
+                    continue;
+                };
+                const name = rest[0..semi];
+                if (!std.mem.eql(u8, name, "lt") and
+                    !std.mem.eql(u8, name, "gt") and
+                    !std.mem.eql(u8, name, "amp") and
+                    !std.mem.eql(u8, name, "quot") and
+                    !std.mem.eql(u8, name, "apos"))
+                {
+                    return true;
+                }
+                i += 1 + semi + 1; // skip past &name;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn containsOutsideMarkup(bytes: []const u8, needle: []const u8) bool {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (skipMarkupRegion(bytes, i)) |end| {
+            i = end;
+            continue;
+        }
+        if (i + needle.len <= bytes.len and
+            std.ascii.eqlIgnoreCase(bytes[i..][0..needle.len], needle))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn skipMarkupRegion(bytes: []const u8, pos: usize) ?usize {
+    if (pos + 4 <= bytes.len and std.mem.eql(u8, bytes[pos..][0..4], "<!--")) {
+        if (std.mem.indexOf(u8, bytes[pos + 4 ..], "-->")) |end| {
+            return pos + 4 + end + 3;
+        }
+        return bytes.len;
+    }
+    if (pos + 9 <= bytes.len and std.mem.eql(u8, bytes[pos..][0..9], "<![CDATA[")) {
+        if (std.mem.indexOf(u8, bytes[pos + 9 ..], "]]>")) |end| {
+            return pos + 9 + end + 3;
+        }
+        return bytes.len;
+    }
+    return null;
 }
 
 fn normalizeMessageId(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -225,8 +378,83 @@ test "rejects duplicate segments" {
 
 test "rejects entity references" {
     const text =
-        \\<!DOCTYPE nzb [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
         \\<nzb><file><segments><segment bytes="1" number="1">&xxe;</segment></segments></file></nzb>
     ;
     try std.testing.expectError(error.EntityReferenceRejected, parse(std.testing.allocator, text));
+}
+
+test "provides line and column diagnostics on failure" {
+    const text =
+        \\<nzb>
+        \\  <file>
+        \\    <segments>
+        \\      <segment bytes="invalid" number="1">a@b</segment>
+        \\    </segments>
+        \\  </file>
+        \\</nzb>
+    ;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidSegmentBytes, parseWithDiagnostic(std.testing.allocator, text, &diag));
+    try std.testing.expect(diag.line > 0);
+}
+
+test "rejects wrong namespace and non-nzb root element" {
+    const wrong_ns =
+        \\<nzb xmlns="http://example.com/wrong"><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    try std.testing.expectError(error.UnsupportedNzbNamespace, parse(std.testing.allocator, wrong_ns));
+
+    const wrong_root =
+        \\<other><file><segments><segment bytes="1" number="1">a@b</segment></segments></file></other>
+    ;
+    try std.testing.expectError(error.UnsupportedNzbNamespace, parse(std.testing.allocator, wrong_root));
+}
+
+test "rejects password protected nzb case insensitively" {
+    const text =
+        \\<nzb><head><meta type="PASSWORD">secret</meta></head><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    try std.testing.expectError(error.PasswordProtectedNzb, parse(std.testing.allocator, text));
+}
+
+test "rejects non-contiguous segment numbers" {
+    const text =
+        \\<nzb><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\<segment bytes="1" number="3">c@d</segment>
+        \\</segments></file></nzb>
+    ;
+    try std.testing.expectError(error.NonContiguousSegmentNumbers, parse(std.testing.allocator, text));
+}
+
+test "rejects internal entity declaration" {
+    const text =
+        \\<!DOCTYPE nzb [<!ENTITY foo "bar">]>
+        \\<nzb><file><segments><segment bytes="1" number="1">a@b</segment></segments></file></nzb>
+    ;
+    try std.testing.expectError(error.InternalEntityRejected, parse(std.testing.allocator, text));
+}
+
+test "entity references inside comments are not rejected" {
+    const text =
+        \\<nzb><!-- use &custom; syntax --><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    var doc = try parse(std.testing.allocator, text);
+    doc.deinit(std.testing.allocator);
+}
+
+test "entity declarations inside comments are not rejected" {
+    const text =
+        \\<nzb><!-- <!ENTITY foo "bar"> --><file><segments>
+        \\<segment bytes="1" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    var doc = try parse(std.testing.allocator, text);
+    doc.deinit(std.testing.allocator);
 }
