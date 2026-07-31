@@ -290,8 +290,7 @@ fn cleanup(
         io,
         now,
         now - cfg.retention_seconds,
-        now - cfg.retention_seconds,
-        now - cfg.download_timeout_seconds,
+        now - 1800,
     );
     defer {
         for (jobs) |job| job.deinit(db.allocator);
@@ -335,6 +334,9 @@ fn cleanupWorkDirs(io: std.Io, root_dir: std.Io.Dir, job_id: []const u8) !void {
     var output_buffer: [128]u8 = undefined;
     const output = try std.fmt.bufPrint(&output_buffer, ".nzbunny-downloads/{s}", .{job_id});
     try root_dir.deleteTree(io, output);
+    var tmp_buffer: [148]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buffer, ".nzbunny-downloads/.tmp-{s}", .{job_id});
+    try root_dir.deleteTree(io, tmp);
 }
 
 fn providerFailure(err: anyerror) bool {

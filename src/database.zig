@@ -243,8 +243,7 @@ pub const Database = struct {
         _: std.Io,
         now: i64,
         failed_before: i64,
-        submission_before: i64,
-        processing_before: i64,
+        expired_before: i64,
     ) ![]Job {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
@@ -252,15 +251,11 @@ pub const Database = struct {
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at,finalize_attempts,finalize_next_at,finalize_lease_until,finalize_lease_token FROM jobs " ++
             "WHERE (status='COMPLETE' AND expires_at<=?1) OR " ++
             "(status='FAILED' AND updated_at<=?2) OR " ++
-            "(status='PENDING' AND created_at<=?3) OR " ++
-            "(status IN ('PROCESSING','FINALIZING') AND created_at<=?4) OR " ++
-            "(status='EXPIRED' AND updated_at<=?5)");
+            "(status='EXPIRED' AND updated_at<=?3)");
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, now);
         _ = c.sqlite3_bind_int64(stmt, 2, failed_before);
-        _ = c.sqlite3_bind_int64(stmt, 3, submission_before);
-        _ = c.sqlite3_bind_int64(stmt, 4, processing_before);
-        _ = c.sqlite3_bind_int64(stmt, 5, now - 1800);
+        _ = c.sqlite3_bind_int64(stmt, 3, expired_before);
         var result: std.ArrayList(Job) = .empty;
         while (true) switch (c.sqlite3_step(stmt)) {
             c.SQLITE_ROW => try result.append(self.allocator, try scan(self.allocator, stmt)),

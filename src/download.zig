@@ -480,6 +480,11 @@ fn ensureDir(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
         error.PathAlreadyExists => {},
         else => return err,
     };
+    var opened = dir.openFile(io, path, .{ .allow_directory = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.SymLinkLoop => return error.PathNotSafe,
+        else => return err,
+    };
+    opened.close(io);
 }
 
 fn removeTree(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
