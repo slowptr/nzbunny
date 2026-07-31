@@ -18,7 +18,7 @@ pub fn run(init: std.process.Init) !void {
 
     var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const download_root = try paths.resolveRoot(cfg.download_dir, &root_buffer);
-    std.log.info("nzigbunny listens on port {d}", .{cfg.port});
+    std.log.info("nzbunny listens on port {d}", .{cfg.port});
     try web.serve(init.gpa, init.io, &db, cfg, download_root);
 }
 

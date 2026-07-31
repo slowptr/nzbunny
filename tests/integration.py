@@ -122,7 +122,7 @@ def wait_ready(port):
         except OSError:
             pass
         time.sleep(0.1)
-    raise AssertionError("nzigbunny did not become ready")
+    raise AssertionError("nzbunny did not become ready")
 
 
 def wait_job(port, location, wanted):
@@ -150,7 +150,7 @@ def stop_process(process):
 
 
 def upload(port):
-    boundary = "nzigbunny-integration"
+    boundary = "nzbunny-integration"
     body = (
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="nzbfile"; filename="sample.nzb"\r\n'
@@ -174,7 +174,7 @@ def main():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    with tempfile.TemporaryDirectory(prefix="nzigbunny-integration-") as root:
+    with tempfile.TemporaryDirectory(prefix="nzbunny-integration-") as root:
         root_path = Path(root)
         artifacts = [root_path / "result-1.bin", root_path / "result-2.bin"]
         artifacts[0].write_bytes(b"integration artifact one")

@@ -22,7 +22,7 @@ pub const Config = struct {
 
 const Defaults = struct {
     const sab_url = "http://localhost:8080";
-    const db_path = "nzigbunny.db";
+    const db_path = "nzbunny.db";
     const trusted_proxy_cidrs = "";
     const port = "1337";
     const retention_ttl = "15m";

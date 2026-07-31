@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const module = b.addModule("nzigbunny", .{
+    const module = b.addModule("nzbunny", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -15,12 +15,12 @@ pub fn build(b: *std.Build) void {
     module.linkSystemLibrary("archive", .{});
 
     const exe = b.addExecutable(.{
-        .name = "nzigbunny",
+        .name = "nzbunny",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "nzigbunny", .module = module }},
+            .imports = &.{.{ .name = "nzbunny", .module = module }},
         }),
     });
     b.installArtifact(exe);
@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    b.step("run", "Run nzigbunny").dependOn(&run_cmd.step);
+    b.step("run", "Run nzbunny").dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = module });
     const test_step = b.step("test", "Run tests");

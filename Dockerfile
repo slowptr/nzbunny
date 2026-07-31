@@ -34,14 +34,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 libarchive13 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --system --gid 10001 nzigbunny \
-    && useradd --system --uid 10001 --gid nzigbunny --home-dir /data nzigbunny \
+RUN groupadd --system --gid 10001 nzbunny \
+    && useradd --system --uid 10001 --gid nzbunny --home-dir /data nzbunny \
     && mkdir -p /data /downloads \
-    && chown nzigbunny:nzigbunny /data /downloads
+    && chown nzbunny:nzbunny /data /downloads
 
-COPY --from=build /out/bin/nzigbunny /usr/local/bin/nzigbunny
+COPY --from=build /out/bin/nzbunny /usr/local/bin/nzbunny
 
-USER nzigbunny
+USER nzbunny
 WORKDIR /data
 EXPOSE 1337
-ENTRYPOINT ["/usr/local/bin/nzigbunny"]
+ENTRYPOINT ["/usr/local/bin/nzbunny"]

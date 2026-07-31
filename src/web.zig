@@ -6,7 +6,7 @@ const worker = @import("worker.zig");
 
 const css = @embedFile("assets/styles.css");
 const javascript = @embedFile("assets/upload.js");
-const logo = @embedFile("assets/nzigbunny.png");
+const logo = @embedFile("assets/nzbunny.png");
 
 const index_html =
     \\<!DOCTYPE html>
@@ -15,7 +15,7 @@ const index_html =
     \\    <meta charset="UTF-8">
     \\    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     \\    <link rel="stylesheet" href="/public/styles.css">
-    \\    <title>nzigbunny</title>
+    \\    <title>nzbunny</title>
     \\</head>
     \\<body>
     \\    <main>
@@ -31,7 +31,7 @@ const index_html =
     \\          </form>
     \\      </div>
     \\    </main>
-    \\    <img src="/public/nzigbunny.png" alt="nzigbunny logo" class="logo">
+    \\    <img src="/public/nzbunny.png" alt="nzbunny logo" class="logo">
     \\    <script src="/public/upload.js"></script>
     \\</body>
     \\</html>
@@ -203,7 +203,7 @@ fn route(
         return public(request, css, "text/css; charset=utf-8");
     if (std.mem.eql(u8, target, "/public/upload.js"))
         return public(request, javascript, "text/javascript; charset=utf-8");
-    if (std.mem.eql(u8, target, "/public/nzigbunny.png"))
+    if (std.mem.eql(u8, target, "/public/nzbunny.png"))
         return public(request, logo, "image/png");
     if (std.mem.startsWith(u8, target, "/public/"))
         return respondText(request, .not_found, "Not found.");
@@ -247,7 +247,7 @@ fn upload(
     var random: [16]u8 = undefined;
     context.io.random(&random);
     var temp_name_buffer: [64]u8 = undefined;
-    const temp_name = std.fmt.bufPrint(&temp_name_buffer, ".nzigbunny-upload-{x}.tmp", .{random}) catch unreachable;
+    const temp_name = std.fmt.bufPrint(&temp_name_buffer, ".nzbunny-upload-{x}.tmp", .{random}) catch unreachable;
     const temp_file = context.root_dir.createFile(context.io, temp_name, .{
         .read = true,
         .exclusive = true,
@@ -310,7 +310,7 @@ fn jobPage(
     );
     const details = describe(job);
     if (details.refresh) try w.writeAll("<meta http-equiv=\"refresh\" content=\"5\">");
-    try w.writeAll("<title>nzigbunny - job ");
+    try w.writeAll("<title>nzbunny - job ");
     try htmlEscape(w, job.id);
     try w.writeAll("</title></head><body><main><div class=\"module-container\"><h2>");
     try w.writeAll(details.title);
@@ -346,7 +346,7 @@ fn jobPage(
     try w.writeAll("</p>");
     try w.writeAll(
         \\</div></div><div class="module-container"><a href="/">upload another file</a></div>
-        \\<img src="/public/nzigbunny.png" alt="nzigbunny logo" class="logo"></main></body></html>
+        \\<img src="/public/nzbunny.png" alt="nzbunny logo" class="logo"></main></body></html>
     );
     return request.respond(page.writer.buffered(), .{ .extra_headers = &.{
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },

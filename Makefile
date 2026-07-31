@@ -4,7 +4,7 @@ build:
 	zig build -Doptimize=ReleaseSafe
 
 run: build
-	./zig-out/bin/nzigbunny
+	./zig-out/bin/nzbunny
 
 dev:
 	zig build run

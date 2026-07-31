@@ -1,9 +1,9 @@
 /.env
 /.zig-cache/
 /zig-out/
-/nzigbunny.db
-/nzigbunny.db-shm
-/nzigbunny.db-wal
+/nzbunny.db
+/nzbunny.db-shm
+/nzbunny.db-wal
 /deploy/config/
 /deploy/data/
 /deploy/downloads/

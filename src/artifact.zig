@@ -46,7 +46,7 @@ pub fn prepare(
         .CLOEXEC = true,
     }, 0) catch return error.DownloadRootNotAccessible;
     defer _ = c.close(root_fd);
-    const artifact_name = ".nzigbunny-artifacts";
+    const artifact_name = ".nzbunny-artifacts";
     if (c.mkdirat(root_fd, artifact_name, 0o755) != 0 and std.c._errno().* != c.EEXIST)
         return error.ArtifactDirectoryFailed;
     const artifact_fd = std.posix.openat(
@@ -460,7 +460,7 @@ test "artifact directory cannot be a symlink" {
     var outside_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const outside = try std.fmt.bufPrint(&outside_buffer, "{s}/outside", .{base});
     var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const link = try std.fmt.bufPrint(&link_buffer, "{s}/.nzigbunny-artifacts", .{download});
+    const link = try std.fmt.bufPrint(&link_buffer, "{s}/.nzbunny-artifacts", .{download});
     var outside_z: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     var link_z: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     if (c.symlink((try toZ(outside, &outside_z)).ptr, (try toZ(link, &link_z)).ptr) != 0)
@@ -493,7 +493,7 @@ test "directory artifact is written through a safe directory handle" {
     );
     defer std.testing.allocator.free(result.relative_path);
     try std.testing.expectEqualStrings(
-        ".nzigbunny-artifacts/0123456789abcdef0123456789abcdef.zip",
+        ".nzbunny-artifacts/0123456789abcdef0123456789abcdef.zip",
         result.relative_path,
     );
     try std.testing.expect(result.size > 0);

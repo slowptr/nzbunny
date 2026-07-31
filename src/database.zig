@@ -167,7 +167,7 @@ pub const Database = struct {
         const id = try self.allocator.alloc(u8, 32);
         errdefer self.allocator.free(id);
         _ = std.fmt.bufPrint(id, "{x}", .{random}) catch unreachable;
-        const sab_name = try std.fmt.allocPrint(self.allocator, "nzigbunny-{s}", .{id});
+        const sab_name = try std.fmt.allocPrint(self.allocator, "nzbunny-{s}", .{id});
         defer self.allocator.free(sab_name);
 
         const stmt = try prepare(db,
@@ -427,16 +427,16 @@ fn initialize(db: *c.sqlite3) !void {
         \\PRAGMA journal_size_limit=16777216;
     );
     const has_jobs = try tableExists(db, "jobs");
-    const has_meta = try tableExists(db, "nzigbunny_schema");
+    const has_meta = try tableExists(db, "nzbunny_schema");
     if (has_jobs and !has_meta) return error.LegacyGoSchemaDetected;
     if (!has_jobs and !has_meta) try exec(db, "PRAGMA auto_vacuum=INCREMENTAL;");
     try exec(db,
         \\BEGIN IMMEDIATE;
-        \\CREATE TABLE IF NOT EXISTS nzigbunny_schema (
+        \\CREATE TABLE IF NOT EXISTS nzbunny_schema (
         \\  version INTEGER NOT NULL
         \\);
-        \\INSERT INTO nzigbunny_schema(version)
-        \\SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM nzigbunny_schema);
+        \\INSERT INTO nzbunny_schema(version)
+        \\SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM nzbunny_schema);
         \\CREATE TABLE IF NOT EXISTS jobs (
         \\  id TEXT PRIMARY KEY,
         \\  filename TEXT NOT NULL,
@@ -457,7 +457,7 @@ fn initialize(db: *c.sqlite3) !void {
         \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
         \\COMMIT;
     );
-    const stmt = try prepare(db, "SELECT version FROM nzigbunny_schema LIMIT 1");
+    const stmt = try prepare(db, "SELECT version FROM nzbunny_schema LIMIT 1");
     defer _ = c.sqlite3_finalize(stmt);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW or c.sqlite3_column_int(stmt, 0) != 1) return error.UnsupportedSchemaVersion;
 }

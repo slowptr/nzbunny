@@ -1,15 +1,15 @@
 services:
-  nzigbunny:
+  nzbunny:
     build:
       context: ..
       dockerfile: Dockerfile
-    container_name: nzigbunny
+    container_name: nzbunny
     environment:
       PORT: "1337"
       SABNZBD_URL: http://sabnzbd:8080
       SABNZBD_API_KEY: ${SABNZBD_API_KEY:?Set SABNZBD_API_KEY in your environment}
       SABNZBD_DOWNLOAD_DIR: /downloads
-      DB_PATH: /data/nzigbunny.db
+      DB_PATH: /data/nzbunny.db
       RETENTION_TTL: 5m
       CLEANUP_INTERVAL: 30s
       POLL_INTERVAL: 10s
@@ -23,7 +23,7 @@ services:
       UPLOADS_PER_MINUTE: "20"
       TRUSTED_PROXY_CIDRS: ""
     volumes:
-      - nzigbunny-data:/data
+      - nzbunny-data:/data
       - downloads:/downloads
     ports:
       - "127.0.0.1:1337:1337"
@@ -62,7 +62,7 @@ services:
 
   sabnzbd:
     image: lscr.io/linuxserver/sabnzbd@sha256:302be8972d4627222a0701634f2f9025826d760d856414aa6e67c0a66833e5be
-    container_name: nzigbunny-sabnzbd
+    container_name: nzbunny-sabnzbd
     hostname: sabnzbd
     environment:
       PUID: "10001"
@@ -82,7 +82,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  nzigbunny-data:
+  nzbunny-data:
   sabnzbd-config:
   sabnzbd-incomplete:
   downloads:
