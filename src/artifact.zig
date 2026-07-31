@@ -42,6 +42,7 @@ pub fn prepare(
     try paths.rejectSymlinks(root, source);
     const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{
         .DIRECTORY = true,
+        .NOFOLLOW = true,
         .CLOEXEC = true,
     }, 0) catch return error.DownloadRootNotAccessible;
     defer _ = c.close(root_fd);
@@ -291,6 +292,7 @@ pub fn removeValidated(root: []const u8, candidate: []const u8) !void {
     if (std.mem.eql(u8, resolved, root)) return error.RefuseRootRemoval;
     const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{
         .DIRECTORY = true,
+        .NOFOLLOW = true,
         .CLOEXEC = true,
     }, 0) catch return error.DownloadRootNotAccessible;
     defer _ = c.close(root_fd);

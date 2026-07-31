@@ -75,6 +75,16 @@ pub const Database = struct {
         self.allocator.free(self.path);
     }
 
+    pub fn maintain(self: *Database) !void {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        try exec(db,
+            \\PRAGMA wal_checkpoint(PASSIVE);
+            \\PRAGMA incremental_vacuum(256);
+            \\PRAGMA optimize;
+        );
+    }
+
     pub fn ready(self: *Database, _: std.Io) bool {
         const db = self.connect() catch return false;
         defer _ = c.sqlite3_close(db);
@@ -206,17 +216,21 @@ pub const Database = struct {
     }
 
     pub fn get(self: *Database, io: std.Io, id: []const u8) !?Job {
-        return self.getWith(io, "id", id);
+        return self.getWith(io, "id", id, false);
+    }
+
+    pub fn getWithContent(self: *Database, io: std.Io, id: []const u8) !?Job {
+        return self.getWith(io, "id", id, true);
     }
 
     pub fn getByToken(self: *Database, io: std.Io, token: []const u8) !?Job {
-        return self.getWith(io, "download_token", token);
+        return self.getWith(io, "download_token", token, false);
     }
 
     pub fn listWork(self: *Database, _: std.Io) ![]Job {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "SELECT id,filename,content,status,sab_name,nzo_id,download_path,artifact_path," ++
+        const stmt = try prepare(db, "SELECT id,filename,NULL,status,sab_name,nzo_id,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs " ++
             "WHERE status IN ('PENDING','SUBMITTING','PROCESSING','FINALIZING') ORDER BY created_at");
         defer _ = c.sqlite3_finalize(stmt);
@@ -238,7 +252,7 @@ pub const Database = struct {
     ) ![]Job {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "SELECT id,filename,content,status,sab_name,nzo_id,download_path,artifact_path," ++
+        const stmt = try prepare(db, "SELECT id,filename,NULL,status,sab_name,nzo_id,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs " ++
             "WHERE (status='COMPLETE' AND expires_at<=?1) OR " ++
             "(status='FAILED' AND updated_at<=?2) OR " ++
@@ -259,10 +273,17 @@ pub const Database = struct {
         };
     }
 
-    fn getWith(self: *Database, _: std.Io, comptime field: []const u8, value: []const u8) !?Job {
+    fn getWith(
+        self: *Database,
+        _: std.Io,
+        comptime field: []const u8,
+        value: []const u8,
+        comptime include_content: bool,
+    ) !?Job {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "SELECT id,filename,content,status,sab_name,nzo_id,download_path,artifact_path," ++
+        const content = if (include_content) "content" else "NULL";
+        const stmt = try prepare(db, "SELECT id,filename," ++ content ++ ",status,sab_name,nzo_id,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs WHERE " ++ field ++ "=?1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, value);
@@ -379,7 +400,13 @@ fn openHandle(path: [:0]const u8) !*c.sqlite3 {
     }
     const db = handle.?;
     errdefer _ = c.sqlite3_close(db);
-    try exec(db, "PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    try exec(db,
+        \\PRAGMA foreign_keys=ON;
+        \\PRAGMA trusted_schema=OFF;
+        \\PRAGMA busy_timeout=5000;
+        \\PRAGMA wal_autocheckpoint=256;
+        \\PRAGMA journal_size_limit=16777216;
+    );
     return db;
 }
 
@@ -391,10 +418,18 @@ fn activeCount(db: *c.sqlite3) !i64 {
 }
 
 fn initialize(db: *c.sqlite3) !void {
-    try exec(db, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    try exec(db,
+        \\PRAGMA journal_mode=WAL;
+        \\PRAGMA foreign_keys=ON;
+        \\PRAGMA trusted_schema=OFF;
+        \\PRAGMA busy_timeout=5000;
+        \\PRAGMA wal_autocheckpoint=256;
+        \\PRAGMA journal_size_limit=16777216;
+    );
     const has_jobs = try tableExists(db, "jobs");
     const has_meta = try tableExists(db, "nzigbunny_schema");
     if (has_jobs and !has_meta) return error.LegacyGoSchemaDetected;
+    if (!has_jobs and !has_meta) try exec(db, "PRAGMA auto_vacuum=INCREMENTAL;");
     try exec(db,
         \\BEGIN IMMEDIATE;
         \\CREATE TABLE IF NOT EXISTS nzigbunny_schema (
@@ -545,6 +580,9 @@ test "SQLite job transitions use compare and set" {
     const id = try db.create(io, "sample.nzb", "<nzb/>", 100);
     const pending = (try db.get(io, id)).?;
     try std.testing.expectEqual(Status.pending, pending.status);
+    try std.testing.expectEqual(@as(usize, 0), pending.content.len);
+    const pending_with_content = (try db.getWithContent(io, id)).?;
+    try std.testing.expectEqualStrings("<nzb/>", pending_with_content.content);
     try std.testing.expect((try db.createIfCapacity(io, "second.nzb", "<nzb/>", 100, 1)) == null);
     try std.testing.expect(try db.claimPending(io, id, 101));
     try std.testing.expect(!try db.claimPending(io, id, 102));

@@ -55,17 +55,23 @@ const RateEntry = struct {
     used: bool = false,
 };
 
-const RateLimiter = struct {
-    entries: [8192]RateEntry = @splat(.{}),
+const RateShard = struct {
+    entries: [32]RateEntry = @splat(.{}),
     mutex: std.Io.Mutex = .init,
+};
+
+const RateLimiter = struct {
+    shards: [256]RateShard = @splat(.{}),
+    seed: u64 = 0,
 
     fn allow(self: *RateLimiter, io: std.Io, key_text: []const u8, limit: u32, now: i64) bool {
-        const key = std.hash.Wyhash.hash(0, key_text);
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        const key = std.hash.Wyhash.hash(self.seed, key_text);
+        const shard = &self.shards[@as(u8, @truncate(key))];
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
         var free: ?usize = null;
         var oldest: usize = 0;
-        for (&self.entries, 0..) |*entry, i| {
+        for (&shard.entries, 0..) |*entry, i| {
             if (!entry.used) {
                 free = i;
                 break;
@@ -79,10 +85,10 @@ const RateLimiter = struct {
                 entry.count += 1;
                 return true;
             }
-            if (entry.window < self.entries[oldest].window) oldest = i;
+            if (entry.window < shard.entries[oldest].window) oldest = i;
         }
         const slot = free orelse oldest;
-        self.entries[slot] = .{ .key = key, .count = 1, .window = now, .used = true };
+        shard.entries[slot] = .{ .key = key, .count = 1, .window = now, .used = true };
         return true;
     }
 };
@@ -103,6 +109,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
         .connections = .{ .permits = cfg.max_connections },
         .limiter = .{},
     };
+    io.random(std.mem.asBytes(&context.limiter.seed));
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     group.async(io, worker.run, .{ allocator, io, db, cfg, context.root });
@@ -708,4 +715,14 @@ test "forwarded addresses require a trusted direct peer" {
     try std.testing.expect(trustedPeer("10.1.2.3", "10.0.0.0/8,192.0.2.0/24"));
     try std.testing.expect(!trustedPeer("198.51.100.2", "10.0.0.0/8"));
     try std.testing.expect(trustedPeer("2001:db8::2", "2001:db8::/32"));
+}
+
+test "rate limits are isolated and windows expire" {
+    var limiter: RateLimiter = .{};
+    const io = std.testing.io;
+    try std.testing.expect(limiter.allow(io, "192.0.2.1", 2, 100));
+    try std.testing.expect(limiter.allow(io, "192.0.2.1", 2, 101));
+    try std.testing.expect(!limiter.allow(io, "192.0.2.1", 2, 102));
+    try std.testing.expect(limiter.allow(io, "192.0.2.2", 2, 102));
+    try std.testing.expect(limiter.allow(io, "192.0.2.1", 2, 160));
 }

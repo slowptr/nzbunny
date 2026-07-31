@@ -12,6 +12,7 @@ const SabResult = struct {
 };
 
 const max_concurrent_finalizers = 2;
+const max_concurrent_jobs = 8;
 
 const Finalizers = struct {
     allocator: std.mem.Allocator,
@@ -60,9 +61,27 @@ const FinalizeTask = struct {
     download_path: []u8,
 };
 
+const ProcessTask = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db: *Database,
+    cfg: Config,
+    finalizers: *Finalizers,
+    job: *const Job,
+    now: i64,
+};
+
+const CleanupTask = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db: *Database,
+    cfg: Config,
+    root: []const u8,
+    job: *const Job,
+    now: i64,
+};
+
 pub fn run(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8) void {
-    var client = std.http.Client{ .allocator = allocator, .io = io };
-    defer client.deinit();
     var finalizers = Finalizers{
         .allocator = allocator,
         .io = io,
@@ -74,11 +93,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config,
     var last_cleanup: i64 = 0;
     while (true) {
         const now = std.Io.Clock.real.now(io).toSeconds();
-        cycle(allocator, io, db, cfg, &client, &finalizers, now) catch |err|
+        cycle(allocator, io, db, cfg, &finalizers, now) catch |err|
             std.log.err("The worker cycle failed: {t}", .{err});
         if (now - last_cleanup >= cfg.cleanup_seconds) {
-            cleanup(allocator, io, db, cfg, root, &client, now) catch |err|
+            cleanup(allocator, io, db, cfg, root, now) catch |err|
                 std.log.err("The cleanup cycle failed: {t}", .{err});
+            db.maintain() catch |err|
+                std.log.err("SQLite maintenance failed: {t}", .{err});
             last_cleanup = now;
         }
         std.Io.sleep(io, .fromSeconds(cfg.poll_seconds), .awake) catch return;
@@ -90,29 +111,59 @@ fn cycle(
     io: std.Io,
     db: *Database,
     cfg: Config,
-    client: *std.http.Client,
     finalizers: *Finalizers,
     now: i64,
 ) !void {
     const jobs = try db.listWork(io);
-    defer db.allocator.free(jobs);
-    for (jobs) |job| {
-        defer job.deinit(db.allocator);
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const job_allocator = arena.allocator();
-        switch (job.status) {
-            .pending => submitPending(job_allocator, io, db, cfg, client, job, now) catch |err|
-                std.log.err("Job {s} submission failed: {t}", .{ job.id, err }),
-            .submitting => reconcileSubmitting(job_allocator, io, db, cfg, client, job, now) catch |err|
-                std.log.err("Job {s} reconciliation failed: {t}", .{ job.id, err }),
-            .processing => pollProcessing(job_allocator, io, db, cfg, client, job, now) catch |err|
-                std.log.err("Job {s} poll failed: {t}", .{ job.id, err }),
-            .finalizing => finalizers.schedule(job) catch |err|
-                std.log.err("Job {s} finalization could not be scheduled: {t}", .{ job.id, err }),
-            else => {},
-        }
+    defer {
+        for (jobs) |job| job.deinit(db.allocator);
+        db.allocator.free(jobs);
     }
+    var offset: usize = 0;
+    while (offset < jobs.len) {
+        const end = @min(offset + max_concurrent_jobs, jobs.len);
+        var group: std.Io.Group = .init;
+        for (jobs[offset..end]) |*job| {
+            const task = ProcessTask{
+                .allocator = allocator,
+                .io = io,
+                .db = db,
+                .cfg = cfg,
+                .finalizers = finalizers,
+                .job = job,
+                .now = now,
+            };
+            group.concurrent(io, processJob, .{task}) catch processJob(task);
+        }
+        try group.await(io);
+        offset = end;
+    }
+}
+
+fn processJob(task: ProcessTask) void {
+    var arena = std.heap.ArenaAllocator.init(task.allocator);
+    defer arena.deinit();
+    var client = std.http.Client{ .allocator = arena.allocator(), .io = task.io };
+    defer client.deinit();
+    const job = task.job.*;
+    switch (job.status) {
+        .pending => processPending(arena.allocator(), task, &client) catch |err|
+            std.log.err("Job {s} submission failed: {t}", .{ job.id, err }),
+        .submitting => reconcileSubmitting(arena.allocator(), task.io, task.db, task.cfg, &client, job, task.now) catch |err|
+            std.log.err("Job {s} reconciliation failed: {t}", .{ job.id, err }),
+        .processing => pollProcessing(arena.allocator(), task.io, task.db, task.cfg, &client, job, task.now) catch |err|
+            std.log.err("Job {s} poll failed: {t}", .{ job.id, err }),
+        .finalizing => task.finalizers.schedule(job) catch |err|
+            std.log.err("Job {s} finalization could not be scheduled: {t}", .{ job.id, err }),
+        else => {},
+    }
+}
+
+fn processPending(allocator: std.mem.Allocator, task: ProcessTask, client: *std.http.Client) !void {
+    const job = (try task.db.getWithContent(task.io, task.job.id)) orelse return;
+    defer job.deinit(task.db.allocator);
+    if (job.status != .pending) return;
+    try submitPending(allocator, task.io, task.db, task.cfg, client, job, task.now);
 }
 
 fn submitPending(
@@ -245,7 +296,6 @@ fn cleanup(
     db: *Database,
     cfg: Config,
     root: []const u8,
-    client: *std.http.Client,
     now: i64,
 ) !void {
     const submission_age = @max(cfg.retention_seconds, 1800);
@@ -257,33 +307,64 @@ fn cleanup(
         now - submission_age,
         now - processing_age,
     );
-    defer db.allocator.free(jobs);
-    for (jobs) |job| {
-        defer job.deinit(db.allocator);
-        if (job.status == .expired) {
-            try db.purgeExpired(io, job.id, now - 1800);
-            continue;
-        }
-        if (job.status == .submitting or job.status == .processing or job.status == .failed) {
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-            cancelSabWork(arena.allocator(), client, cfg, job) catch |err| {
-                std.log.err("Job {s} SABnzbd cleanup failed: {t}", .{ job.id, err });
-                continue;
-            };
-        }
-        if (job.download_path.len != 0)
-            artifact.removeValidated(root, job.download_path) catch |err| {
-                std.log.err("Job {s} output cleanup was rejected: {t}", .{ job.id, err });
-                continue;
-            };
-        if (job.artifact_path.len != 0 and !std.mem.eql(u8, job.artifact_path, job.download_path))
-            artifact.removeValidated(root, job.artifact_path) catch |err| {
-                std.log.err("Job {s} artifact cleanup was rejected: {t}", .{ job.id, err });
-                continue;
-            };
-        _ = try db.markExpired(io, job.id, job.status, now);
+    defer {
+        for (jobs) |job| job.deinit(db.allocator);
+        db.allocator.free(jobs);
     }
+    var offset: usize = 0;
+    while (offset < jobs.len) {
+        const end = @min(offset + max_concurrent_jobs, jobs.len);
+        var group: std.Io.Group = .init;
+        for (jobs[offset..end]) |*job| {
+            const task = CleanupTask{
+                .allocator = allocator,
+                .io = io,
+                .db = db,
+                .cfg = cfg,
+                .root = root,
+                .job = job,
+                .now = now,
+            };
+            group.concurrent(io, processCleanup, .{task}) catch processCleanup(task);
+        }
+        try group.await(io);
+        offset = end;
+    }
+}
+
+fn processCleanup(task: CleanupTask) void {
+    const job = task.job.*;
+    var arena = std.heap.ArenaAllocator.init(task.allocator);
+    defer arena.deinit();
+    var client = std.http.Client{ .allocator = arena.allocator(), .io = task.io };
+    defer client.deinit();
+    cleanupJob(arena.allocator(), &client, task, job) catch |err|
+        std.log.err("Job {s} cleanup failed: {t}", .{ job.id, err });
+}
+
+fn cleanupJob(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    task: CleanupTask,
+    job: Job,
+) !void {
+    if (job.status == .expired) return task.db.purgeExpired(task.io, job.id, task.now - 1800);
+    if (job.status == .submitting or job.status == .processing or job.status == .failed)
+        cancelSabWork(allocator, client, task.cfg, job) catch |err| {
+            std.log.err("Job {s} SABnzbd cleanup failed: {t}", .{ job.id, err });
+            return;
+        };
+    if (job.download_path.len != 0)
+        artifact.removeValidated(task.root, job.download_path) catch |err| {
+            std.log.err("Job {s} output cleanup was rejected: {t}", .{ job.id, err });
+            return;
+        };
+    if (job.artifact_path.len != 0 and !std.mem.eql(u8, job.artifact_path, job.download_path))
+        artifact.removeValidated(task.root, job.artifact_path) catch |err| {
+            std.log.err("Job {s} artifact cleanup was rejected: {t}", .{ job.id, err });
+            return;
+        };
+    _ = try task.db.markExpired(task.io, job.id, job.status, task.now);
 }
 
 fn cancelSabWork(
@@ -340,11 +421,13 @@ fn upload(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, j
     client.io.random(&boundary_random);
     var boundary: [24]u8 = undefined;
     _ = std.fmt.bufPrint(&boundary, "{x}", .{boundary_random}) catch unreachable;
-    var body = std.Io.Writer.Allocating.init(allocator);
-    try body.writer.print("--{s}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{s}.nzb\"\r\n", .{ boundary, job.id });
-    try body.writer.writeAll("Content-Type: application/x-nzb\r\n\r\n");
-    try body.writer.writeAll(job.content);
-    try body.writer.print("\r\n--{s}--\r\n", .{boundary});
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "--{s}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"{s}.nzb\"\r\n" ++
+            "Content-Type: application/x-nzb\r\n\r\n",
+        .{ boundary, job.id },
+    );
+    const suffix = try std.fmt.allocPrint(allocator, "\r\n--{s}--\r\n", .{boundary});
     const encoded_key = try encode(allocator, cfg.sab_api_key);
     const encoded_name = try encode(allocator, job.sab_name);
     const url = try std.fmt.allocPrint(allocator, "{s}/api?mode=addfile&output=json&apikey={s}&nzbname={s}", .{
@@ -356,7 +439,7 @@ fn upload(allocator: std.mem.Allocator, client: *std.http.Client, cfg: Config, j
         client,
         url,
         .POST,
-        body.writer.buffered(),
+        &.{ prefix, job.content, suffix },
         &.{.{ .name = "content-type", .value = content_type }},
         cfg.sab_request_seconds,
     );
@@ -428,7 +511,7 @@ fn fetchJson(
     client: *std.http.Client,
     url: []const u8,
     method: std.http.Method,
-    payload: ?[]const u8,
+    payload: ?[]const []const u8,
     headers: []const std.http.Header,
     timeout_seconds: u32,
 ) !std.json.Value {
@@ -449,10 +532,12 @@ fn fetchJson(
         timeout_seconds,
     }) catch return error.SabnzbdConcurrencyUnavailable;
     defer timeout.cancel(client.io);
-    if (payload) |body_bytes| {
-        request.transfer_encoding = .{ .content_length = body_bytes.len };
+    if (payload) |parts| {
+        var content_length: usize = 0;
+        for (parts) |part| content_length = try std.math.add(usize, content_length, part.len);
+        request.transfer_encoding = .{ .content_length = content_length };
         var body = try request.sendBodyUnflushed(&.{});
-        try body.writer.writeAll(body_bytes);
+        for (parts) |part| try body.writer.writeAll(part);
         try body.end();
         try request.connection.?.flush();
     } else {
