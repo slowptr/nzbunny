@@ -88,7 +88,9 @@ docker compose -f deploy/docker-compose.yml up --build
 ```
 
 Compose stores the database in the `nzigbunny-data` volume. It uses the
-`downloads` volume to share files between both services.
+`downloads` volume to share files between both services. Before nzigbunny
+starts, Compose configures SABnzbd to put completed downloads in
+`/downloads/complete`.
 
 Compose binds both HTTP ports to the host loopback interface. Keep nzigbunny
 behind an authenticated reverse proxy before making it reachable from another

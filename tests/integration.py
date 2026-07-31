@@ -16,8 +16,8 @@ from pathlib import Path
 
 class SabState:
     uploads = 0
-    accepted_name = ""
-    nzo_id = "SAB-UNCERTAIN-1"
+    jobs = {}
+    storages = []
     lock = threading.Lock()
 
 
@@ -36,7 +36,11 @@ class SabHandler(BaseHTTPRequestHandler):
         self.rfile.read(length)
         with SabState.lock:
             SabState.uploads += 1
-            SabState.accepted_name = query["nzbname"][0]
+            name = query["nzbname"][0]
+            SabState.jobs[name] = (
+                f"SAB-UNCERTAIN-{SabState.uploads}",
+                SabState.storages[SabState.uploads - 1],
+            )
         self.connection.shutdown(socket.SHUT_RDWR)
         self.connection.close()
 
@@ -44,10 +48,13 @@ class SabHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         mode = query.get("mode", [""])[0]
         if mode == "queue":
-            if query.get("search") == [SabState.accepted_name]:
+            name = query.get("search", [""])[0]
+            with SabState.lock:
+                job = SabState.jobs.get(name)
+            if job:
                 slots = [{
-                    "nzo_id": SabState.nzo_id,
-                    "name": SabState.accepted_name,
+                    "nzo_id": job[0],
+                    "name": name,
                     "status": "Downloading",
                 }]
             else:
@@ -55,12 +62,22 @@ class SabHandler(BaseHTTPRequestHandler):
             self.send_json({"queue": {"slots": slots}})
             return
         if mode == "history":
-            if query.get("nzo_ids") == [SabState.nzo_id]:
+            nzo_id = query.get("nzo_ids", [""])[0]
+            with SabState.lock:
+                match = next(
+                    (
+                        (name, job)
+                        for name, job in SabState.jobs.items()
+                        if job[0] == nzo_id
+                    ),
+                    None,
+                )
+            if match:
                 slots = [{
-                    "nzo_id": SabState.nzo_id,
-                    "name": SabState.accepted_name,
+                    "nzo_id": nzo_id,
+                    "name": match[0],
                     "status": "Completed",
-                    "storage": "result.bin",
+                    "storage": match[1][1],
                 }]
             else:
                 slots = []
@@ -159,8 +176,10 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="nzigbunny-integration-") as root:
         root_path = Path(root)
-        artifact = root_path / "result.bin"
-        artifact.write_bytes(b"integration artifact")
+        artifacts = [root_path / "result-1.bin", root_path / "result-2.bin"]
+        artifacts[0].write_bytes(b"integration artifact one")
+        artifacts[1].write_bytes(b"integration artifact two")
+        SabState.storages = [artifact.name for artifact in artifacts]
         environment = os.environ.copy()
         environment.update({
             "SABNZBD_URL": f"http://127.0.0.1:{sab_port}",
@@ -168,14 +187,14 @@ def main():
             "SABNZBD_DOWNLOAD_DIR": root,
             "DB_PATH": str(root_path / "jobs.db"),
             "PORT": str(app_port),
-            "RETENTION_TTL": "3s",
+            "RETENTION_TTL": "6s",
             "CLEANUP_INTERVAL": "1s",
             "POLL_INTERVAL": "1s",
             "SABNZBD_REQUEST_TIMEOUT": "5s",
             "HTTP_HEADER_TIMEOUT": "1s",
             "HTTP_REQUEST_TIMEOUT": "5s",
             "MAX_CONNECTIONS": "4",
-            "UPLOADS_PER_MINUTE": "1",
+            "UPLOADS_PER_MINUTE": "2",
         })
         slow_process = subprocess.Popen(
             [str(executable)],
@@ -208,28 +227,41 @@ def main():
         try:
             wait_ready(app_port)
             location = upload(app_port)
-            status, _, _ = request(app_port, "POST", "/", b"")
-            assert status == 429
             page = wait_job(app_port, location, "COMPLETE")
             match = re.search(r'href="(/d/[0-9a-f]{64})"', page)
             assert match
             status, headers, body = request(app_port, "GET", match.group(1))
             assert status == 200
-            assert body == b"integration artifact"
+            assert body == b"integration artifact one"
             assert headers["cache-control"] == "private, no-store"
-            artifact.write_bytes(b"replacement artifact")
+            artifacts[0].write_bytes(b"replacement artifact")
             status, _, body = request(app_port, "GET", match.group(1))
             assert status == 200
-            assert body == b"integration artifact"
+            assert body == b"integration artifact one"
             status, headers, body = request(app_port, "HEAD", match.group(1))
             assert status == 200
             assert body == b""
-            assert headers["content-length"] == str(len(b"integration artifact"))
+            assert headers["content-length"] == str(len(b"integration artifact one"))
+
+            second_location = upload(app_port)
+            second_page = wait_job(app_port, second_location, "COMPLETE")
+            second_match = re.search(r'href="(/d/[0-9a-f]{64})"', second_page)
+            assert second_match
+            status, _, body = request(app_port, "GET", second_match.group(1))
+            assert status == 200
+            assert body == b"integration artifact two"
+            status, _, _ = request(app_port, "POST", "/", b"")
+            assert status == 429
+
             wait_job(app_port, location, "EXPIRED")
             status, _, _ = request(app_port, "GET", match.group(1))
             assert status == 410
-            assert not artifact.exists()
-            assert SabState.uploads == 1
+            wait_job(app_port, second_location, "EXPIRED")
+            status, _, _ = request(app_port, "GET", second_match.group(1))
+            assert status == 410
+            assert not artifacts[0].exists()
+            assert not artifacts[1].exists()
+            assert SabState.uploads == 2
         finally:
             stop_process(process)
             server.shutdown()

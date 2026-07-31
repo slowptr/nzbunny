@@ -30,12 +30,35 @@ services:
     depends_on:
       sabnzbd:
         condition: service_healthy
+      sabnzbd-configure:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:1337/readyz"]
       interval: 10s
       timeout: 3s
       retries: 6
     restart: unless-stopped
+
+  sabnzbd-configure:
+    image: lscr.io/linuxserver/sabnzbd@sha256:302be8972d4627222a0701634f2f9025826d760d856414aa6e67c0a66833e5be
+    environment:
+      SABNZBD_API_KEY: ${SABNZBD_API_KEY:?Set SABNZBD_API_KEY in your environment}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        response="$$(curl --fail --silent --show-error --get \
+          --data-urlencode mode=set_config \
+          --data-urlencode section=misc \
+          --data-urlencode keyword=complete_dir \
+          --data-urlencode value=/downloads/complete \
+          --data-urlencode output=json \
+          --data-urlencode "apikey=$$SABNZBD_API_KEY" \
+          http://sabnzbd:8080/api)"
+        printf '%s\n' "$$response" | grep -F '"complete_dir":"/downloads/complete"' >/dev/null
+    depends_on:
+      sabnzbd:
+        condition: service_healthy
+    restart: "no"
 
   sabnzbd:
     image: lscr.io/linuxserver/sabnzbd@sha256:302be8972d4627222a0701634f2f9025826d760d856414aa6e67c0a66833e5be

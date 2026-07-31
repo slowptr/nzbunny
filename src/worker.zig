@@ -102,7 +102,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config,
                 std.log.err("SQLite maintenance failed: {t}", .{err});
             last_cleanup = now;
         }
-        std.Io.sleep(io, .fromSeconds(cfg.poll_seconds), .awake) catch return;
+        std.Io.sleep(io, .fromSeconds(cfg.poll_seconds), .awake) catch |err| {
+            std.log.err("The worker loop stopped: {t}", .{err});
+            return;
+        };
     }
 }
 
@@ -119,24 +122,16 @@ fn cycle(
         for (jobs) |job| job.deinit(db.allocator);
         db.allocator.free(jobs);
     }
-    var offset: usize = 0;
-    while (offset < jobs.len) {
-        const end = @min(offset + max_concurrent_jobs, jobs.len);
-        var group: std.Io.Group = .init;
-        for (jobs[offset..end]) |*job| {
-            const task = ProcessTask{
-                .allocator = allocator,
-                .io = io,
-                .db = db,
-                .cfg = cfg,
-                .finalizers = finalizers,
-                .job = job,
-                .now = now,
-            };
-            group.concurrent(io, processJob, .{task}) catch processJob(task);
-        }
-        try group.await(io);
-        offset = end;
+    for (jobs) |*job| {
+        processJob(.{
+            .allocator = allocator,
+            .io = io,
+            .db = db,
+            .cfg = cfg,
+            .finalizers = finalizers,
+            .job = job,
+            .now = now,
+        });
     }
 }
 
@@ -601,6 +596,13 @@ fn encode(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
 fn definitelyNotSent(err: anyerror) bool {
     return err == error.ConnectionRefused or
         err == error.UnknownHostName or
+        err == error.ResolvConfParseFailed or
+        err == error.InvalidDnsARecord or
+        err == error.InvalidDnsAAAARecord or
+        err == error.InvalidDnsCnameRecord or
+        err == error.NameServerFailure or
+        err == error.NoAddressReturned or
+        err == error.DetectingNetworkConfigurationFailed or
         err == error.NetworkUnreachable or
         err == error.AddressFamilyUnsupported;
 }
@@ -609,4 +611,22 @@ test "SABnzbd state normalization" {
     try std.testing.expectEqual(SabState.complete, normalizeState("Completed"));
     try std.testing.expectEqual(SabState.failed, normalizeState("FAILED"));
     try std.testing.expectEqual(SabState.queued, normalizeState("Downloading"));
+}
+
+test "pre-connect failures can safely retry an upload" {
+    const failures = [_]anyerror{
+        error.ConnectionRefused,
+        error.UnknownHostName,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.DetectingNetworkConfigurationFailed,
+        error.NetworkUnreachable,
+        error.AddressFamilyUnsupported,
+    };
+    for (failures) |err| try std.testing.expect(definitelyNotSent(err));
+    try std.testing.expect(!definitelyNotSent(error.ConnectionResetByPeer));
 }
