@@ -1,6 +1,7 @@
 const std = @import("std");
 const nzb = @import("nzb.zig");
 const nntp = @import("nntp.zig");
+const shutdown = @import("shutdown.zig");
 const yenc = @import("yenc.zig");
 
 pub const Result = struct {
@@ -15,8 +16,11 @@ pub fn run(
     nzb_bytes: []const u8,
     cfg: anytype,
     ca_store: *nntp.CaStore,
-    deadline_seconds: i64,
+    control: *shutdown.DownloadControl,
 ) !Result {
+    var watchdog: std.Io.Group = .init;
+    watchdog.async(io, shutdown.DownloadControl.watch, .{control});
+    defer watchdog.cancel(io);
     const document = try nzb.parse(allocator, nzb_bytes);
     defer document.deinit(allocator);
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
@@ -47,7 +51,8 @@ pub fn run(
     }
     var total_size: u64 = 0;
     for (document.files, 0..) |file, file_index| {
-        outputs[file_index] = try fetchFile(allocator, io, root_dir, work_root, file_index, file, cfg, ca_store, deadline_seconds);
+        try checkCanceled(control);
+        outputs[file_index] = try fetchFile(allocator, io, root_dir, work_root, file_index, file, cfg, ca_store, control);
         std.log.info("file {d}/{d} downloaded: {s} ({d} segments)", .{ file_index + 1, document.files.len, outputs[file_index].name, file.segments.len });
         total_size = std.math.add(u64, total_size, outputs[file_index].size) catch return error.ArtifactTooLarge;
         if (total_size > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
@@ -55,7 +60,8 @@ pub fn run(
     try rejectDuplicateNames(outputs);
     try rejectUnsupportedSet(outputs);
     for (outputs, 0..) |output, file_index| {
-        try assembleFile(allocator, io, root_dir, tmp_output_root, file_index, output, deadline_seconds);
+        try checkCanceled(control);
+        try assembleFile(allocator, io, root_dir, tmp_output_root, file_index, output, control);
     }
 
     // Flush temporary output directory
@@ -105,7 +111,7 @@ const WorkerContext = struct {
     segments: []const nzb.Segment,
     cfg: @import("config.zig").Config,
     ca_store: *nntp.CaStore,
-    deadline_seconds: i64,
+    control: *shutdown.DownloadControl,
     parts: []Part,
     expected_name: []const u8,
     expected_size: u64,
@@ -124,9 +130,9 @@ fn fetchFile(
     file: nzb.File,
     cfg: anytype,
     ca_store: *nntp.CaStore,
-    deadline_seconds: i64,
+    control: *shutdown.DownloadControl,
 ) !OutputFile {
-    if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
+    try checkCanceled(control);
     var file_work_buffer: [256]u8 = undefined;
     const file_work = try std.fmt.bufPrint(&file_work_buffer, "{s}/{d}", .{ work_root, file_index });
     try ensureDir(io, root_dir, file_work);
@@ -137,7 +143,7 @@ fn fetchFile(
 
     var name: []const u8 = "";
     var size: u64 = 0;
-    const first = try fetchSegment(allocator, io, root_dir, file_work, 0, file.segments[0], cfg, ca_store, deadline_seconds);
+    const first = try fetchSegment(allocator, io, root_dir, file_work, 0, file.segments[0], cfg, ca_store, control);
     defer allocator.free(first.name);
     parts[0] = .{ .begin = first.begin, .end = first.end, .rel_path = first.rel_path };
     name = try allocator.dupe(u8, first.name);
@@ -161,7 +167,7 @@ fn fetchFile(
             .segments = file.segments,
             .cfg = cfg,
             .ca_store = ca_store,
-            .deadline_seconds = deadline_seconds,
+            .control = control,
             .parts = parts,
             .expected_name = name,
             .expected_size = size,
@@ -185,10 +191,10 @@ fn fetchFile(
 
 fn fetchSegmentWorker(ctx: WorkerContext) void {
     while (!ctx.canceled.load(.acquire)) {
-        if (std.Io.Clock.real.now(ctx.io).toSeconds() >= ctx.deadline_seconds) {
-            recordSegmentError(ctx, error.Timeout);
+        checkCanceled(ctx.control) catch |err| {
+            recordSegmentError(ctx, err);
             return;
-        }
+        };
         const index = ctx.next_segment.fetchAdd(1, .monotonic);
         if (index >= ctx.segments.len) break;
         const segment = ctx.segments[index];
@@ -201,7 +207,7 @@ fn fetchSegmentWorker(ctx: WorkerContext) void {
             segment,
             ctx.cfg,
             ctx.ca_store,
-            ctx.deadline_seconds,
+            ctx.control,
         ) catch |err| {
             recordSegmentError(ctx, err);
             return;
@@ -221,6 +227,7 @@ fn recordSegmentError(ctx: WorkerContext, err: anyerror) void {
     defer ctx.mutex.unlock(ctx.io);
     if (ctx.first_error.* == null) ctx.first_error.* = err;
     ctx.canceled.store(true, .release);
+    ctx.control.cancel();
 }
 
 const DecodedPart = struct {
@@ -240,15 +247,14 @@ fn fetchSegment(
     segment: nzb.Segment,
     cfg: anytype,
     ca_store: *nntp.CaStore,
-    deadline_seconds: i64,
+    control: *shutdown.DownloadControl,
 ) !DecodedPart {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
-        return fetchSegmentOnce(allocator, io, root_dir, file_work, index, segment, cfg, ca_store) catch |err| {
+        try checkCanceled(control);
+        return fetchSegmentOnce(allocator, io, root_dir, file_work, index, segment, cfg, ca_store, control) catch |err| {
             if (attempt >= 3 or !retryable(err)) return err;
-            if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
-            std.Io.sleep(io, .fromSeconds(@as(i64, 1) << @intCast(attempt)), .awake) catch {};
+            try control.wait(@as(i64, 1) << @intCast(attempt));
             continue;
         };
     }
@@ -263,6 +269,7 @@ fn fetchSegmentOnce(
     segment: nzb.Segment,
     cfg: anytype,
     ca_store: *nntp.CaStore,
+    control: *shutdown.DownloadControl,
 ) !DecodedPart {
     var part_path_buffer: [320]u8 = undefined;
     const part_path = try std.fmt.bufPrint(&part_path_buffer, "{s}/{d}.part", .{ file_work, index });
@@ -283,6 +290,7 @@ fn fetchSegmentOnce(
         cfg.nntp_pass,
         ca_store,
         cfg.nntp_timeout_seconds,
+        control,
     );
     defer session.deinit();
     try session.connect();
@@ -302,7 +310,7 @@ fn fetchSegmentOnce(
     try out_file.sync(io);
 
     // Validate declared yEnc segment byte count
-    const part_bytes = meta.end - meta.begin + 1;
+    const part_bytes = try inclusiveRangeLength(meta.begin, meta.end);
     if (part_bytes != segment.declared_bytes) return error.InconsistentSegmentSize;
 
     try root_dir.rename(tmp_path, root_dir, part_path, io);
@@ -322,10 +330,10 @@ fn assembleFile(
     output_root: []const u8,
     file_index: usize,
     output: OutputFile,
-    deadline_seconds: i64,
+    control: *shutdown.DownloadControl,
 ) !void {
     _ = file_index;
-    if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
+    try checkCanceled(control);
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
     defer allocator.free(final_path);
     var out = try root_dir.createFile(io, final_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
@@ -334,10 +342,10 @@ fn assembleFile(
     var writer = out.writer(io, &out_buffer);
     var buffer: [64 * 1024]u8 = undefined;
     for (output.parts) |part| {
-        if (std.Io.Clock.real.now(io).toSeconds() >= deadline_seconds) return error.Timeout;
+        try checkCanceled(control);
         var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
         defer input.close(io);
-        const size = part.end - part.begin + 1;
+        const size = try inclusiveRangeLength(part.begin, part.end);
         var reader = std.Io.File.Reader.initSize(input, io, &buffer, size);
         const sent = try writer.interface.sendFileAll(&reader, .limited(size));
         if (sent != size) return error.DecodedPartChanged;
@@ -355,9 +363,14 @@ fn validatePartRanges(parts: []Part, size: u64) !void {
     var expected: u64 = 1;
     for (parts) |part| {
         if (part.begin != expected or part.end < part.begin or part.end > size) return error.InvalidYencRange;
-        expected = part.end + 1;
+        expected = std.math.add(u64, part.end, 1) catch return error.InvalidYencRange;
     }
-    if (expected != size + 1) return error.InvalidYencRange;
+    if (expected != std.math.add(u64, size, 1) catch return error.InvalidYencRange) return error.InvalidYencRange;
+}
+
+fn inclusiveRangeLength(begin: u64, end: u64) !u64 {
+    if (begin == 0 or end < begin) return error.InvalidYencRange;
+    return std.math.add(u64, end - begin, 1) catch error.InvalidYencRange;
 }
 
 fn rejectDuplicateNames(outputs: []OutputFile) !void {
@@ -395,11 +408,16 @@ fn splitName(name: []const u8) bool {
     return false;
 }
 
+fn checkCanceled(control: *shutdown.DownloadControl) !void {
+    if (control.isCanceled()) return error.Canceled;
+    if (std.Io.Clock.real.now(control.io).toSeconds() >= control.deadline_seconds) {
+        control.cancel();
+        return error.Timeout;
+    }
+}
+
 fn retryable(err: anyerror) bool {
-    return err == error.Timeout or
-        err == error.ConnectionResetByPeer or
-        err == error.NntpReadFailed or
-        err == error.YencCrcMismatch;
+    return nntp.isRetryableProviderFailure(err);
 }
 
 fn ensureDir(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
@@ -424,4 +442,3 @@ test "rejects split archive names" {
     try std.testing.expectError(error.Par2Rejected, rejectUnsupportedName("movie.par2"));
     try rejectUnsupportedName("movie.rar");
 }
-

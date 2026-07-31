@@ -2,6 +2,7 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const Database = @import("database.zig").Database;
 const Job = @import("database.zig").Job;
+const shutdown = @import("shutdown.zig");
 const worker = @import("worker.zig");
 const nntp = @import("nntp.zig");
 
@@ -116,10 +117,11 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store });
-    while (true) {
+    while (!shutdown.requested.load(.acquire)) {
         try context.connections.wait(io);
         const stream = listener.accept(io) catch |err| {
             context.connections.post(io);
+            if (shutdown.requested.load(.acquire)) break;
             return err;
         };
         group.async(io, accept, .{ &context, stream });

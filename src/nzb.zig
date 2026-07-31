@@ -65,6 +65,9 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
     if (containsOutsideMarkup(bytes, "<!entity")) {
         return error.InternalEntityRejected;
     }
+    if (containsEntityReference(bytes)) {
+        return error.EntityReferenceRejected;
+    }
 
     const options = c.XML_PARSE_NONET;
     const reader = c.xmlReaderForMemory(
@@ -166,6 +169,10 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                 if (segment_number == 0) {
                     setDiag(diag, reader);
                     return error.InvalidSegmentNumber;
+                }
+                if (segment_bytes == 0) {
+                    setDiag(diag, reader);
+                    return error.InvalidSegmentBytes;
                 }
             } else if (std.mem.eql(u8, name, "meta")) {
                 if (hasPasswordMeta(reader)) {
@@ -366,6 +373,15 @@ test "parses direct segment text" {
     try std.testing.expectEqualStrings("abc@example", doc.files[0].segments[0].message_id);
 }
 
+test "rejects zero-byte segments" {
+    const text =
+        \\<nzb><file><segments>
+        \\<segment bytes="0" number="1">a@b</segment>
+        \\</segments></file></nzb>
+    ;
+    try std.testing.expectError(error.InvalidSegmentBytes, parse(std.testing.allocator, text));
+}
+
 test "rejects duplicate segments" {
     const text =
         \\<nzb><file><segments>
@@ -381,6 +397,15 @@ test "rejects entity references" {
         \\<nzb><file><segments><segment bytes="1" number="1">&xxe;</segment></segments></file></nzb>
     ;
     try std.testing.expectError(error.EntityReferenceRejected, parse(std.testing.allocator, text));
+}
+
+test "accepts predefined entity references" {
+    const text =
+        \\<nzb><file><segments><segment bytes="1" number="1">a&amp;b</segment></segments></file></nzb>
+    ;
+    const doc = try parse(std.testing.allocator, text);
+    defer doc.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a&b", doc.files[0].segments[0].message_id);
 }
 
 test "provides line and column diagnostics on failure" {

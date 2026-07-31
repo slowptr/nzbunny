@@ -8,3 +8,5 @@
 /deploy/data/
 /deploy/downloads/
 /deploy/incomplete-downloads/
+/.pi-subagents/
+/tests/__pycache__/

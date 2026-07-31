@@ -9,9 +9,13 @@ pub const nzb = @import("nzb.zig");
 pub const yenc = @import("yenc.zig");
 pub const worker = @import("worker.zig");
 pub const paths = @import("paths.zig");
+pub const shutdown = @import("shutdown.zig");
 pub const web = @import("web.zig");
 
 pub fn run(init: std.process.Init) !void {
+    shutdown.requested.store(false, .release);
+    // ponytail: signal handlers wired in Phase 7 (graceful shutdown).
+    // shutdown.installSignalHandlers();
     const allocator = init.arena.allocator();
     const cfg = config.load(allocator, init.io, init.minimal.environ) catch |err| {
         std.log.err("Configuration is not valid: {t}", .{err});

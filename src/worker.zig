@@ -6,6 +6,7 @@ const Status = @import("database.zig").Status;
 const artifact = @import("artifact.zig");
 const download = @import("download.zig");
 const nntp = @import("nntp.zig");
+const shutdown = @import("shutdown.zig");
 
 pub var provider_ready: std.atomic.Value(bool) = .init(false);
 
@@ -101,6 +102,7 @@ pub fn startup(
         cfg.nntp_pass,
         ca_store,
         cfg.nntp_timeout_seconds,
+        null,
     );
     defer session.deinit();
     try session.connect();
@@ -124,7 +126,7 @@ pub fn run(
     };
     defer finalizers.deinit();
     var last_cleanup: i64 = 0;
-    while (true) {
+    while (!shutdown.requested.load(.acquire)) {
         const now = std.Io.Clock.real.now(io).toSeconds();
         cycle(allocator, io, db, cfg, root, ca_store, &finalizers, now) catch |err|
             std.log.err("The worker cycle failed: {t}", .{err});
@@ -135,10 +137,7 @@ pub fn run(
                 std.log.err("SQLite maintenance failed: {t}", .{err});
             last_cleanup = now;
         }
-        std.Io.sleep(io, .fromSeconds(cfg.poll_seconds), .awake) catch |err| {
-            std.log.err("The worker loop stopped: {t}", .{err});
-            return;
-        };
+        shutdown.waitForRequest(io, cfg.poll_seconds) catch return;
     }
 }
 
@@ -195,8 +194,9 @@ fn processPending(
     };
     if (!try db.beginProcessing(io, job.id, now)) return;
     const started = std.Io.Clock.real.now(io).toSeconds();
-    const deadline = started + cfg.download_timeout_seconds;
-    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store, deadline) catch |err| {
+    const deadline = std.math.add(i64, started, cfg.download_timeout_seconds) catch return error.Timeout;
+    var control = @import("shutdown.zig").DownloadControl.init(io, deadline);
+    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store, &control) catch |err| {
         const root_dir = std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false }) catch null;
         if (root_dir) |dir| {
             defer dir.close(io);
@@ -230,6 +230,7 @@ fn probeProvider(
         cfg.nntp_pass,
         ca_store,
         cfg.nntp_timeout_seconds,
+        null,
     );
     defer session.deinit();
     try session.connect();
@@ -342,12 +343,7 @@ fn cleanupWorkDirs(io: std.Io, root_dir: std.Io.Dir, job_id: []const u8) !void {
 }
 
 fn providerFailure(err: anyerror) bool {
-    return err == error.Timeout or
-        err == error.UnknownHostName or
-        err == error.ConnectionRefused or
-        err == error.ConnectionResetByPeer or
-        err == error.NetworkUnreachable or
-        err == error.NntpReadFailed;
+    return nntp.isRetryableProviderFailure(err);
 }
 
 test "provider readiness starts false" {

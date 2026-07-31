@@ -354,14 +354,14 @@ def main():
     assert executable.exists(), executable
     root = Path(__file__).resolve().parents[1]
 
-    print("[1/9] Testing residual SABnzbd references...")
+    print("[1/10] Testing residual SABnzbd references...")
     test_residual_references(root)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("[2/9] Generating test TLS certificates...")
+        print("[2/10] Generating test TLS certificates...")
         certs = generate_certs(temp_dir)
 
-        print("[3/9] Starting fake NNTP server...")
+        print("[3/10] Starting fake NNTP server...")
         server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         server.start()
         time.sleep(0.2)
@@ -389,7 +389,7 @@ def main():
             "POLL_INTERVAL": "1s",
         })
 
-        print("[4/9] Testing single direct file E2E download...")
+        print("[4/10] Testing single direct file E2E download...")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             wait_for_server("http://127.0.0.1:13370/readyz", proc)
@@ -422,12 +422,12 @@ def main():
             stdout, stderr = proc.communicate()
 
         log_output = (stdout or "") + (stderr or "")
-        print("[5/9] Auditing logs for credential/payload leaks...")
+        print("[5/10] Auditing logs for credential/payload leaks...")
         assert "testpass" not in log_output
         assert "Antigravity" not in log_output
         assert ".nzbunny-work" not in log_output
 
-        print("[6/9] Testing multi-file ZIP download & concurrency...")
+        print("[6/10] Testing multi-file ZIP download & concurrency...")
         server.articles.clear()
         f1_data = b"File 1 content data"
         f2_p1_data = b"File 2 part 1 data "
@@ -499,7 +499,34 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[7/9] Testing all-or-nothing failure & cleanup...")
+        print("[7/10] Testing malformed zero-size yEnc cleanup...")
+        server.articles.clear()
+        zero_msgid = "zero@nzbunny.test"
+        server.articles[zero_msgid] = b"=ybegin line=128 size=0 name=zero.bin\r\n=yend size=0 crc32=00000000\r\n"
+        proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server("http://127.0.0.1:13370/readyz", proc)
+            nzb_zero = build_nzb([[(1, 1, zero_msgid)]])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "zero.nzb", nzb_zero)
+            assert code == 303, (code, loc)
+            job_id = loc.split("/")[-1]
+
+            for _ in range(30):
+                assert proc.poll() is None, "Process aborted on zero-size yEnc"
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{job_id}")
+                if "FAILED" in html.decode("utf-8"):
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError("Zero-size yEnc job did not fail")
+
+            assert not os.path.exists(os.path.join(download_dir, ".nzbunny-work", job_id))
+            assert not os.path.exists(os.path.join(download_dir, ".nzbunny-downloads", job_id))
+        finally:
+            proc.terminate()
+            proc.communicate()
+
+        print("[8/10] Testing all-or-nothing failure & cleanup...")
         server.articles.clear()
         server.missing_articles.add("missing@nzbunny.test")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -527,7 +554,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[8/9] Testing DB V1 migration & interrupted download restart...")
+        print("[9/10] Testing DB V1 migration & interrupted download restart...")
         mig_db_path = os.path.join(temp_dir, "v1_migrate.db")
         conn = sqlite3.connect(mig_db_path)
         conn.execute("CREATE TABLE nzbunny_schema (version INTEGER NOT NULL)")
@@ -564,7 +591,7 @@ def main():
 
         server.stop()
 
-        print("[9/9] Testing Compose config validation...")
+        print("[10/10] Testing Compose config validation...")
         compose_file = root / "deploy/docker-compose.yml"
         compose_env = env.copy()
         compose_env.update({"NNTP_HOST": "localhost", "NNTP_USER": "u", "NNTP_PASS": "p"})

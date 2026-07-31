@@ -704,4 +704,3 @@ test "schema version 1 migration converts in-flight jobs and preserves completed
     try std.testing.expectEqual(Status.complete, j4.status);
     try std.testing.expectEqualStrings("art4.zip", j4.artifact_path);
 }
-

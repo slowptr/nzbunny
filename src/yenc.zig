@@ -59,7 +59,7 @@ pub const Decoder = struct {
             if (end.size != meta.decoded) return error.InvalidYencDecodedSize;
             if (meta.part != 0) {
                 if (meta.begin == 0 or meta.end < meta.begin) return error.MissingYpart;
-                if (meta.end - meta.begin + 1 != meta.decoded) return error.InvalidYencRange;
+                if (try inclusiveRangeLength(meta.begin, meta.end) != meta.decoded) return error.InvalidYencRange;
             } else {
                 meta.begin = 1;
                 meta.end = meta.size;
@@ -98,7 +98,7 @@ pub const Decoder = struct {
             byte -%= 42;
             try self.output.writeByte(byte);
             self.crc.update(&.{byte});
-            meta.decoded += 1;
+            meta.decoded = std.math.add(u64, meta.decoded, 1) catch return error.InvalidYencDecodedSize;
             if (meta.decoded > meta.size) return error.InvalidYencDecodedSize;
         }
         self.meta = meta;
@@ -110,6 +110,7 @@ const End = struct { size: u64, part: ?u32, pcrc32: ?u32, crc32: ?u32 };
 
 fn parseYbegin(allocator: std.mem.Allocator, line: []const u8) !Part {
     const size = try requiredInt(u64, line, "size=");
+    if (size == 0) return error.InvalidYencRange;
     const name = try requiredText(line, "name=");
     try validateName(name);
     const part = optionalInt(u32, line, "part=") catch return error.InvalidYencPart;
@@ -123,6 +124,11 @@ fn parseYbegin(allocator: std.mem.Allocator, line: []const u8) !Part {
         .crc32 = null,
         .decoded = 0,
     };
+}
+
+fn inclusiveRangeLength(begin: u64, end: u64) !u64 {
+    if (begin == 0 or end < begin) return error.InvalidYencRange;
+    return std.math.add(u64, end - begin, 1) catch error.InvalidYencRange;
 }
 
 fn parseYpart(line: []const u8) !Range {
@@ -188,6 +194,14 @@ test "decodes escaped bytes" {
     try std.testing.expectEqualStrings("=", out.writer.buffered());
 }
 
+test "rejects zero-size yenc" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    defer decoder.deinit();
+    try std.testing.expectError(error.InvalidYencRange, decoder.consumeLine("=ybegin line=128 size=0 name=a.bin"));
+}
+
 test "validates optional crc" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -229,4 +243,3 @@ test "rejects ypart for single-part yenc" {
     try decoder.consumeLine("=ybegin line=128 size=3 name=a.bin");
     try std.testing.expectError(error.YpartInSinglepart, decoder.consumeLine("=ypart begin=1 end=3"));
 }
-
