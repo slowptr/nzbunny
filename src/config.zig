@@ -1,16 +1,21 @@
 const std = @import("std");
 
 pub const Config = struct {
-    sab_url: []const u8,
-    sab_api_key: []const u8,
+    nntp_host: []const u8,
+    nntp_user: []const u8,
+    nntp_pass: []const u8,
+    nntp_ca_file: []const u8,
     download_dir: []const u8,
     db_path: []const u8,
     trusted_proxy_cidrs: []const u8,
+    nntp_port: u16,
+    nntp_connections: u32,
     port: u16,
     retention_seconds: i64,
     cleanup_seconds: u32,
     poll_seconds: u32,
-    sab_request_seconds: u32,
+    nntp_timeout_seconds: u32,
+    download_timeout_seconds: u32,
     http_header_seconds: u32,
     http_request_seconds: u32,
     max_artifact_bytes: u64,
@@ -21,14 +26,16 @@ pub const Config = struct {
 };
 
 const Defaults = struct {
-    const sab_url = "http://localhost:8080";
     const db_path = "nzbunny.db";
     const trusted_proxy_cidrs = "";
+    const nntp_port = "563";
+    const nntp_connections = "4";
+    const nntp_timeout = "30s";
+    const download_timeout = "2h";
     const port = "1337";
     const retention_ttl = "15m";
     const cleanup_interval = "30s";
     const poll_interval = "10s";
-    const sab_request_timeout = "30s";
     const http_header_timeout = "15s";
     const http_request_timeout = "5m";
     const max_artifact_bytes = "209715200";
@@ -48,24 +55,40 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Envir
         else => return err,
     };
 
-    const sab_api_key = value(&env, "SABNZBD_API_KEY", "");
-    const download_dir = value(&env, "SABNZBD_DOWNLOAD_DIR", "");
-    if (sab_api_key.len == 0) return error.MissingSabnzbdApiKey;
+    const nntp_host = value(&env, "NNTP_HOST", "");
+    const nntp_user = value(&env, "NNTP_USER", "");
+    const nntp_pass = value(&env, "NNTP_PASS", "");
+    const nntp_ca_file = value(&env, "NNTP_CA_FILE", "");
+    const download_dir = value(&env, "DOWNLOAD_DIR", "");
+    if (nntp_host.len == 0) return error.MissingNntpHost;
+    if (nntp_user.len == 0) return error.MissingNntpUser;
+    if (nntp_pass.len == 0) return error.MissingNntpPassword;
     if (download_dir.len == 0) return error.MissingDownloadDirectory;
+    try validateNntpValue(nntp_host);
+    try validateNntpValue(nntp_user);
+    try validateNntpValue(nntp_pass);
+    try validateNntpValue(nntp_ca_file);
 
     const trusted_proxy_cidrs = value(&env, "TRUSTED_PROXY_CIDRS", Defaults.trusted_proxy_cidrs);
     try validateCidrs(trusted_proxy_cidrs);
+    const nntp_connections = try positiveInt(u32, value(&env, "NNTP_CONNECTIONS", Defaults.nntp_connections));
+    if (nntp_connections > 16) return error.InvalidNntpConnections;
     return .{
-        .sab_url = try parseUrl(value(&env, "SABNZBD_URL", Defaults.sab_url)),
-        .sab_api_key = sab_api_key,
+        .nntp_host = nntp_host,
+        .nntp_user = nntp_user,
+        .nntp_pass = nntp_pass,
+        .nntp_ca_file = nntp_ca_file,
         .download_dir = download_dir,
         .db_path = value(&env, "DB_PATH", Defaults.db_path),
         .trusted_proxy_cidrs = trusted_proxy_cidrs,
+        .nntp_port = try positiveInt(u16, value(&env, "NNTP_PORT", Defaults.nntp_port)),
+        .nntp_connections = nntp_connections,
         .port = try positiveInt(u16, value(&env, "PORT", Defaults.port)),
         .retention_seconds = try retentionDuration(value(&env, "RETENTION_TTL", Defaults.retention_ttl)),
         .cleanup_seconds = try shortDuration(value(&env, "CLEANUP_INTERVAL", Defaults.cleanup_interval)),
         .poll_seconds = try shortDuration(value(&env, "POLL_INTERVAL", Defaults.poll_interval)),
-        .sab_request_seconds = try shortDuration(value(&env, "SABNZBD_REQUEST_TIMEOUT", Defaults.sab_request_timeout)),
+        .nntp_timeout_seconds = try shortDuration(value(&env, "NNTP_TIMEOUT", Defaults.nntp_timeout)),
+        .download_timeout_seconds = try shortDuration(value(&env, "DOWNLOAD_TIMEOUT", Defaults.download_timeout)),
         .http_header_seconds = try shortDuration(value(&env, "HTTP_HEADER_TIMEOUT", Defaults.http_header_timeout)),
         .http_request_seconds = try shortDuration(value(&env, "HTTP_REQUEST_TIMEOUT", Defaults.http_request_timeout)),
         .max_artifact_bytes = try positiveInt(u64, value(&env, "MAX_ARTIFACT_BYTES", Defaults.max_artifact_bytes)),
@@ -74,6 +97,10 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Envir
         .max_connections = try positiveInt(u32, value(&env, "MAX_CONNECTIONS", Defaults.max_connections)),
         .uploads_per_minute = try positiveInt(u32, value(&env, "UPLOADS_PER_MINUTE", Defaults.uploads_per_minute)),
     };
+}
+
+fn validateNntpValue(text: []const u8) !void {
+    if (std.mem.findAny(u8, text, "\x00\r\n") != null) return error.InvalidNntpConfigurationValue;
 }
 
 fn validateCidrs(value_text: []const u8) !void {
@@ -153,13 +180,6 @@ fn uploadBytes(text: []const u8) !u64 {
     return bytes;
 }
 
-fn parseUrl(text: []const u8) ![]const u8 {
-    const uri = std.Uri.parse(text) catch return error.InvalidSabnzbdUrl;
-    if (uri.host == null or (uri.scheme.len != 4 and uri.scheme.len != 5)) return error.InvalidSabnzbdUrl;
-    if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) return error.InvalidSabnzbdUrl;
-    return std.mem.trimEnd(u8, text, "/");
-}
-
 test "duration parser rejects silent fallbacks" {
     try std.testing.expectEqual(@as(i64, 900), try duration("15m"));
     try std.testing.expectError(error.InvalidDuration, duration("15"));
@@ -168,4 +188,8 @@ test "duration parser rejects silent fallbacks" {
     try std.testing.expectError(error.InvalidDuration, shortDuration("50000d"));
     try std.testing.expectError(error.RetentionTtlTooLarge, retentionDuration("366d"));
     try std.testing.expectError(error.MaximumUploadBytesTooLarge, uploadBytes("18446744073709551615"));
+}
+
+test "NNTP configuration rejects unsafe control bytes and connection range" {
+    try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("bad\nhost"));
 }

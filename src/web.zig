@@ -3,6 +3,7 @@ const Config = @import("config.zig").Config;
 const Database = @import("database.zig").Database;
 const Job = @import("database.zig").Job;
 const worker = @import("worker.zig");
+const nntp = @import("nntp.zig");
 
 const css = @embedFile("assets/styles.css");
 const javascript = @embedFile("assets/upload.js");
@@ -44,6 +45,7 @@ const Context = struct {
     cfg: Config,
     root: []const u8,
     root_dir: std.Io.Dir,
+    ca_store: *nntp.CaStore,
     connections: std.Io.Semaphore,
     limiter: RateLimiter,
 };
@@ -93,7 +95,7 @@ const RateLimiter = struct {
     }
 };
 
-pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8) !void {
+pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8, ca_store: *nntp.CaStore) !void {
     const address = try std.Io.net.IpAddress.parse("0.0.0.0", cfg.port);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -106,13 +108,14 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
         .cfg = cfg,
         .root = try allocator.dupe(u8, root),
         .root_dir = root_dir,
+        .ca_store = ca_store,
         .connections = .{ .permits = cfg.max_connections },
         .limiter = .{},
     };
     io.random(std.mem.asBytes(&context.limiter.seed));
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root });
+    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store });
     while (true) {
         try context.connections.wait(io);
         const stream = listener.accept(io) catch |err| {
@@ -186,8 +189,8 @@ fn route(
     }
     if (std.mem.eql(u8, target, "/readyz")) {
         if (request.head.method != .GET and request.head.method != .HEAD) return methodNotAllowed(request);
-        if (context.db.ready(context.io)) return respondText(request, .ok, "ready");
-        return respondText(request, .service_unavailable, "Database is not ready.");
+        if (context.db.ready(context.io) and worker.provider_ready.load(.acquire)) return respondText(request, .ok, "ready");
+        return respondText(request, .service_unavailable, "The service is not ready.");
     }
     if (std.mem.eql(u8, target, "/")) {
         return switch (request.head.method) {
@@ -546,7 +549,7 @@ pub fn htmlEscape(writer: *std.Io.Writer, value: []const u8) !void {
 fn describe(job: Job) struct { title: []const u8, detail: []const u8, refresh: bool } {
     return switch (job.status) {
         .pending => .{ .title = "Queued", .detail = "Your NZB is in the queue.", .refresh = true },
-        .submitting, .processing => .{ .title = "Downloading", .detail = "SABnzbd processes the job. This page refreshes automatically.", .refresh = true },
+        .processing => .{ .title = "Downloading", .detail = "The embedded downloader processes the job. This page refreshes automatically.", .refresh = true },
         .finalizing => .{ .title = "Finalizing", .detail = "The file is almost ready. Wait a few seconds.", .refresh = true },
         .complete => .{ .title = "Ready", .detail = "Your temporary download link is active until it expires.", .refresh = false },
         .expired => .{ .title = "Expired", .detail = "This temporary download expired and was removed.", .refresh = false },

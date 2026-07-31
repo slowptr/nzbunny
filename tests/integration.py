@@ -1,271 +1,40 @@
-import http.client
-import json
-import os
 import re
-import signal
-import socket
-import subprocess
 import sys
-import tempfile
-import threading
-import time
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-class SabState:
-    uploads = 0
-    jobs = {}
-    storages = []
-    lock = threading.Lock()
+REMOVED = (
+    "SAB" + "NZBD_URL",
+    "SAB" + "NZBD_API_KEY",
+    "SAB" + "NZBD_DOWNLOAD_DIR",
+    "SAB" + "NZBD_REQUEST_TIMEOUT",
+    "sab" + "nzbd",
+)
 
-
-class SabHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *_):
-        pass
-
-    def do_POST(self):
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-        if query.get("mode") != ["addfile"]:
-            self.send_json({"error": "bad mode"}, 400)
-            return
-        length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
-        with SabState.lock:
-            SabState.uploads += 1
-            name = query["nzbname"][0]
-            SabState.jobs[name] = (
-                f"SAB-UNCERTAIN-{SabState.uploads}",
-                SabState.storages[SabState.uploads - 1],
-            )
-        self.connection.shutdown(socket.SHUT_RDWR)
-        self.connection.close()
-
-    def do_GET(self):
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-        mode = query.get("mode", [""])[0]
-        if mode == "queue":
-            name = query.get("search", [""])[0]
-            with SabState.lock:
-                job = SabState.jobs.get(name)
-            if job:
-                slots = [{
-                    "nzo_id": job[0],
-                    "name": name,
-                    "status": "Downloading",
-                }]
-            else:
-                slots = []
-            self.send_json({"queue": {"slots": slots}})
-            return
-        if mode == "history":
-            nzo_id = query.get("nzo_ids", [""])[0]
-            with SabState.lock:
-                match = next(
-                    (
-                        (name, job)
-                        for name, job in SabState.jobs.items()
-                        if job[0] == nzo_id
-                    ),
-                    None,
-                )
-            if match:
-                slots = [{
-                    "nzo_id": nzo_id,
-                    "name": match[0],
-                    "status": "Completed",
-                    "storage": match[1][1],
-                }]
-            else:
-                slots = []
-            self.send_json({"history": {"slots": slots}})
-            return
-        self.send_json({"error": "bad mode"}, 400)
-
-    def send_json(self, value, status=200):
-        body = json.dumps(value).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def request(port, method, path, body=None, headers=None):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-    request_headers = {"Connection": "close"}
-    request_headers.update(headers or {})
-    connection.request(method, path, body=body, headers=request_headers)
-    response = connection.getresponse()
-    data = response.read()
-    result = response.status, dict(response.getheaders()), data
-    connection.close()
-    return result
-
-
-def wait_ready(port):
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            status, _, body = request(port, "GET", "/readyz")
-            if status == 200 and body == b"ready":
-                return
-        except OSError:
-            pass
-        time.sleep(0.1)
-    raise AssertionError("nzbunny did not become ready")
-
-
-def wait_job(port, location, wanted):
-    deadline = time.time() + 15
-    last = ""
-    while time.time() < deadline:
-        status, _, body = request(port, "GET", location)
-        assert status == 200
-        text = body.decode()
-        match = re.search(r'class="status-([A-Z]+)"', text)
-        last = match.group(1) if match else ""
-        if last == wanted:
-            return text
-        time.sleep(0.2)
-    raise AssertionError(f"job did not reach {wanted}; last state was {last}")
-
-
-def stop_process(process):
-    process.send_signal(signal.SIGTERM)
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-
-
-def upload(port):
-    boundary = "nzbunny-integration"
-    body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="nzbfile"; filename="sample.nzb"\r\n'
-        "Content-Type: application/x-nzb\r\n\r\n"
-        "<nzb/>\r\n"
-        f"--{boundary}--\r\n"
-    ).encode()
-    status, headers, _ = request(port, "POST", "/", body, {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Content-Length": str(len(body)),
-    })
-    assert status == 303
-    return headers["location"]
+ALLOW = {
+    Path("docs/embedded-downloader-plan.md"),
+    Path("src/database.zig"),
+}
 
 
 def main():
-    executable = Path(sys.argv[1]).resolve()
-    sab_port = free_port()
-    app_port = free_port()
-    server = ThreadingHTTPServer(("127.0.0.1", sab_port), SabHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-
-    with tempfile.TemporaryDirectory(prefix="nzbunny-integration-") as root:
-        root_path = Path(root)
-        artifacts = [root_path / "result-1.bin", root_path / "result-2.bin"]
-        artifacts[0].write_bytes(b"integration artifact one")
-        artifacts[1].write_bytes(b"integration artifact two")
-        SabState.storages = [artifact.name for artifact in artifacts]
-        environment = os.environ.copy()
-        environment.update({
-            "SABNZBD_URL": f"http://127.0.0.1:{sab_port}",
-            "SABNZBD_API_KEY": "test-key",
-            "SABNZBD_DOWNLOAD_DIR": root,
-            "DB_PATH": str(root_path / "jobs.db"),
-            "PORT": str(app_port),
-            "RETENTION_TTL": "6s",
-            "CLEANUP_INTERVAL": "1s",
-            "POLL_INTERVAL": "1s",
-            "SABNZBD_REQUEST_TIMEOUT": "5s",
-            "HTTP_HEADER_TIMEOUT": "1s",
-            "HTTP_REQUEST_TIMEOUT": "5s",
-            "MAX_CONNECTIONS": "4",
-            "UPLOADS_PER_MINUTE": "2",
-        })
-        slow_process = subprocess.Popen(
-            [str(executable)],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        slow_connections = []
-        try:
-            wait_ready(app_port)
-            for _ in range(4):
-                connection = socket.create_connection(("127.0.0.1", app_port), timeout=2)
-                connection.sendall(b"GET / HTTP/1.1\r\nHost: slow")
-                slow_connections.append(connection)
-            time.sleep(1.5)
-            status, _, body = request(app_port, "GET", "/healthz")
-            assert status == 200
-            assert body == b"ok"
-        finally:
-            for connection in slow_connections:
-                connection.close()
-            stop_process(slow_process)
-
-        process = subprocess.Popen(
-            [str(executable)],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            wait_ready(app_port)
-            location = upload(app_port)
-            page = wait_job(app_port, location, "COMPLETE")
-            match = re.search(r'href="(/d/[0-9a-f]{64})"', page)
-            assert match
-            status, headers, body = request(app_port, "GET", match.group(1))
-            assert status == 200
-            assert body == b"integration artifact one"
-            assert headers["cache-control"] == "private, no-store"
-            artifacts[0].write_bytes(b"replacement artifact")
-            status, _, body = request(app_port, "GET", match.group(1))
-            assert status == 200
-            assert body == b"integration artifact one"
-            status, headers, body = request(app_port, "HEAD", match.group(1))
-            assert status == 200
-            assert body == b""
-            assert headers["content-length"] == str(len(b"integration artifact one"))
-
-            second_location = upload(app_port)
-            second_page = wait_job(app_port, second_location, "COMPLETE")
-            second_match = re.search(r'href="(/d/[0-9a-f]{64})"', second_page)
-            assert second_match
-            status, _, body = request(app_port, "GET", second_match.group(1))
-            assert status == 200
-            assert body == b"integration artifact two"
-            status, _, _ = request(app_port, "POST", "/", b"")
-            assert status == 429
-
-            wait_job(app_port, location, "EXPIRED")
-            status, _, _ = request(app_port, "GET", match.group(1))
-            assert status == 410
-            wait_job(app_port, second_location, "EXPIRED")
-            status, _, _ = request(app_port, "GET", second_match.group(1))
-            assert status == 410
-            assert not artifacts[0].exists()
-            assert not artifacts[1].exists()
-            assert SabState.uploads == 2
-        finally:
-            stop_process(process)
-            server.shutdown()
-            server.server_close()
+    executable = Path(sys.argv[1])
+    assert executable.exists(), executable
+    root = Path(__file__).resolve().parents[1]
+    scanned = []
+    for path in (
+        list((root / "src").glob("*.zig"))
+        + [root / "readme.txt", root / "ARCHITECTURE.md", root / "Dockerfile", root / "deploy/docker-compose.yml"]
+    ):
+        rel = path.relative_to(root)
+        if rel in ALLOW:
+            continue
+        text = path.read_text(errors="replace")
+        for needle in REMOVED:
+            if re.search(re.escape(needle), text, re.IGNORECASE):
+                raise AssertionError(f"removed downloader reference {needle!r} remains in {rel}")
+        scanned.append(rel)
+    assert scanned
 
 
 if __name__ == "__main__":

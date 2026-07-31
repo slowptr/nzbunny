@@ -5,7 +5,6 @@ const c = @cImport({
 
 pub const Status = enum {
     pending,
-    submitting,
     processing,
     finalizing,
     complete,
@@ -15,7 +14,7 @@ pub const Status = enum {
     pub fn publicName(self: Status) []const u8 {
         return switch (self) {
             .pending => "PENDING",
-            .submitting, .processing, .finalizing => "PROCESSING",
+            .processing, .finalizing => "PROCESSING",
             .complete => "COMPLETE",
             .failed => "FAILED",
             .expired => "EXPIRED",
@@ -28,8 +27,6 @@ pub const Job = struct {
     filename: []const u8,
     content: []const u8,
     status: Status,
-    sab_name: []const u8,
-    nzo_id: []const u8,
     download_path: []const u8,
     artifact_path: []const u8,
     artifact_size: u64,
@@ -43,8 +40,6 @@ pub const Job = struct {
         freeText(allocator, self.id);
         freeText(allocator, self.filename);
         freeText(allocator, self.content);
-        freeText(allocator, self.sab_name);
-        freeText(allocator, self.nzo_id);
         freeText(allocator, self.download_path);
         freeText(allocator, self.artifact_path);
         freeText(allocator, self.download_token);
@@ -167,13 +162,10 @@ pub const Database = struct {
         const id = try self.allocator.alloc(u8, 32);
         errdefer self.allocator.free(id);
         _ = std.fmt.bufPrint(id, "{x}", .{random}) catch unreachable;
-        const sab_name = try std.fmt.allocPrint(self.allocator, "nzbunny-{s}", .{id});
-        defer self.allocator.free(sab_name);
-
         const stmt = try prepare(db,
             \\INSERT INTO jobs
-            \\(id, filename, content, status, sab_name, created_at, updated_at)
-            \\VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?5)
+            \\(id, filename, content, status, created_at, updated_at)
+            \\VALUES (?1, ?2, ?3, 'PENDING', ?4, ?4)
         );
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
@@ -182,8 +174,7 @@ pub const Database = struct {
             _ = c.sqlite3_bind_blob(stmt, 3, bytes.ptr, @intCast(bytes.len), null)
         else if (c.sqlite3_bind_zeroblob64(stmt, 3, content_size) != c.SQLITE_OK)
             return error.DatabaseWriteFailed;
-        bindText(stmt, 4, sab_name);
-        _ = c.sqlite3_bind_int64(stmt, 5, now);
+        _ = c.sqlite3_bind_int64(stmt, 4, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return id;
     }
@@ -230,9 +221,9 @@ pub const Database = struct {
     pub fn listWork(self: *Database, _: std.Io) ![]Job {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "SELECT id,filename,NULL,status,sab_name,nzo_id,download_path,artifact_path," ++
+        const stmt = try prepare(db, "SELECT id,filename,NULL,status,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs " ++
-            "WHERE status IN ('PENDING','SUBMITTING','PROCESSING','FINALIZING') ORDER BY created_at");
+            "WHERE status IN ('PENDING','PROCESSING','FINALIZING') ORDER BY created_at");
         defer _ = c.sqlite3_finalize(stmt);
         var result: std.ArrayList(Job) = .empty;
         while (true) switch (c.sqlite3_step(stmt)) {
@@ -252,11 +243,11 @@ pub const Database = struct {
     ) ![]Job {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "SELECT id,filename,NULL,status,sab_name,nzo_id,download_path,artifact_path," ++
+        const stmt = try prepare(db, "SELECT id,filename,NULL,status,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs " ++
             "WHERE (status='COMPLETE' AND expires_at<=?1) OR " ++
             "(status='FAILED' AND updated_at<=?2) OR " ++
-            "(status IN ('PENDING','SUBMITTING') AND created_at<=?3) OR " ++
+            "(status='PENDING' AND created_at<=?3) OR " ++
             "(status IN ('PROCESSING','FINALIZING') AND created_at<=?4) OR " ++
             "(status='EXPIRED' AND updated_at<=?5)");
         defer _ = c.sqlite3_finalize(stmt);
@@ -283,7 +274,7 @@ pub const Database = struct {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
         const content = if (include_content) "content" else "NULL";
-        const stmt = try prepare(db, "SELECT id,filename," ++ content ++ ",status,sab_name,nzo_id,download_path,artifact_path," ++
+        const stmt = try prepare(db, "SELECT id,filename," ++ content ++ ",status,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs WHERE " ++ field ++ "=?1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, value);
@@ -293,18 +284,13 @@ pub const Database = struct {
         return try scan(self.allocator, stmt);
     }
 
-    pub fn claimPending(self: *Database, io: std.Io, id: []const u8, now: i64) !bool {
-        return self.casStatus(io, id, "PENDING", "SUBMITTING", now);
-    }
-
-    pub fn resumeSubmitting(self: *Database, _: std.Io, id: []const u8, nzo_id: []const u8, now: i64) !bool {
+    pub fn beginProcessing(self: *Database, _: std.Io, id: []const u8, now: i64) !bool {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "UPDATE jobs SET status='PROCESSING',nzo_id=?1,content=NULL,updated_at=?2 WHERE id=?3 AND status='SUBMITTING'");
+        const stmt = try prepare(db, "UPDATE jobs SET status='PROCESSING',content=NULL,updated_at=?1 WHERE id=?2 AND status='PENDING'");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, nzo_id);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
+        _ = c.sqlite3_bind_int64(stmt, 1, now);
+        bindText(stmt, 2, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(db) == 1;
     }
@@ -350,8 +336,31 @@ pub const Database = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
-    pub fn retryPending(self: *Database, io: std.Io, id: []const u8, now: i64) !bool {
-        return self.casStatus(io, id, "SUBMITTING", "PENDING", now);
+    pub fn failProcessingOnStartup(self: *Database, _: std.Io, now: i64) ![]Job {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        try exec(db, "BEGIN IMMEDIATE;");
+        errdefer exec(db, "ROLLBACK;") catch |err|
+            std.log.err("SQLite startup rollback failed: {t}", .{err});
+        const select = try prepare(db, "SELECT id,filename,NULL,status,download_path,artifact_path," ++
+            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs WHERE status='PROCESSING'");
+        defer _ = c.sqlite3_finalize(select);
+        var result: std.ArrayList(Job) = .empty;
+        errdefer {
+            for (result.items) |job| job.deinit(self.allocator);
+            result.deinit(self.allocator);
+        }
+        while (true) switch (c.sqlite3_step(select)) {
+            c.SQLITE_ROW => try result.append(self.allocator, try scan(self.allocator, select)),
+            c.SQLITE_DONE => break,
+            else => return error.DatabaseReadFailed,
+        };
+        const update = try prepare(db, "UPDATE jobs SET status='FAILED',content=NULL,fail_reason='Download was interrupted; upload the NZB again.',updated_at=?1 WHERE status='PROCESSING'");
+        defer _ = c.sqlite3_finalize(update);
+        _ = c.sqlite3_bind_int64(update, 1, now);
+        if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+        try exec(db, "COMMIT;");
+        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn markExpired(self: *Database, _: std.Io, id: []const u8, expected: Status, now: i64) !bool {
@@ -411,7 +420,7 @@ fn openHandle(path: [:0]const u8) !*c.sqlite3 {
 }
 
 fn activeCount(db: *c.sqlite3) !i64 {
-    const stmt = try prepare(db, "SELECT count(*) FROM jobs WHERE status IN ('PENDING','SUBMITTING','PROCESSING','FINALIZING')");
+    const stmt = try prepare(db, "SELECT count(*) FROM jobs WHERE status IN ('PENDING','PROCESSING','FINALIZING')");
     defer _ = c.sqlite3_finalize(stmt);
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DatabaseReadFailed;
     return c.sqlite3_column_int64(stmt, 0);
@@ -436,14 +445,12 @@ fn initialize(db: *c.sqlite3) !void {
         \\  version INTEGER NOT NULL
         \\);
         \\INSERT INTO nzbunny_schema(version)
-        \\SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM nzbunny_schema);
+        \\SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM nzbunny_schema);
         \\CREATE TABLE IF NOT EXISTS jobs (
         \\  id TEXT PRIMARY KEY,
         \\  filename TEXT NOT NULL,
         \\  content BLOB,
-        \\  status TEXT NOT NULL CHECK(status IN ('PENDING','SUBMITTING','PROCESSING','FINALIZING','COMPLETE','FAILED','EXPIRED')),
-        \\  sab_name TEXT NOT NULL UNIQUE,
-        \\  nzo_id TEXT,
+        \\  status TEXT NOT NULL CHECK(status IN ('PENDING','PROCESSING','FINALIZING','COMPLETE','FAILED','EXPIRED')),
         \\  download_path TEXT,
         \\  artifact_path TEXT,
         \\  artifact_size INTEGER NOT NULL DEFAULT 0 CHECK(artifact_size>=0),
@@ -458,8 +465,52 @@ fn initialize(db: *c.sqlite3) !void {
         \\COMMIT;
     );
     const stmt = try prepare(db, "SELECT version FROM nzbunny_schema LIMIT 1");
-    defer _ = c.sqlite3_finalize(stmt);
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW or c.sqlite3_column_int(stmt, 0) != 1) return error.UnsupportedSchemaVersion;
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
+        _ = c.sqlite3_finalize(stmt);
+        return error.UnsupportedSchemaVersion;
+    }
+    const version = c.sqlite3_column_int(stmt, 0);
+    _ = c.sqlite3_finalize(stmt);
+    if (version == 1) {
+        try migrateV1ToV2(db);
+        return;
+    }
+    if (version != 2) return error.UnsupportedSchemaVersion;
+}
+
+fn migrateV1ToV2(db: *c.sqlite3) !void {
+    try exec(db,
+        \\BEGIN IMMEDIATE;
+        \\ALTER TABLE jobs RENAME TO jobs_v1;
+        \\CREATE TABLE jobs (
+        \\  id TEXT PRIMARY KEY,
+        \\  filename TEXT NOT NULL,
+        \\  content BLOB,
+        \\  status TEXT NOT NULL CHECK(status IN ('PENDING','PROCESSING','FINALIZING','COMPLETE','FAILED','EXPIRED')),
+        \\  download_path TEXT,
+        \\  artifact_path TEXT,
+        \\  artifact_size INTEGER NOT NULL DEFAULT 0 CHECK(artifact_size>=0),
+        \\  download_token TEXT UNIQUE,
+        \\  fail_reason TEXT,
+        \\  created_at INTEGER NOT NULL,
+        \\  updated_at INTEGER NOT NULL,
+        \\  expires_at INTEGER
+        \\);
+        \\INSERT INTO jobs(id,filename,content,status,download_path,artifact_path,artifact_size,download_token,fail_reason,created_at,updated_at,expires_at)
+        \\SELECT id,filename,content,status,download_path,artifact_path,artifact_size,download_token,fail_reason,created_at,updated_at,expires_at
+        \\FROM jobs_v1 WHERE status IN ('PENDING','FINALIZING','COMPLETE','FAILED','EXPIRED');
+        \\INSERT INTO jobs(id,filename,content,status,download_path,artifact_path,artifact_size,download_token,fail_reason,created_at,updated_at,expires_at)
+        \\SELECT id,filename,NULL,'FAILED',NULL,artifact_path,artifact_size,download_token,
+        \\  'Download was interrupted by the downloader upgrade; upload the NZB again.',
+        \\  created_at,updated_at,expires_at
+        \\FROM jobs_v1 WHERE status IN ('SUBMITTING','PROCESSING');
+        \\DROP TABLE jobs_v1;
+        \\DELETE FROM nzbunny_schema;
+        \\INSERT INTO nzbunny_schema(version) VALUES (2);
+        \\CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
+        \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
+        \\COMMIT;
+    );
 }
 
 fn tableExists(db: *c.sqlite3, name: []const u8) !bool {
@@ -499,7 +550,7 @@ fn text(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, column: c_int) ![]c
 
 fn scan(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !Job {
     const status = parseStatus(borrowedText(stmt, 3)) orelse return error.InvalidStoredStatus;
-    const artifact_size = c.sqlite3_column_int64(stmt, 8);
+    const artifact_size = c.sqlite3_column_int64(stmt, 6);
     if (artifact_size < 0) return error.InvalidStoredArtifactSize;
     return .{
         .id = try text(allocator, stmt, 0),
@@ -510,16 +561,14 @@ fn scan(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !Job {
             break :blk try allocator.dupe(u8, @as([*]const u8, @ptrCast(ptr))[0..len]);
         },
         .status = status,
-        .sab_name = try text(allocator, stmt, 4),
-        .nzo_id = try text(allocator, stmt, 5),
-        .download_path = try text(allocator, stmt, 6),
-        .artifact_path = try text(allocator, stmt, 7),
+        .download_path = try text(allocator, stmt, 4),
+        .artifact_path = try text(allocator, stmt, 5),
         .artifact_size = @intCast(artifact_size),
-        .download_token = try text(allocator, stmt, 9),
-        .fail_reason = try text(allocator, stmt, 10),
-        .created_at = c.sqlite3_column_int64(stmt, 11),
-        .updated_at = c.sqlite3_column_int64(stmt, 12),
-        .expires_at = if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 13),
+        .download_token = try text(allocator, stmt, 7),
+        .fail_reason = try text(allocator, stmt, 8),
+        .created_at = c.sqlite3_column_int64(stmt, 9),
+        .updated_at = c.sqlite3_column_int64(stmt, 10),
+        .expires_at = if (c.sqlite3_column_type(stmt, 11) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 11),
     };
 }
 
@@ -536,7 +585,6 @@ fn freeText(allocator: std.mem.Allocator, value: []const u8) void {
 fn parseStatus(value: []const u8) ?Status {
     const map = std.StaticStringMap(Status).initComptime(.{
         .{ "PENDING", .pending },
-        .{ "SUBMITTING", .submitting },
         .{ "PROCESSING", .processing },
         .{ "FINALIZING", .finalizing },
         .{ "COMPLETE", .complete },
@@ -549,7 +597,6 @@ fn parseStatus(value: []const u8) ?Status {
 fn statusName(status: Status) []const u8 {
     return switch (status) {
         .pending => "PENDING",
-        .submitting => "SUBMITTING",
         .processing => "PROCESSING",
         .finalizing => "FINALIZING",
         .complete => "COMPLETE",
@@ -559,7 +606,6 @@ fn statusName(status: Status) []const u8 {
 }
 
 test "internal states map to public processing" {
-    try std.testing.expectEqualStrings("PROCESSING", Status.submitting.publicName());
     try std.testing.expectEqualStrings("PROCESSING", Status.finalizing.publicName());
     try std.testing.expectEqualStrings("COMPLETE", Status.complete.publicName());
 }
@@ -584,9 +630,8 @@ test "SQLite job transitions use compare and set" {
     const pending_with_content = (try db.getWithContent(io, id)).?;
     try std.testing.expectEqualStrings("<nzb/>", pending_with_content.content);
     try std.testing.expect((try db.createIfCapacity(io, "second.nzb", "<nzb/>", 100, 1)) == null);
-    try std.testing.expect(try db.claimPending(io, id, 101));
-    try std.testing.expect(!try db.claimPending(io, id, 102));
-    try std.testing.expect(try db.resumeSubmitting(io, id, "SAB-ID", 103));
+    try std.testing.expect(try db.beginProcessing(io, id, 101));
+    try std.testing.expect(!try db.beginProcessing(io, id, 102));
     try std.testing.expect(try db.beginFinalizing(io, id, "output", 104));
     const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     try std.testing.expect(try db.complete(io, id, "artifact.zip", 42, token, 200, 105));
