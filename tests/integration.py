@@ -379,14 +379,14 @@ def main():
     assert executable.exists(), executable
     root = Path(__file__).resolve().parents[1]
 
-    print("[1/14] Testing residual SABnzbd references...")
+    print("[1/16] Testing residual SABnzbd references...")
     test_residual_references(root)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("[2/14] Generating test TLS certificates...")
+        print("[2/16] Generating test TLS certificates...")
         certs = generate_certs(temp_dir)
 
-        print("[3/14] Starting fake NNTP server...")
+        print("[3/16] Starting fake NNTP server...")
         server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         server.start()
         time.sleep(0.2)
@@ -414,7 +414,7 @@ def main():
             "POLL_INTERVAL": "1s",
         })
 
-        print("[4/14] Testing single direct file E2E download...")
+        print("[4/16] Testing single direct file E2E download...")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             wait_for_server("http://127.0.0.1:13370/readyz", proc)
@@ -447,12 +447,12 @@ def main():
             stdout, stderr = proc.communicate()
 
         log_output = (stdout or "") + (stderr or "")
-        print("[5/14] Auditing logs for credential/payload leaks...")
+        print("[5/16] Auditing logs for credential/payload leaks...")
         assert "testpass" not in log_output
         assert "Antigravity" not in log_output
         assert ".nzbunny-work" not in log_output
 
-        print("[6/14] Testing multi-file ZIP download & concurrency...")
+        print("[6/16] Testing multi-file ZIP download & concurrency...")
         server.articles.clear()
         f1_data = b"File 1 content data"
         f2_p1_data = b"File 2 part 1 data "
@@ -524,7 +524,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[7/14] Testing malformed zero-size yEnc cleanup...")
+        print("[7/16] Testing malformed zero-size yEnc cleanup...")
         server.articles.clear()
         zero_msgid = "zero@nzbunny.test"
         server.articles[zero_msgid] = b"=ybegin line=128 size=0 name=zero.bin\r\n=yend size=0 crc32=00000000\r\n"
@@ -551,7 +551,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[8/14] Testing all-or-nothing failure & cleanup...")
+        print("[8/16] Testing all-or-nothing failure & cleanup...")
         server.articles.clear()
         server.missing_articles.add("missing@nzbunny.test")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -579,7 +579,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[9/14] Testing stall after TLS handshake, before greeting (P0-1)...")
+        print("[9/16] Testing stall after TLS handshake, before greeting (P0-1)...")
         stall_server = FakeNNTPServer(certs, greeting_code=200, two_step_auth=True)
         stall_server.stall_after_tls = True
         stall_server.start()
@@ -606,7 +606,7 @@ def main():
             proc.communicate()
             stall_server.stop()
 
-        print("[10/14] Testing transient 400 then 222 recovery (P1-1)...")
+        print("[10/16] Testing transient 400 then 222 recovery (P1-1)...")
         t_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         t_server.start()
         time.sleep(0.2)
@@ -653,7 +653,7 @@ def main():
             proc.communicate()
             t_server.stop()
 
-        print("[11/14] Testing repeated 400 to exhaustion and readiness (P1-1)...")
+        print("[11/16] Testing repeated 400 to exhaustion and readiness (P1-1)...")
         ex_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         ex_server.start()
         time.sleep(0.2)
@@ -720,7 +720,7 @@ def main():
             proc.communicate()
             ex_server.stop()
 
-        print("[12/14] Testing 430 missing article, no readiness loss (P1-1)...")
+        print("[12/16] Testing 430 missing article, no readiness loss (P1-1)...")
         m_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         m_server.start()
         time.sleep(0.2)
@@ -760,7 +760,108 @@ def main():
             proc.communicate()
             m_server.stop()
 
-        print("[13/14] Testing DB V1 migration & interrupted download restart...")
+        print("[13/16] Testing first-part preflight barrier (P0-4)...")
+        pf_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        pf_server.start()
+        time.sleep(0.2)
+        pf_f0_s0_data = b"Preflight file 0 segment 0"
+        pf_f0_s1_data = b"Preflight file 0 segment 1"
+        pf_f0_total = len(pf_f0_s0_data) + len(pf_f0_s1_data)
+        pf_f1_data = b"Preflight file 1 segment 0"
+        pf_server.articles["pf_f0_s0@nzbunny.test"] = yenc_encode("pf_file0.txt", pf_f0_total, 1, 2, 1, len(pf_f0_s0_data), pf_f0_s0_data)
+        pf_server.articles["pf_f0_s1@nzbunny.test"] = yenc_encode("pf_file0.txt", pf_f0_total, 2, 2, len(pf_f0_s0_data) + 1, pf_f0_total, pf_f0_s1_data)
+        pf_server.missing_articles.add("pf_f1_s0@nzbunny.test")
+        pf_dl = os.path.join(temp_dir, "pf_downloads")
+        os.makedirs(pf_dl, exist_ok=True)
+        pf_env = env.copy()
+        pf_env["NNTP_PORT"] = str(pf_server.port)
+        pf_env["NNTP_TIMEOUT"] = "5s"
+        pf_env["DOWNLOAD_DIR"] = pf_dl
+        pf_env["DB_PATH"] = os.path.join(temp_dir, "pf.db")
+        pf_env["NNTP_CONNECTIONS"] = "2"
+        pf_env["POLL_INTERVAL"] = "1s"
+        proc = subprocess.Popen([str(executable)], env=pf_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server(f"http://127.0.0.1:13370/readyz", proc)
+            nzb_pf = build_nzb([
+                [(1, len(pf_f0_s0_data), "pf_f0_s0@nzbunny.test"), (2, len(pf_f0_s1_data), "pf_f0_s1@nzbunny.test")],
+                [(1, len(pf_f1_data), "pf_f1_s0@nzbunny.test")],
+            ])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "pf.nzb", nzb_pf)
+            assert code == 303, (code, loc)
+            job_id = loc.split("/")[-1]
+            for _ in range(30):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{job_id}")
+                if "FAILED" in html.decode("utf-8"):
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError("Preflight barrier job did not fail")
+            with pf_server.lock:
+                body_reqs = list(pf_server.body_requests)
+            assert "pf_f0_s1@nzbunny.test" not in body_reqs, f"Segment 2+ was requested: {body_reqs}"
+        except Exception:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}", flush=True)
+            raise
+        finally:
+            proc.terminate()
+            proc.communicate()
+            pf_server.stop()
+
+        print("[14/16] Testing ZIP envelope size cap before segment 2+ (P0-5)...")
+        env_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        env_server.start()
+        time.sleep(0.2)
+        env_f0_s0_data = b"A" * 100
+        env_f0_s1_data = b"B" * 100
+        env_f0_total = len(env_f0_s0_data) + len(env_f0_s1_data)
+        env_f1_data = b"C" * 100
+        env_server.articles["env_f0_s0@nzbunny.test"] = yenc_encode("env_file0.bin", env_f0_total, 1, 2, 1, len(env_f0_s0_data), env_f0_s0_data)
+        env_server.articles["env_f0_s1@nzbunny.test"] = yenc_encode("env_file0.bin", env_f0_total, 2, 2, len(env_f0_s0_data) + 1, env_f0_total, env_f0_s1_data)
+        env_server.articles["env_f1_s0@nzbunny.test"] = yenc_encode("env_file1.bin", len(env_f1_data), 1, 1, 1, len(env_f1_data), env_f1_data)
+        env_dl = os.path.join(temp_dir, "env_downloads")
+        os.makedirs(env_dl, exist_ok=True)
+        env_env = env.copy()
+        env_env["NNTP_PORT"] = str(env_server.port)
+        env_env["NNTP_TIMEOUT"] = "5s"
+        env_env["DOWNLOAD_DIR"] = env_dl
+        env_env["DB_PATH"] = os.path.join(temp_dir, "env.db")
+        env_env["NNTP_CONNECTIONS"] = "2"
+        env_env["POLL_INTERVAL"] = "1s"
+        env_env["MAX_ARTIFACT_BYTES"] = "300"
+        proc = subprocess.Popen([str(executable)], env=env_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server(f"http://127.0.0.1:13370/readyz", proc)
+            nzb_env = build_nzb([
+                [(1, len(env_f0_s0_data), "env_f0_s0@nzbunny.test"), (2, len(env_f0_s1_data), "env_f0_s1@nzbunny.test")],
+                [(1, len(env_f1_data), "env_f1_s0@nzbunny.test")],
+            ])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "env.nzb", nzb_env)
+            assert code == 303, (code, loc)
+            job_id = loc.split("/")[-1]
+            for _ in range(30):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{job_id}")
+                if "FAILED" in html.decode("utf-8"):
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError("ZIP envelope cap job did not fail")
+            with env_server.lock:
+                body_reqs = list(env_server.body_requests)
+            assert "env_f0_s1@nzbunny.test" not in body_reqs, f"Segment 2+ was requested before envelope rejection: {body_reqs}"
+        except Exception:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}", flush=True)
+            raise
+        finally:
+            proc.terminate()
+            proc.communicate()
+            env_server.stop()
+
+        print("[15/16] Testing DB V1 migration & interrupted download restart...")
         mig_db_path = os.path.join(temp_dir, "v1_migrate.db")
         conn = sqlite3.connect(mig_db_path)
         conn.execute("CREATE TABLE nzbunny_schema (version INTEGER NOT NULL)")
@@ -797,7 +898,7 @@ def main():
 
         server.stop()
 
-        print("[14/14] Testing Compose config validation...")
+        print("[16/16] Testing Compose config validation...")
         compose_file = root / "deploy/docker-compose.yml"
         compose_env = env.copy()
         compose_env.update({"NNTP_HOST": "localhost", "NNTP_USER": "u", "NNTP_PASS": "p"})

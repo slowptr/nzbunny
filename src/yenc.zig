@@ -14,13 +14,15 @@ pub const Part = struct {
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
     output: *std.Io.Writer,
+    max_size: u64 = std.math.maxInt(u64),
+    budget: u64 = 0,
     meta: ?Part = null,
     in_data: bool = false,
     saw_yend: bool = false,
     crc: std.hash.Crc32 = .init(),
 
-    pub fn init(allocator: std.mem.Allocator, output: *std.Io.Writer) Decoder {
-        return .{ .allocator = allocator, .output = output };
+    pub fn init(allocator: std.mem.Allocator, output: *std.Io.Writer, max_size: u64) Decoder {
+        return .{ .allocator = allocator, .output = output, .max_size = max_size };
     }
 
     pub fn deinit(self: *Decoder) void {
@@ -32,6 +34,8 @@ pub const Decoder = struct {
         if (std.mem.startsWith(u8, line, "=ybegin ")) {
             if (self.meta != null) return error.DuplicateYbegin;
             self.meta = try parseYbegin(self.allocator, line);
+            if (self.meta.?.size > self.max_size) return error.YencSizeExceedsBudget;
+            self.budget = self.meta.?.size;
             self.in_data = true;
             return;
         }
@@ -44,6 +48,7 @@ pub const Decoder = struct {
             meta.begin = range.begin;
             meta.end = range.end;
             self.meta = meta;
+            self.budget = try inclusiveRangeLength(range.begin, range.end);
             return;
         }
         if (std.mem.startsWith(u8, line, "=yend ")) {
@@ -99,7 +104,7 @@ pub const Decoder = struct {
             try self.output.writeByte(byte);
             self.crc.update(&.{byte});
             meta.decoded = std.math.add(u64, meta.decoded, 1) catch return error.InvalidYencDecodedSize;
-            if (meta.decoded > meta.size) return error.InvalidYencDecodedSize;
+            if (meta.decoded > self.budget) return error.InvalidYencDecodedSize;
         }
         self.meta = meta;
     }
@@ -185,7 +190,7 @@ fn validateName(name: []const u8) !void {
 test "decodes escaped bytes" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     try decoder.consumeLine("=ybegin line=128 size=1 name=a.bin");
     defer decoder.deinit();
     try decoder.consumeLine("=\xa7");
@@ -197,7 +202,7 @@ test "decodes escaped bytes" {
 test "rejects zero-size yenc" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
     try std.testing.expectError(error.InvalidYencRange, decoder.consumeLine("=ybegin line=128 size=0 name=a.bin"));
 }
@@ -207,7 +212,7 @@ test "validates optional crc" {
     defer out.deinit();
     var crc: std.hash.Crc32 = .init();
     crc.update("abc");
-    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
     try decoder.consumeLine("=ybegin line=128 size=3 name=a.bin");
     try decoder.consumeLine("\x8b\x8c\x8d");
@@ -221,7 +226,7 @@ test "validates optional crc" {
 test "rejects invalid multipart range" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
     try decoder.consumeLine("=ybegin part=1 line=128 size=3 name=a.bin");
     try std.testing.expectError(error.InvalidYencRange, decoder.consumeLine("=ypart begin=3 end=2"));
@@ -230,7 +235,7 @@ test "rejects invalid multipart range" {
 test "rejects duplicate yenc fields" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
     try std.testing.expectError(error.DuplicateYencField, decoder.consumeLine("=ybegin line=128 size=3 size=5 name=a.bin"));
 }
@@ -238,8 +243,26 @@ test "rejects duplicate yenc fields" {
 test "rejects ypart for single-part yenc" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    var decoder = Decoder.init(std.testing.allocator, &out.writer);
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
     try decoder.consumeLine("=ybegin line=128 size=3 name=a.bin");
     try std.testing.expectError(error.YpartInSinglepart, decoder.consumeLine("=ypart begin=1 end=3"));
+}
+
+test "per-part budget rejects oversized decoded body" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin part=1 line=128 size=10 name=a.bin");
+    try decoder.consumeLine("=ypart begin=1 end=3");
+    try std.testing.expectError(error.InvalidYencDecodedSize, decoder.consumeLine("\x8b\x8c\x8d\x8e"));
+}
+
+test "max size rejects yEnc exceeding artifact limit" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, 10);
+    defer decoder.deinit();
+    try std.testing.expectError(error.YencSizeExceedsBudget, decoder.consumeLine("=ybegin line=128 size=11 name=a.bin"));
 }

@@ -4,6 +4,8 @@ const nntp = @import("nntp.zig");
 const shutdown = @import("shutdown.zig");
 const yenc = @import("yenc.zig");
 
+const Config = @import("config.zig").Config;
+
 pub const Result = struct {
     relative_path: []const u8,
 };
@@ -43,57 +45,71 @@ pub fn run(
     try ensureDir(io, root_dir, work_root);
     try ensureDir(io, root_dir, tmp_output_root);
 
-    const outputs = try allocator.alloc(OutputFile, document.files.len);
-    @memset(outputs, .{});
+    const manifest = try allocator.alloc(FileManifest, document.files.len);
+    @memset(manifest, .{});
     defer {
-        for (outputs) |output| output.deinit(allocator);
-        allocator.free(outputs);
-    }
-    var total_size: u64 = 0;
-    for (document.files, 0..) |file, file_index| {
-        try checkCanceled(control);
-        outputs[file_index] = try fetchFile(allocator, io, root_dir, work_root, file_index, file, cfg, ca_store, control);
-        std.log.info("file {d}/{d} downloaded: {s} ({d} segments)", .{ file_index + 1, document.files.len, outputs[file_index].name, file.segments.len });
-        total_size = std.math.add(u64, total_size, outputs[file_index].size) catch return error.ArtifactTooLarge;
-        if (total_size > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
-    }
-    try rejectDuplicateNames(outputs);
-    try rejectUnsupportedSet(outputs);
-    for (outputs, 0..) |output, file_index| {
-        try checkCanceled(control);
-        try assembleFile(allocator, io, root_dir, tmp_output_root, file_index, output, control);
+        for (manifest) |file| file.deinit(allocator);
+        allocator.free(manifest);
     }
 
-    // Flush temporary output directory
+    for (document.files, 0..) |file, file_index| {
+        var file_work_buffer: [256]u8 = undefined;
+        const file_work = try std.fmt.bufPrint(&file_work_buffer, "{s}/{d}", .{ work_root, file_index });
+        try ensureDir(io, root_dir, file_work);
+        manifest[file_index].parts = try allocator.alloc(Part, file.segments.len);
+        for (manifest[file_index].parts) |*p| p.* = .{ .begin = 0, .end = 0, .rel_path = "" };
+    }
+
+    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, control);
+    try validateAggregate(manifest, cfg);
+
+    var remaining = std.ArrayList(WorkItem).empty;
+    defer remaining.deinit(allocator);
+    for (document.files, 0..) |file, file_index| {
+        for (1..file.segments.len) |segment_index| {
+            try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
+        }
+    }
+    if (remaining.items.len > 0)
+        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control);
+
+    for (manifest) |file| {
+        try checkCanceled(control);
+        validatePartRanges(file.parts, file.size) catch |err| return err;
+    }
+
+    for (manifest, 0..) |file, file_index| {
+        try checkCanceled(control);
+        std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ file_index + 1, document.files.len, file.name, file.parts.len });
+        try assembleFile(allocator, io, root_dir, tmp_output_root, file, control);
+    }
+
     var tmp_dir_file = try root_dir.openFile(io, tmp_output_root, .{ .allow_directory = true, .follow_symlinks = false });
     try tmp_dir_file.sync(io);
     tmp_dir_file.close(io);
 
-    // Atomically rename temporary output directory to final output_root
     try root_dir.rename(tmp_output_root, root_dir, output_root, io);
 
-    // Flush .nzbunny-downloads directory
     var downloads_dir_file = try root_dir.openFile(io, ".nzbunny-downloads", .{ .allow_directory = true, .follow_symlinks = false });
     try downloads_dir_file.sync(io);
     downloads_dir_file.close(io);
 
-    // Cleanup work root after successful publication
     try removeTree(io, root_dir, work_root);
 
     if (document.files.len == 1)
-        return .{ .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, outputs[0].name }) };
+        return .{ .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, manifest[0].name }) };
     return .{ .relative_path = try allocator.dupe(u8, output_root) };
 }
 
-const OutputFile = struct {
+const FileManifest = struct {
     name: []const u8 = "",
     size: u64 = 0,
     parts: []Part = &.{},
 
-    fn deinit(self: OutputFile, allocator: std.mem.Allocator) void {
+    fn deinit(self: FileManifest, allocator: std.mem.Allocator) void {
         if (self.name.len != 0) allocator.free(self.name);
-        for (self.parts) |part| allocator.free(part.rel_path);
-        allocator.free(self.parts);
+        for (self.parts) |part| if (part.rel_path.len != 0) allocator.free(part.rel_path);
+        if (self.parts.len > 0) allocator.free(self.parts);
     }
 };
 
@@ -103,224 +119,265 @@ const Part = struct {
     rel_path: []const u8,
 };
 
-const WorkerContext = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    file_work: []const u8,
-    segments: []const nzb.Segment,
-    cfg: @import("config.zig").Config,
-    ca_store: *nntp.CaStore,
-    control: *shutdown.DownloadControl,
-    parts: []Part,
-    expected_name: []const u8,
-    expected_size: u64,
-    next_segment: *std.atomic.Value(usize),
-    canceled: *std.atomic.Value(bool),
-    mutex: *std.Io.Mutex,
-    first_error: *?anyerror,
+const WorkItem = struct {
+    file_index: usize,
+    segment_index: usize,
 };
 
-fn fetchFile(
+const SharedCtx = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     root_dir: std.Io.Dir,
     work_root: []const u8,
-    file_index: usize,
-    file: nzb.File,
+    files: []const nzb.File,
+    manifest: []FileManifest,
+    cfg: Config,
+    ca_store: *nntp.CaStore,
+    control: *shutdown.DownloadControl,
+    mutex: std.Io.Mutex = .init,
+    first_error: ?anyerror = null,
+    canceled: std.atomic.Value(bool) = .init(false),
+};
+
+fn preflightPhase(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    work_root: []const u8,
+    manifest: []FileManifest,
+    files: []const nzb.File,
     cfg: anytype,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
-) !OutputFile {
-    try checkCanceled(control);
-    var file_work_buffer: [256]u8 = undefined;
-    const file_work = try std.fmt.bufPrint(&file_work_buffer, "{s}/{d}", .{ work_root, file_index });
-    try ensureDir(io, root_dir, file_work);
-    var parts = try allocator.alloc(Part, file.segments.len);
-    errdefer allocator.free(parts);
-    for (parts) |*p| p.* = .{ .begin = 0, .end = 0, .rel_path = "" };
-    errdefer for (parts) |p| if (p.rel_path.len != 0) allocator.free(p.rel_path);
-
-    var name: []const u8 = "";
-    var size: u64 = 0;
-    const first = try fetchSegment(allocator, io, root_dir, file_work, 0, file.segments[0], cfg, ca_store, control);
-    defer allocator.free(first.name);
-    parts[0] = .{ .begin = first.begin, .end = first.end, .rel_path = first.rel_path };
-    name = try allocator.dupe(u8, first.name);
-    errdefer allocator.free(name);
-    size = first.size;
-    try rejectUnsupportedName(name);
-
-    if (file.segments.len > 1) {
-        var next_segment: std.atomic.Value(usize) = .init(1);
-        var canceled: std.atomic.Value(bool) = .init(false);
-        var mutex: std.Io.Mutex = .init;
-        var first_error: ?anyerror = null;
-        var group: std.Io.Group = .init;
-
-        const worker_count = @min(file.segments.len - 1, cfg.nntp_connections);
-        const ctx = WorkerContext{
-            .allocator = allocator,
-            .io = io,
-            .root_dir = root_dir,
-            .file_work = file_work,
-            .segments = file.segments,
-            .cfg = cfg,
-            .ca_store = ca_store,
-            .control = control,
-            .parts = parts,
-            .expected_name = name,
-            .expected_size = size,
-            .next_segment = &next_segment,
-            .canceled = &canceled,
-            .mutex = &mutex,
-            .first_error = &first_error,
-        };
-
-        var w: usize = 0;
-        while (w < worker_count) : (w += 1) {
-            group.concurrent(io, fetchSegmentWorker, .{ctx}) catch fetchSegmentWorker(ctx);
-        }
-        try group.await(io);
-        if (first_error) |err| return err;
+) !void {
+    if (files.len == 0) return;
+    var ctx = SharedCtx{
+        .allocator = allocator,
+        .io = io,
+        .root_dir = root_dir,
+        .work_root = work_root,
+        .files = files,
+        .manifest = manifest,
+        .cfg = cfg,
+        .ca_store = ca_store,
+        .control = control,
+    };
+    var next: std.atomic.Value(usize) = .init(0);
+    const worker_count = @min(files.len, cfg.nntp_connections);
+    if (worker_count == 0) return;
+    var group: std.Io.Group = .init;
+    var w: usize = 0;
+    while (w < worker_count) : (w += 1) {
+        group.concurrent(io, preflightWorker, .{ &ctx, &next }) catch preflightWorker(&ctx, &next);
     }
-
-    validatePartRanges(parts, size) catch |err| return err;
-    return .{ .name = name, .size = size, .parts = parts };
+    try group.await(io);
+    if (ctx.first_error) |err| return err;
 }
 
-fn fetchSegmentWorker(ctx: WorkerContext) void {
+fn preflightWorker(ctx: *SharedCtx, next: *std.atomic.Value(usize)) void {
+    var session = nntp.makeSession(
+        ctx.allocator,
+        ctx.io,
+        ctx.cfg.nntp_host,
+        ctx.cfg.nntp_port,
+        ctx.cfg.nntp_user,
+        ctx.cfg.nntp_pass,
+        ctx.ca_store,
+        ctx.cfg.nntp_timeout_seconds,
+        ctx.control,
+    );
+    defer session.deinit();
+    var connected = false;
     while (!ctx.canceled.load(.acquire)) {
-        checkCanceled(ctx.control) catch |err| {
-            recordSegmentError(ctx, err);
-            return;
-        };
-        const index = ctx.next_segment.fetchAdd(1, .monotonic);
-        if (index >= ctx.segments.len) break;
-        const segment = ctx.segments[index];
-        const decoded = fetchSegment(
-            ctx.allocator,
-            ctx.io,
-            ctx.root_dir,
-            ctx.file_work,
-            index,
-            segment,
-            ctx.cfg,
-            ctx.ca_store,
-            ctx.control,
-        ) catch |err| {
-            recordSegmentError(ctx, err);
-            return;
-        };
-        defer ctx.allocator.free(decoded.name);
-        if (!std.mem.eql(u8, ctx.expected_name, decoded.name) or ctx.expected_size != decoded.size) {
-            ctx.allocator.free(decoded.rel_path);
-            recordSegmentError(ctx, error.InconsistentYencMetadata);
+        if (ctx.control.isCanceled()) {
+            ctx.canceled.store(true, .release);
             return;
         }
-        ctx.parts[index] = .{ .begin = decoded.begin, .end = decoded.end, .rel_path = decoded.rel_path };
+        const file_index = next.fetchAdd(1, .monotonic);
+        if (file_index >= ctx.files.len) break;
+        fetchItemWithSession(ctx, &session, &connected, file_index, 0, true) catch |err| {
+            recordError(ctx, err);
+            return;
+        };
     }
 }
 
-fn recordSegmentError(ctx: WorkerContext, err: anyerror) void {
+fn downloadPhase(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    work_root: []const u8,
+    manifest: []FileManifest,
+    items: []const WorkItem,
+    files: []const nzb.File,
+    cfg: anytype,
+    ca_store: *nntp.CaStore,
+    control: *shutdown.DownloadControl,
+) !void {
+    var ctx = SharedCtx{
+        .allocator = allocator,
+        .io = io,
+        .root_dir = root_dir,
+        .work_root = work_root,
+        .files = files,
+        .manifest = manifest,
+        .cfg = cfg,
+        .ca_store = ca_store,
+        .control = control,
+    };
+    var next: std.atomic.Value(usize) = .init(0);
+    const worker_count = @min(items.len, cfg.nntp_connections);
+    var group: std.Io.Group = .init;
+    var w: usize = 0;
+    while (w < worker_count) : (w += 1) {
+        group.concurrent(io, downloadWorker, .{ &ctx, items, &next }) catch downloadWorker(&ctx, items, &next);
+    }
+    try group.await(io);
+    if (ctx.first_error) |err| return err;
+}
+
+fn downloadWorker(ctx: *SharedCtx, items: []const WorkItem, next: *std.atomic.Value(usize)) void {
+    var session = nntp.makeSession(
+        ctx.allocator,
+        ctx.io,
+        ctx.cfg.nntp_host,
+        ctx.cfg.nntp_port,
+        ctx.cfg.nntp_user,
+        ctx.cfg.nntp_pass,
+        ctx.ca_store,
+        ctx.cfg.nntp_timeout_seconds,
+        ctx.control,
+    );
+    defer session.deinit();
+    var connected = false;
+    while (!ctx.canceled.load(.acquire)) {
+        if (ctx.control.isCanceled()) {
+            ctx.canceled.store(true, .release);
+            return;
+        }
+        const idx = next.fetchAdd(1, .monotonic);
+        if (idx >= items.len) break;
+        const item = items[idx];
+        fetchItemWithSession(ctx, &session, &connected, item.file_index, item.segment_index, false) catch |err| {
+            recordError(ctx, err);
+            return;
+        };
+    }
+}
+
+fn recordError(ctx: *SharedCtx, err: anyerror) void {
     ctx.mutex.lockUncancelable(ctx.io);
     defer ctx.mutex.unlock(ctx.io);
-    if (ctx.first_error.* == null) ctx.first_error.* = err;
+    if (ctx.first_error == null) ctx.first_error = err;
     ctx.canceled.store(true, .release);
     ctx.control.cancel();
 }
 
-const DecodedPart = struct {
-    name: []const u8,
-    size: u64,
-    begin: u64,
-    end: u64,
-    rel_path: []const u8,
-};
-
-fn fetchSegment(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    file_work: []const u8,
-    index: usize,
-    segment: nzb.Segment,
-    cfg: anytype,
-    ca_store: *nntp.CaStore,
-    control: *shutdown.DownloadControl,
-) !DecodedPart {
+fn fetchItemWithSession(
+    ctx: *SharedCtx,
+    session: *nntp.Session,
+    connected: *bool,
+    file_index: usize,
+    segment_index: usize,
+    is_preflight: bool,
+) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        try checkCanceled(control);
-        return fetchSegmentOnce(allocator, io, root_dir, file_work, index, segment, cfg, ca_store, control) catch |err| {
+        try checkCanceled(ctx.control);
+        fetchItemOnce(ctx, session, connected, file_index, segment_index, is_preflight) catch |err| {
             if (attempt >= 3 or !retryable(err)) return err;
-            try control.wait(@as(i64, 1) << @intCast(attempt));
+            session.abort();
+            connected.* = false;
+            try ctx.control.wait(@as(i64, 1) << @intCast(attempt));
             continue;
         };
+        return;
     }
 }
 
-fn fetchSegmentOnce(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    file_work: []const u8,
-    index: usize,
-    segment: nzb.Segment,
-    cfg: anytype,
-    ca_store: *nntp.CaStore,
-    control: *shutdown.DownloadControl,
-) !DecodedPart {
+fn fetchItemOnce(
+    ctx: *SharedCtx,
+    session: *nntp.Session,
+    connected: *bool,
+    file_index: usize,
+    segment_index: usize,
+    is_preflight: bool,
+) !void {
+    const file = ctx.files[file_index];
+    const segment = file.segments[segment_index];
+
     var part_path_buffer: [320]u8 = undefined;
-    const part_path = try std.fmt.bufPrint(&part_path_buffer, "{s}/{d}.part", .{ file_work, index });
+    const part_path = try std.fmt.bufPrint(&part_path_buffer, "{s}/{d}/{d}.part", .{ ctx.work_root, file_index, segment_index });
     var tmp_path_buffer: [324]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_path_buffer, "{s}.tmp", .{part_path});
-    root_dir.deleteFile(io, tmp_path) catch {};
-    var out_file = try root_dir.createFile(io, tmp_path, .{ .read = true, .exclusive = true, .permissions = @enumFromInt(0o600) });
-    defer out_file.close(io);
+    ctx.root_dir.deleteFile(ctx.io, tmp_path) catch {};
+    var out_file = try ctx.root_dir.createFile(ctx.io, tmp_path, .{ .read = true, .exclusive = true, .permissions = @enumFromInt(0o600) });
+    defer out_file.close(ctx.io);
     var file_buffer: [64 * 1024]u8 = undefined;
-    var file_writer = out_file.writer(io, &file_buffer);
-    var decoder = yenc.Decoder.init(allocator, &file_writer.interface);
-    var session = nntp.makeSession(
-        allocator,
-        io,
-        cfg.nntp_host,
-        cfg.nntp_port,
-        cfg.nntp_user,
-        cfg.nntp_pass,
-        ca_store,
-        cfg.nntp_timeout_seconds,
-        control,
-    );
-    defer session.deinit();
-    try session.connect();
+    var file_writer = out_file.writer(ctx.io, &file_buffer);
+    var decoder = yenc.Decoder.init(ctx.allocator, &file_writer.interface, ctx.cfg.max_artifact_bytes);
+    defer decoder.deinit();
+
+    if (!connected.*) {
+        try session.connect();
+        connected.* = true;
+    }
     try session.requestBody(segment.message_id);
     while (true) {
-        const item = try session.readBodyLine(allocator);
+        const item = try session.readBodyLine(ctx.allocator);
         switch (item) {
             .end => break,
             .line => |line| {
-                defer allocator.free(line);
+                defer ctx.allocator.free(line);
                 try decoder.consumeLine(line);
             },
         }
     }
     const meta = try decoder.finish();
     try file_writer.interface.flush();
-    try out_file.sync(io);
+    try out_file.sync(ctx.io);
 
-    // Validate declared yEnc segment byte count
     const part_bytes = try inclusiveRangeLength(meta.begin, meta.end);
     if (part_bytes != segment.declared_bytes) return error.InconsistentSegmentSize;
 
-    try root_dir.rename(tmp_path, root_dir, part_path, io);
-    return .{
-        .name = meta.name,
-        .size = meta.size,
+    if (is_preflight) {
+        try rejectUnsupportedName(meta.name);
+        ctx.manifest[file_index].name = try ctx.allocator.dupe(u8, meta.name);
+        ctx.manifest[file_index].size = meta.size;
+    } else {
+        if (!std.mem.eql(u8, ctx.manifest[file_index].name, meta.name) or
+            ctx.manifest[file_index].size != meta.size)
+            return error.InconsistentYencMetadata;
+    }
+
+    try ctx.root_dir.rename(tmp_path, ctx.root_dir, part_path, ctx.io);
+    ctx.manifest[file_index].parts[segment_index] = .{
         .begin = meta.begin,
         .end = meta.end,
-        .rel_path = try allocator.dupe(u8, part_path),
+        .rel_path = try ctx.allocator.dupe(u8, part_path),
     };
+}
+
+fn validateAggregate(manifest: []FileManifest, cfg: anytype) !void {
+    for (manifest) |file| if (file.name.len == 0) return error.PreflightIncomplete;
+    try rejectDuplicateNames(manifest);
+    try rejectUnsupportedSet(manifest);
+    var total_size: u64 = 0;
+    for (manifest) |file| {
+        total_size = std.math.add(u64, total_size, file.size) catch return error.ArtifactTooLarge;
+        if (total_size > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
+    }
+    if (manifest.len > 1) {
+        const envelope = zipEnvelope(manifest.len);
+        const total_with_envelope = std.math.add(u64, total_size, envelope) catch return error.ArtifactTooLarge;
+        if (total_with_envelope > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
+    }
+}
+
+fn zipEnvelope(num_entries: usize) u64 {
+    const per_entry: u64 = 30 + 46 + 24 + 510;
+    const overhead: u64 = 22 + 56 + 20;
+    return per_entry * @as(u64, @intCast(num_entries)) + overhead;
 }
 
 fn assembleFile(
@@ -328,11 +385,9 @@ fn assembleFile(
     io: std.Io,
     root_dir: std.Io.Dir,
     output_root: []const u8,
-    file_index: usize,
-    output: OutputFile,
+    output: FileManifest,
     control: *shutdown.DownloadControl,
 ) !void {
-    _ = file_index;
     try checkCanceled(control);
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
     defer allocator.free(final_path);
@@ -373,7 +428,7 @@ fn inclusiveRangeLength(begin: u64, end: u64) !u64 {
     return std.math.add(u64, end - begin, 1) catch error.InvalidYencRange;
 }
 
-fn rejectDuplicateNames(outputs: []OutputFile) !void {
+fn rejectDuplicateNames(outputs: []FileManifest) !void {
     for (outputs, 0..) |a, i| {
         for (outputs[i + 1 ..]) |b| {
             if (std.ascii.eqlIgnoreCase(a.name, b.name)) return error.DuplicateOutputName;
@@ -381,7 +436,7 @@ fn rejectDuplicateNames(outputs: []OutputFile) !void {
     }
 }
 
-fn rejectUnsupportedSet(outputs: []OutputFile) !void {
+fn rejectUnsupportedSet(outputs: []FileManifest) !void {
     for (outputs) |output| try rejectUnsupportedName(output.name);
     if (outputs.len <= 1) return;
     for (outputs) |output| {
@@ -441,4 +496,9 @@ test "rejects split archive names" {
     try std.testing.expectError(error.SplitArchiveRejected, rejectUnsupportedName("movie.r01"));
     try std.testing.expectError(error.Par2Rejected, rejectUnsupportedName("movie.par2"));
     try rejectUnsupportedName("movie.rar");
+}
+
+test "zip envelope grows with entry count" {
+    try std.testing.expect(zipEnvelope(2) < zipEnvelope(10));
+    try std.testing.expect(zipEnvelope(0) > 0);
 }

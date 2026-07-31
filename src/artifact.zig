@@ -13,6 +13,42 @@ const c = @cImport({
 
 const at_removedir = std.os.linux.AT.REMOVEDIR;
 
+const WriteCtx = struct {
+    fd: c_int,
+    written: u64 = 0,
+    cap: u64,
+};
+
+fn boundedWriteCallback(
+    a: ?*c.struct_archive,
+    client_data: ?*anyopaque,
+    buffer: ?*const anyopaque,
+    length: usize,
+) callconv(.c) isize {
+    _ = a;
+    if (length == 0) return 0;
+    const ctx: *WriteCtx = @ptrCast(@alignCast(client_data.?));
+    const new_written = std.math.add(u64, ctx.written, @as(u64, length)) catch return -1;
+    if (new_written > ctx.cap) return -1;
+    const buf: [*]const u8 = @ptrCast(buffer.?);
+    while (true) {
+        const rc = std.os.linux.write(ctx.fd, buf, length);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
+            return -1;
+        }
+        ctx.written += @as(u64, @intCast(signed));
+        return signed;
+    }
+}
+
+fn archiveCloseCallback(a: ?*c.struct_archive, client_data: ?*anyopaque) callconv(.c) c_int {
+    _ = a;
+    _ = client_data;
+    return c.ARCHIVE_OK;
+}
+
 pub const Result = struct {
     relative_path: []const u8,
     size: u64,
@@ -113,7 +149,10 @@ pub fn prepare(
         const archive = c.archive_write_new() orelse return error.ArchiveCreateFailed;
         defer _ = c.archive_write_free(archive);
         if (c.archive_write_set_format_zip(archive) != c.ARCHIVE_OK) return error.ArchiveFormatFailed;
-        if (c.archive_write_open_fd(archive, temp_fd) != c.ARCHIVE_OK)
+        _ = c.archive_write_set_bytes_per_block(archive, 0);
+        _ = c.archive_write_set_bytes_in_last_block(archive, 1);
+        var write_ctx = WriteCtx{ .fd = temp_fd, .cap = max_bytes };
+        if (c.archive_write_open2(archive, &write_ctx, null, boundedWriteCallback, archiveCloseCallback, null) != c.ARCHIVE_OK)
             return error.ArchiveOpenFailed;
         var archive_open = true;
         defer {
@@ -121,7 +160,8 @@ pub fn prepare(
         }
         var limits = Limits{ .max_bytes = max_bytes };
         try walkFd(archive, source_fd.fd, "", &limits, 0, io_buffer);
-        if (c.archive_write_close(archive) != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
+        const close_rc = c.archive_write_close(archive);
+        if (close_rc != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
         archive_open = false;
     }
 
