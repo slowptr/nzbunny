@@ -1,7 +1,0 @@
-{
-  "[zig]": {
-    "editor.defaultFormatter": "ziglang.vscode-zig",
-    "editor.formatOnSave": true
-  },
-  "zig.zls.enabled": true
-}
