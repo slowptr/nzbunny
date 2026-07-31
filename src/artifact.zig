@@ -165,6 +165,8 @@ pub fn prepare(
         archive_open = false;
     }
 
+    if (c.fsync(temp_fd) != 0) return error.ArchiveWriteFailed;
+
     var temp_stat: c.struct_stat = undefined;
     if (c.fstat(temp_fd, &temp_stat) != 0 or (temp_stat.st_mode & c.S_IFMT) != c.S_IFREG)
         return error.ArchiveStatFailed;
@@ -174,6 +176,7 @@ pub fn prepare(
     temp_open = false;
     if (c.renameat(artifact_fd, temp_name, artifact_fd, final_name) != 0)
         return error.ArchiveRenameFailed;
+    if (c.fsync(artifact_fd) != 0) return error.ArtifactDirectoryFailed;
     return .{
         .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ artifact_name, final_name }),
         .size = size,

@@ -12,7 +12,9 @@ pub var provider_ready: std.atomic.Value(bool) = .init(false);
 
 const max_concurrent_finalizers = 2;
 const max_concurrent_cleanup = 8;
-const max_finalize_attempts = 3;
+const max_finalize_attempts = 5;
+const lease_duration_seconds: i64 = 60;
+const lease_renew_seconds: i64 = 45;
 
 const Finalizers = struct {
     allocator: std.mem.Allocator,
@@ -23,45 +25,30 @@ const Finalizers = struct {
     group: std.Io.Group = .init,
     mutex: std.Io.Mutex = .init,
     active: std.StringHashMapUnmanaged(void) = .empty,
-    finalize_attempts: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinit(self: *Finalizers) void {
         self.group.cancel(self.io);
+        self.group.await(self.io) catch {};
         self.active.deinit(self.allocator);
-        self.finalize_attempts.deinit(self.allocator);
     }
 
     fn schedule(self: *Finalizers, job: Job) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.active.contains(job.id) or self.active.count() >= max_concurrent_finalizers) return;
-        const task = try self.allocator.create(FinalizeTask);
-        errdefer self.allocator.destroy(task);
-        task.* = .{
-            .owner = self,
-            .id = try self.allocator.dupe(u8, job.id),
-            .download_path = try self.allocator.dupe(u8, job.download_path),
-        };
-        const gop = try self.finalize_attempts.getOrPut(self.allocator, task.id);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-        task.attempt = gop.value_ptr.*;
-        try self.active.put(self.allocator, task.id, {});
-        self.group.async(self.io, runFinalize, .{task});
+        if (self.active.count() >= max_concurrent_finalizers) return;
+        if (self.active.contains(job.id)) return;
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        const token = (try self.db.tryClaimFinalizing(self.io, job.id, now, lease_duration_seconds, self.io)) orelse return;
+        errdefer self.allocator.free(token);
+        const owned_id = try self.allocator.dupe(u8, job.id);
+        errdefer self.allocator.free(owned_id);
+        const owned_download_path = try self.allocator.dupe(u8, job.download_path);
+        errdefer self.allocator.free(owned_download_path);
+        try self.active.put(self.allocator, owned_id, {});
+        const attempt = job.finalize_attempts + 1;
+        self.group.concurrent(self.io, runFinalize, .{ self, owned_id, token, owned_download_path, attempt }) catch
+            runFinalize(self, owned_id, token, owned_download_path, attempt);
     }
-
-    fn finished(self: *Finalizers, id: []const u8) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        _ = self.active.remove(id);
-    }
-};
-
-const FinalizeTask = struct {
-    owner: *Finalizers,
-    id: []u8,
-    download_path: []u8,
-    attempt: u32 = 0,
 };
 
 const CleanupTask = struct {
@@ -87,6 +74,8 @@ pub fn startup(
         for (interrupted) |job| job.deinit(db.allocator);
         db.allocator.free(interrupted);
     }
+    db.reclaimStaleLeases(io, now) catch |err|
+        std.log.err("Stale lease reclaim failed: {t}", .{err});
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
     defer root_dir.close(io);
     for (interrupted) |job| {
@@ -238,25 +227,25 @@ fn probeProvider(
     provider_ready.store(true, .release);
 }
 
-fn runFinalize(task: *FinalizeTask) void {
-    const owner = task.owner;
-    defer {
-        owner.finished(task.id);
-        owner.allocator.free(task.download_path);
-        owner.allocator.free(task.id);
-        owner.allocator.destroy(task);
-    }
+fn runFinalize(owner: *Finalizers, job_id: []const u8, lease_token: []const u8, download_path: []const u8, attempt: u32) void {
+    defer owner.allocator.free(lease_token);
+    defer owner.allocator.free(download_path);
     var arena = std.heap.ArenaAllocator.init(owner.allocator);
     defer arena.deinit();
     const now = std.Io.Clock.real.now(owner.io).toSeconds();
-    finalize(arena.allocator(), owner, task.id, task.download_path, now) catch |err| {
-        std.log.err("Job {s} finalization failed (attempt {d}/{d}): {t}", .{ task.id, task.attempt, max_finalize_attempts, err });
-        if (task.attempt >= max_finalize_attempts) {
-            owner.db.fail(owner.io, task.id, "The output artifact could not be prepared after multiple attempts.", now) catch |db_err|
-                std.log.err("Job {s} failure state could not be saved: {t}", .{ task.id, db_err });
+    finalize(arena.allocator(), owner, job_id, download_path, lease_token, attempt, now) catch |err| {
+        std.log.err("Job {s} finalization failed (attempt {d}/{d}): {t}", .{ job_id, attempt, max_finalize_attempts, err });
+        if (attempt >= max_finalize_attempts) {
+            owner.db.failFinalizing(owner.io, job_id, lease_token, "The output artifact could not be prepared after multiple attempts.", now) catch |db_err|
+                std.log.err("Job {s} failure state could not be saved: {t}", .{ job_id, db_err });
+        } else {
+            const backoff = @as(i64, 1) << @min(attempt, 4);
+            owner.db.releaseFinalizing(owner.io, job_id, lease_token, now + backoff, now) catch {};
         }
-        // Otherwise preserve FINALIZING state for retry on next worker cycle
     };
+    owner.mutex.lockUncancelable(owner.io);
+    if (owner.active.fetchRemove(job_id)) |entry| owner.allocator.free(entry.key);
+    owner.mutex.unlock(owner.io);
 }
 
 fn finalize(
@@ -264,16 +253,22 @@ fn finalize(
     owner: *Finalizers,
     id: []const u8,
     download_path: []const u8,
+    lease_token: []const u8,
+    attempt: u32,
     now: i64,
 ) !void {
     const result = try artifact.prepare(allocator, owner.root, id, download_path, owner.cfg.max_artifact_bytes);
+    if (attempt < max_finalize_attempts) {
+        const renew_until = std.math.add(i64, now, lease_duration_seconds) catch now + lease_duration_seconds;
+        _ = owner.db.renewLease(owner.io, id, lease_token, renew_until, now) catch {};
+    }
     var attempts: usize = 0;
     while (attempts < 4) : (attempts += 1) {
         var random: [32]u8 = undefined;
         owner.io.random(&random);
         var token: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&token, "{x}", .{random}) catch unreachable;
-        const saved = owner.db.complete(owner.io, id, result.relative_path, result.size, &token, now + owner.cfg.retention_seconds, now) catch |err| switch (err) {
+        const saved = owner.db.completeWithToken(owner.io, id, lease_token, result.relative_path, result.size, &token, now + owner.cfg.retention_seconds, now) catch |err| switch (err) {
             error.DuplicateToken => continue,
             else => return err,
         };

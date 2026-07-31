@@ -35,6 +35,10 @@ pub const Job = struct {
     created_at: i64,
     updated_at: i64,
     expires_at: ?i64,
+    finalize_attempts: u32 = 0,
+    finalize_next_at: ?i64 = null,
+    finalize_lease_until: ?i64 = null,
+    finalize_lease_token: []const u8 = "",
 
     pub fn deinit(self: Job, allocator: std.mem.Allocator) void {
         freeText(allocator, self.id);
@@ -44,6 +48,7 @@ pub const Job = struct {
         freeText(allocator, self.artifact_path);
         freeText(allocator, self.download_token);
         freeText(allocator, self.fail_reason);
+        freeText(allocator, self.finalize_lease_token);
     }
 };
 
@@ -222,7 +227,7 @@ pub const Database = struct {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
         const stmt = try prepare(db, "SELECT id,filename,NULL,status,download_path,artifact_path," ++
-            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs " ++
+            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at,finalize_attempts,finalize_next_at,finalize_lease_until,finalize_lease_token FROM jobs " ++
             "WHERE status IN ('PENDING','PROCESSING','FINALIZING') ORDER BY created_at");
         defer _ = c.sqlite3_finalize(stmt);
         var result: std.ArrayList(Job) = .empty;
@@ -244,7 +249,7 @@ pub const Database = struct {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
         const stmt = try prepare(db, "SELECT id,filename,NULL,status,download_path,artifact_path," ++
-            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs " ++
+            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at,finalize_attempts,finalize_next_at,finalize_lease_until,finalize_lease_token FROM jobs " ++
             "WHERE (status='COMPLETE' AND expires_at<=?1) OR " ++
             "(status='FAILED' AND updated_at<=?2) OR " ++
             "(status='PENDING' AND created_at<=?3) OR " ++
@@ -275,7 +280,7 @@ pub const Database = struct {
         defer _ = c.sqlite3_close(db);
         const content = if (include_content) "content" else "NULL";
         const stmt = try prepare(db, "SELECT id,filename," ++ content ++ ",status,download_path,artifact_path," ++
-            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs WHERE " ++ field ++ "=?1");
+            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at,finalize_attempts,finalize_next_at,finalize_lease_until,finalize_lease_token FROM jobs WHERE " ++ field ++ "=?1");
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, value);
         const result = c.sqlite3_step(stmt);
@@ -325,6 +330,129 @@ pub const Database = struct {
         return c.sqlite3_changes(db) == 1;
     }
 
+    pub fn tryClaimFinalizing(
+        self: *Database,
+        _: std.Io,
+        id: []const u8,
+        now: i64,
+        lease_duration: i64,
+        io: std.Io,
+    ) !?[]const u8 {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        var token_buf: [32]u8 = undefined;
+        var random: [16]u8 = undefined;
+        io.random(&random);
+        _ = std.fmt.bufPrint(&token_buf, "{x}", .{random}) catch unreachable;
+        const lease_until = std.math.add(i64, now, lease_duration) catch now + lease_duration;
+        const stmt = try prepare(db,
+            \\UPDATE jobs SET finalize_attempts=finalize_attempts+1,
+            \\finalize_lease_until=?1, finalize_lease_token=?2,
+            \\finalize_next_at=NULL, updated_at=?3
+            \\WHERE id=?4 AND status='FINALIZING'
+            \\AND (finalize_lease_until IS NULL OR finalize_lease_until <= ?3)
+            \\AND (finalize_next_at IS NULL OR finalize_next_at <= ?3)
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, lease_until);
+        bindText(stmt, 2, token_buf[0..]);
+        _ = c.sqlite3_bind_int64(stmt, 3, now);
+        bindText(stmt, 4, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+        if (c.sqlite3_changes(db) == 0) return null;
+        return try self.allocator.dupe(u8, token_buf[0..]);
+    }
+
+    pub fn releaseFinalizing(self: *Database, _: std.Io, id: []const u8, token: []const u8, retry_after: i64, now: i64) !void {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        const stmt = try prepare(db,
+            \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL,
+            \\finalize_next_at=?1, updated_at=?2
+            \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, retry_after);
+        _ = c.sqlite3_bind_int64(stmt, 2, now);
+        bindText(stmt, 3, id);
+        bindText(stmt, 4, token);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+    }
+
+    pub fn renewLease(self: *Database, _: std.Io, id: []const u8, token: []const u8, new_lease_until: i64, now: i64) !bool {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        const stmt = try prepare(db,
+            \\UPDATE jobs SET finalize_lease_until=?1, updated_at=?2
+            \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, new_lease_until);
+        _ = c.sqlite3_bind_int64(stmt, 2, now);
+        bindText(stmt, 3, id);
+        bindText(stmt, 4, token);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+        return c.sqlite3_changes(db) == 1;
+    }
+
+    pub fn completeWithToken(
+        self: *Database,
+        _: std.Io,
+        id: []const u8,
+        lease_token: []const u8,
+        artifact_path: []const u8,
+        size: u64,
+        download_token: []const u8,
+        expires: i64,
+        now: i64,
+    ) !bool {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        const stmt = try prepare(db, "UPDATE jobs SET status='COMPLETE',artifact_path=?1,artifact_size=?2,download_token=?3," ++
+            "expires_at=?4,updated_at=?5,finalize_lease_until=NULL,finalize_lease_token=NULL " ++
+            "WHERE id=?6 AND status='FINALIZING' AND finalize_lease_token=?7");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, artifact_path);
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(size));
+        bindText(stmt, 3, download_token);
+        _ = c.sqlite3_bind_int64(stmt, 4, expires);
+        _ = c.sqlite3_bind_int64(stmt, 5, now);
+        bindText(stmt, 6, id);
+        bindText(stmt, 7, lease_token);
+        const result = c.sqlite3_step(stmt);
+        if (result == c.SQLITE_CONSTRAINT) return error.DuplicateToken;
+        if (result != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+        return c.sqlite3_changes(db) == 1;
+    }
+
+    pub fn failFinalizing(self: *Database, _: std.Io, id: []const u8, lease_token: []const u8, reason: []const u8, now: i64) !void {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        const stmt = try prepare(db,
+            \\UPDATE jobs SET status='FAILED',fail_reason=?1,content=NULL,
+            \\finalize_lease_until=NULL,finalize_lease_token=NULL,updated_at=?2
+            \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, reason);
+        _ = c.sqlite3_bind_int64(stmt, 2, now);
+        bindText(stmt, 3, id);
+        bindText(stmt, 4, lease_token);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+    }
+
+    pub fn reclaimStaleLeases(self: *Database, _: std.Io, now: i64) !void {
+        const db = try self.connect();
+        defer _ = c.sqlite3_close(db);
+        const stmt = try prepare(db,
+            \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL, updated_at=?1
+            \\WHERE status='FINALIZING' AND finalize_lease_until IS NOT NULL AND finalize_lease_until <= ?1
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_int64(stmt, 1, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+    }
+
     pub fn fail(self: *Database, _: std.Io, id: []const u8, reason: []const u8, now: i64) !void {
         const db = try self.connect();
         defer _ = c.sqlite3_close(db);
@@ -343,7 +471,7 @@ pub const Database = struct {
         errdefer exec(db, "ROLLBACK;") catch |err|
             std.log.err("SQLite startup rollback failed: {t}", .{err});
         const select = try prepare(db, "SELECT id,filename,NULL,status,download_path,artifact_path," ++
-            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at FROM jobs WHERE status='PROCESSING'");
+            "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at,finalize_attempts,finalize_next_at,finalize_lease_until,finalize_lease_token FROM jobs WHERE status='PROCESSING'");
         defer _ = c.sqlite3_finalize(select);
         var result: std.ArrayList(Job) = .empty;
         errdefer {
@@ -445,7 +573,7 @@ fn initialize(db: *c.sqlite3) !void {
         \\  version INTEGER NOT NULL
         \\);
         \\INSERT INTO nzbunny_schema(version)
-        \\SELECT 2 WHERE NOT EXISTS (SELECT 1 FROM nzbunny_schema);
+        \\SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM nzbunny_schema);
         \\CREATE TABLE IF NOT EXISTS jobs (
         \\  id TEXT PRIMARY KEY,
         \\  filename TEXT NOT NULL,
@@ -458,7 +586,11 @@ fn initialize(db: *c.sqlite3) !void {
         \\  fail_reason TEXT,
         \\  created_at INTEGER NOT NULL,
         \\  updated_at INTEGER NOT NULL,
-        \\  expires_at INTEGER
+        \\  expires_at INTEGER,
+        \\  finalize_attempts INTEGER NOT NULL DEFAULT 0,
+        \\  finalize_next_at INTEGER,
+        \\  finalize_lease_until INTEGER,
+        \\  finalize_lease_token TEXT
         \\);
         \\CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
         \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
@@ -473,9 +605,14 @@ fn initialize(db: *c.sqlite3) !void {
     _ = c.sqlite3_finalize(stmt);
     if (version == 1) {
         try migrateV1ToV2(db);
+        try migrateV2ToV3(db);
         return;
     }
-    if (version != 2) return error.UnsupportedSchemaVersion;
+    if (version == 2) {
+        try migrateV2ToV3(db);
+        return;
+    }
+    if (version != 3) return error.UnsupportedSchemaVersion;
 }
 
 fn migrateV1ToV2(db: *c.sqlite3) !void {
@@ -509,6 +646,18 @@ fn migrateV1ToV2(db: *c.sqlite3) !void {
         \\INSERT INTO nzbunny_schema(version) VALUES (2);
         \\CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
         \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
+        \\COMMIT;
+    );
+}
+
+fn migrateV2ToV3(db: *c.sqlite3) !void {
+    try exec(db,
+        \\BEGIN IMMEDIATE;
+        \\ALTER TABLE jobs ADD COLUMN finalize_attempts INTEGER NOT NULL DEFAULT 0;
+        \\ALTER TABLE jobs ADD COLUMN finalize_next_at INTEGER;
+        \\ALTER TABLE jobs ADD COLUMN finalize_lease_until INTEGER;
+        \\ALTER TABLE jobs ADD COLUMN finalize_lease_token TEXT;
+        \\UPDATE nzbunny_schema SET version = 3;
         \\COMMIT;
     );
 }
@@ -569,6 +718,10 @@ fn scan(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !Job {
         .created_at = c.sqlite3_column_int64(stmt, 9),
         .updated_at = c.sqlite3_column_int64(stmt, 10),
         .expires_at = if (c.sqlite3_column_type(stmt, 11) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 11),
+        .finalize_attempts = @intCast(c.sqlite3_column_int64(stmt, 12)),
+        .finalize_next_at = if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 13),
+        .finalize_lease_until = if (c.sqlite3_column_type(stmt, 14) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 14),
+        .finalize_lease_token = try text(allocator, stmt, 15),
     };
 }
 
