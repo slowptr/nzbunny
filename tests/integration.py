@@ -133,6 +133,7 @@ class FakeNNTPServer:
         self.fragment_sends = False
         self.body_delay_seconds = 0
         self.stall_after_tls = False
+        self.stall_body = set()
         self.active_conns = 0
         self.peak_conns = 0
         self.handshake_count = 0
@@ -269,6 +270,8 @@ class FakeNNTPServer:
                             time.sleep(0.01)
                             continue
                         if msgid in self.articles:
+                            if msgid in self.stall_body:
+                                time.sleep(self.body_delay_seconds)
                             payload = self.articles[msgid] + b".\r\n"
                             sock.sendall(f"222 {msgid} body follows\r\n".encode("latin1"))
                             if self.fragment_sends:
@@ -379,14 +382,14 @@ def main():
     assert executable.exists(), executable
     root = Path(__file__).resolve().parents[1]
 
-    print("[1/16] Testing residual SABnzbd references...")
+    print("[1/17] Testing residual SABnzbd references...")
     test_residual_references(root)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("[2/16] Generating test TLS certificates...")
+        print("[2/17] Generating test TLS certificates...")
         certs = generate_certs(temp_dir)
 
-        print("[3/16] Starting fake NNTP server...")
+        print("[3/17] Starting fake NNTP server...")
         server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         server.start()
         time.sleep(0.2)
@@ -414,7 +417,7 @@ def main():
             "POLL_INTERVAL": "1s",
         })
 
-        print("[4/16] Testing single direct file E2E download...")
+        print("[4/17] Testing single direct file E2E download...")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             wait_for_server("http://127.0.0.1:13370/readyz", proc)
@@ -447,12 +450,12 @@ def main():
             stdout, stderr = proc.communicate()
 
         log_output = (stdout or "") + (stderr or "")
-        print("[5/16] Auditing logs for credential/payload leaks...")
+        print("[5/17] Auditing logs for credential/payload leaks...")
         assert "testpass" not in log_output
         assert "Antigravity" not in log_output
         assert ".nzbunny-work" not in log_output
 
-        print("[6/16] Testing multi-file ZIP download & concurrency...")
+        print("[6/17] Testing multi-file ZIP download & concurrency...")
         server.articles.clear()
         f1_data = b"File 1 content data"
         f2_p1_data = b"File 2 part 1 data "
@@ -524,7 +527,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[7/16] Testing malformed zero-size yEnc cleanup...")
+        print("[7/17] Testing malformed zero-size yEnc cleanup...")
         server.articles.clear()
         zero_msgid = "zero@nzbunny.test"
         server.articles[zero_msgid] = b"=ybegin line=128 size=0 name=zero.bin\r\n=yend size=0 crc32=00000000\r\n"
@@ -551,7 +554,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[8/16] Testing all-or-nothing failure & cleanup...")
+        print("[8/17] Testing all-or-nothing failure & cleanup...")
         server.articles.clear()
         server.missing_articles.add("missing@nzbunny.test")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -579,7 +582,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[9/16] Testing stall after TLS handshake, before greeting (P0-1)...")
+        print("[9/17] Testing stall after TLS handshake, before greeting (P0-1)...")
         stall_server = FakeNNTPServer(certs, greeting_code=200, two_step_auth=True)
         stall_server.stall_after_tls = True
         stall_server.start()
@@ -606,7 +609,7 @@ def main():
             proc.communicate()
             stall_server.stop()
 
-        print("[10/16] Testing transient 400 then 222 recovery (P1-1)...")
+        print("[10/17] Testing transient 400 then 222 recovery (P1-1)...")
         t_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         t_server.start()
         time.sleep(0.2)
@@ -653,7 +656,7 @@ def main():
             proc.communicate()
             t_server.stop()
 
-        print("[11/16] Testing repeated 400 to exhaustion and readiness (P1-1)...")
+        print("[11/17] Testing repeated 400 to exhaustion and readiness (P1-1)...")
         ex_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         ex_server.start()
         time.sleep(0.2)
@@ -720,7 +723,7 @@ def main():
             proc.communicate()
             ex_server.stop()
 
-        print("[12/16] Testing 430 missing article, no readiness loss (P1-1)...")
+        print("[12/17] Testing 430 missing article, no readiness loss (P1-1)...")
         m_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         m_server.start()
         time.sleep(0.2)
@@ -760,7 +763,57 @@ def main():
             proc.communicate()
             m_server.stop()
 
-        print("[13/16] Testing first-part preflight barrier (P0-4)...")
+        print("[13/17] Testing SIGTERM clean shutdown during stalled download (P0-7)...")
+        sig_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        sig_server.start()
+        time.sleep(0.2)
+        sig_data = b"SIGTERM test payload data"
+        sig_msgid = "sigterm@nzbunny.test"
+        sig_server.articles[sig_msgid] = yenc_encode("sigterm.bin", len(sig_data), 1, 1, 1, len(sig_data), sig_data)
+        sig_server.body_delay_seconds = 30
+        sig_server.stall_body.add(sig_msgid)
+        sig_dl = os.path.join(temp_dir, "sig_downloads")
+        os.makedirs(sig_dl, exist_ok=True)
+        sig_env = env.copy()
+        sig_env["NNTP_PORT"] = str(sig_server.port)
+        sig_env["NNTP_TIMEOUT"] = "10s"
+        sig_env["DOWNLOAD_DIR"] = sig_dl
+        sig_env["DB_PATH"] = os.path.join(temp_dir, "sig.db")
+        sig_env["NNTP_CONNECTIONS"] = "1"
+        sig_env["POLL_INTERVAL"] = "1s"
+        proc = subprocess.Popen([str(executable)], env=sig_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server(f"http://127.0.0.1:13370/readyz", proc)
+            nzb_sig = build_nzb([[(1, len(sig_data), sig_msgid)]])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "sig.nzb", nzb_sig)
+            assert code == 303, (code, loc)
+            job_id = loc.split("/")[-1]
+            time.sleep(1.0)
+            assert proc.poll() is None, "Process should still be running"
+            proc.terminate()
+            start = time.time()
+            proc.wait(timeout=5)
+            elapsed = time.time() - start
+            assert elapsed < 2, f"Process took {elapsed:.1f}s to exit after SIGTERM, should be < 2s"
+            conn = sqlite3.connect(os.path.join(temp_dir, "sig.db"))
+            cur = conn.execute("SELECT status, fail_reason FROM jobs WHERE id=?", (job_id,))
+            row = cur.fetchone()
+            conn.close()
+            assert row is not None, "Job should exist in DB"
+            assert row[0] == "FAILED", f"Job should be FAILED after SIGTERM, got {row[0]}"
+            assert "interrupted" in (row[1] or "").lower() or "unavailable" in (row[1] or "").lower(), f"Fail reason should mention interruption: {row[1]}"
+            assert not os.path.exists(os.path.join(sig_dl, ".nzbunny-work", job_id)), "Work dir should be cleaned"
+        except Exception:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}", flush=True)
+            raise
+        finally:
+            proc.kill()
+            proc.communicate()
+            sig_server.stop()
+
+        print("[14/17] Testing first-part preflight barrier (P0-4)...")
         pf_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         pf_server.start()
         time.sleep(0.2)
@@ -810,7 +863,7 @@ def main():
             proc.communicate()
             pf_server.stop()
 
-        print("[14/16] Testing ZIP envelope size cap before segment 2+ (P0-5)...")
+        print("[15/17] Testing ZIP envelope size cap before segment 2+ (P0-5)...")
         env_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         env_server.start()
         time.sleep(0.2)
@@ -861,7 +914,7 @@ def main():
             proc.communicate()
             env_server.stop()
 
-        print("[15/16] Testing DB V1 migration & interrupted download restart...")
+        print("[16/17] Testing DB V1 migration & interrupted download restart...")
         mig_db_path = os.path.join(temp_dir, "v1_migrate.db")
         conn = sqlite3.connect(mig_db_path)
         conn.execute("CREATE TABLE nzbunny_schema (version INTEGER NOT NULL)")
@@ -898,7 +951,7 @@ def main():
 
         server.stop()
 
-        print("[16/16] Testing Compose config validation...")
+        print("[17/17] Testing Compose config validation...")
         compose_file = root / "deploy/docker-compose.yml"
         compose_env = env.copy()
         compose_env.update({"NNTP_HOST": "localhost", "NNTP_USER": "u", "NNTP_PASS": "p"})

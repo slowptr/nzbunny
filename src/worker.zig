@@ -192,7 +192,9 @@ fn processPending(
             cleanupWorkDirs(io, dir, job.id) catch {};
         }
         if (providerFailure(err)) provider_ready.store(false, .release);
-        const message = if (err == error.Timeout)
+        const message = if (err == error.Canceled)
+            "The download was interrupted by shutdown."
+        else if (err == error.Timeout)
             "The download exceeded DOWNLOAD_TIMEOUT."
         else if (providerFailure(err))
             "The NNTP provider is unavailable; the job failed after retries."

@@ -9,6 +9,7 @@ const c = @cImport({
 extern "c" fn realpath(noalias path: [*:0]const u8, noalias resolved: [*]u8) ?[*:0]u8;
 
 pub fn resolveRoot(path: []const u8, out: []u8) ![]const u8 {
+    if (path.len == 0 or path[0] != '/') return error.DownloadRootNotAbsolute;
     const z = try toZ(path, out);
     var resolved: [c.PATH_MAX]u8 = undefined;
     if (realpath(z.ptr, &resolved) == null) {

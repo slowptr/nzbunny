@@ -117,6 +117,9 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store });
+    var watcher_group: std.Io.Group = .init;
+    defer watcher_group.cancel(io);
+    watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener }) catch {};
     while (!shutdown.requested.load(.acquire)) {
         try context.connections.wait(io);
         const stream = listener.accept(io) catch |err| {
@@ -126,6 +129,14 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
         };
         group.async(io, accept, .{ &context, stream });
     }
+    group.await(io) catch {};
+}
+
+fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server) std.Io.Cancelable!void {
+    while (!shutdown.requested.load(.acquire))
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+    const stream: std.Io.net.Stream = .{ .socket = listener.socket };
+    stream.shutdown(io, .both) catch {};
 }
 
 fn accept(context: *Context, stream: std.Io.net.Stream) void {
