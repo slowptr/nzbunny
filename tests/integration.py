@@ -127,12 +127,17 @@ class FakeNNTPServer:
         self.two_step_auth = two_step_auth
         self.articles = {}
         self.transient_errors = set()
+        self.persistent_transient = set()
         self.missing_articles = set()
         self.reject_connections = False
         self.fragment_sends = False
         self.body_delay_seconds = 0
+        self.stall_after_tls = False
         self.active_conns = 0
         self.peak_conns = 0
+        self.handshake_count = 0
+        self.auth_count = 0
+        self.body_requests = []
         self.lock = threading.Lock()
         self.server_socket = None
         self.port = 0
@@ -179,6 +184,18 @@ class FakeNNTPServer:
             self.active_conns += 1
             if self.active_conns > self.peak_conns:
                 self.peak_conns = self.active_conns
+            self.handshake_count += 1
+
+        if self.stall_after_tls:
+            time.sleep(30)
+            with self.lock:
+                if self.active_conns > 0:
+                    self.active_conns -= 1
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
 
         try:
             sock.settimeout(5.0)
@@ -212,6 +229,8 @@ class FakeNNTPServer:
                         subarg = auth_parts[1] if len(auth_parts) > 1 else ""
                         if subcmd == "USER":
                             user = subarg
+                            with self.lock:
+                                self.auth_count += 1
                             if self.two_step_auth:
                                 sock.sendall(b"381 PASS required\r\n")
                             else:
@@ -234,6 +253,12 @@ class FakeNNTPServer:
                             time.sleep(0.01)
                             continue
                         msgid = arg.strip("<>")
+                        with self.lock:
+                            self.body_requests.append(msgid)
+                        if msgid in self.persistent_transient:
+                            sock.sendall(b"400 Transient server error\r\n")
+                            time.sleep(0.01)
+                            continue
                         if msgid in self.transient_errors:
                             self.transient_errors.remove(msgid)
                             sock.sendall(b"400 Transient server error\r\n")
@@ -354,14 +379,14 @@ def main():
     assert executable.exists(), executable
     root = Path(__file__).resolve().parents[1]
 
-    print("[1/10] Testing residual SABnzbd references...")
+    print("[1/14] Testing residual SABnzbd references...")
     test_residual_references(root)
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("[2/10] Generating test TLS certificates...")
+        print("[2/14] Generating test TLS certificates...")
         certs = generate_certs(temp_dir)
 
-        print("[3/10] Starting fake NNTP server...")
+        print("[3/14] Starting fake NNTP server...")
         server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
         server.start()
         time.sleep(0.2)
@@ -389,7 +414,7 @@ def main():
             "POLL_INTERVAL": "1s",
         })
 
-        print("[4/10] Testing single direct file E2E download...")
+        print("[4/14] Testing single direct file E2E download...")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             wait_for_server("http://127.0.0.1:13370/readyz", proc)
@@ -422,12 +447,12 @@ def main():
             stdout, stderr = proc.communicate()
 
         log_output = (stdout or "") + (stderr or "")
-        print("[5/10] Auditing logs for credential/payload leaks...")
+        print("[5/14] Auditing logs for credential/payload leaks...")
         assert "testpass" not in log_output
         assert "Antigravity" not in log_output
         assert ".nzbunny-work" not in log_output
 
-        print("[6/10] Testing multi-file ZIP download & concurrency...")
+        print("[6/14] Testing multi-file ZIP download & concurrency...")
         server.articles.clear()
         f1_data = b"File 1 content data"
         f2_p1_data = b"File 2 part 1 data "
@@ -499,7 +524,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[7/10] Testing malformed zero-size yEnc cleanup...")
+        print("[7/14] Testing malformed zero-size yEnc cleanup...")
         server.articles.clear()
         zero_msgid = "zero@nzbunny.test"
         server.articles[zero_msgid] = b"=ybegin line=128 size=0 name=zero.bin\r\n=yend size=0 crc32=00000000\r\n"
@@ -526,7 +551,7 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[8/10] Testing all-or-nothing failure & cleanup...")
+        print("[8/14] Testing all-or-nothing failure & cleanup...")
         server.articles.clear()
         server.missing_articles.add("missing@nzbunny.test")
         proc = subprocess.Popen([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -554,7 +579,188 @@ def main():
             proc.terminate()
             proc.communicate()
 
-        print("[9/10] Testing DB V1 migration & interrupted download restart...")
+        print("[9/14] Testing stall after TLS handshake, before greeting (P0-1)...")
+        stall_server = FakeNNTPServer(certs, greeting_code=200, two_step_auth=True)
+        stall_server.stall_after_tls = True
+        stall_server.start()
+        time.sleep(0.2)
+        stall_dl = os.path.join(temp_dir, "stall_downloads")
+        os.makedirs(stall_dl, exist_ok=True)
+        stall_env = env.copy()
+        stall_env["NNTP_PORT"] = str(stall_server.port)
+        stall_env["NNTP_TIMEOUT"] = "2s"
+        stall_env["DOWNLOAD_TIMEOUT"] = "1h"
+        stall_env["DOWNLOAD_DIR"] = stall_dl
+        stall_env["DB_PATH"] = os.path.join(temp_dir, "stall.db")
+        stall_env["POLL_INTERVAL"] = "1s"
+        proc = subprocess.Popen([str(executable)], env=stall_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            start = time.time()
+            proc.wait(timeout=5)
+            elapsed = time.time() - start
+            assert proc.returncode != 0, "Process should exit with error on stalled startup"
+            assert elapsed < 4, f"Process took {elapsed:.1f}s, should fail within ~3s from NNTP_TIMEOUT not DOWNLOAD_TIMEOUT"
+            assert not any(os.scandir(stall_dl)), "No work/output files should remain"
+        finally:
+            proc.kill()
+            proc.communicate()
+            stall_server.stop()
+
+        print("[10/14] Testing transient 400 then 222 recovery (P1-1)...")
+        t_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        t_server.start()
+        time.sleep(0.2)
+        t_data = b"Transient recovery payload data"
+        t_msgid = "trecov@nzbunny.test"
+        t_server.articles[t_msgid] = yenc_encode("trecov.bin", len(t_data), 1, 1, 1, len(t_data), t_data)
+        t_server.transient_errors.add(t_msgid)
+        t_dl = os.path.join(temp_dir, "t_downloads")
+        os.makedirs(t_dl, exist_ok=True)
+        t_env = env.copy()
+        t_env["NNTP_PORT"] = str(t_server.port)
+        t_env["NNTP_TIMEOUT"] = "5s"
+        t_env["DOWNLOAD_DIR"] = t_dl
+        t_env["DB_PATH"] = os.path.join(temp_dir, "t.db")
+        t_env["NNTP_CONNECTIONS"] = "1"
+        t_env["POLL_INTERVAL"] = "1s"
+        proc = subprocess.Popen([str(executable)], env=t_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server(f"http://127.0.0.1:13370/readyz", proc)
+            nzb_t = build_nzb([[(1, len(t_data), t_msgid)]])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "t.nzb", nzb_t)
+            assert code == 303, (code, loc)
+            job_id = loc.split("/")[-1]
+            token = None
+            for _ in range(30):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{job_id}")
+                html_str = html.decode("utf-8")
+                if "COMPLETE" in html_str:
+                    m = re.search(r'/d/([0-9a-f]{64})', html_str)
+                    assert m, html_str
+                    token = m.group(1)
+                    break
+                time.sleep(0.3)
+            assert token, "Transient 400 job did not recover and complete"
+            _, content, _ = http_get(f"http://127.0.0.1:13370/d/{token}")
+            assert content == t_data
+        except Exception:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}", flush=True)
+            raise
+        finally:
+            proc.terminate()
+            proc.communicate()
+            t_server.stop()
+
+        print("[11/14] Testing repeated 400 to exhaustion and readiness (P1-1)...")
+        ex_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        ex_server.start()
+        time.sleep(0.2)
+        ex_data = b"Exhaustion test data"
+        ex_bad_msgid = "exhaust@nzbunny.test"
+        ex_good_msgid = "exgood@nzbunny.test"
+        ex_server.persistent_transient.add(ex_bad_msgid)
+        ex_server.articles[ex_good_msgid] = yenc_encode("exgood.bin", len(ex_data), 1, 1, 1, len(ex_data), ex_data)
+        ex_dl = os.path.join(temp_dir, "ex_downloads")
+        os.makedirs(ex_dl, exist_ok=True)
+        ex_env = env.copy()
+        ex_env["NNTP_PORT"] = str(ex_server.port)
+        ex_env["NNTP_TIMEOUT"] = "5s"
+        ex_env["DOWNLOAD_DIR"] = ex_dl
+        ex_env["DB_PATH"] = os.path.join(temp_dir, "ex.db")
+        ex_env["NNTP_CONNECTIONS"] = "1"
+        ex_env["POLL_INTERVAL"] = "1s"
+        proc = subprocess.Popen([str(executable)], env=ex_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server(f"http://127.0.0.1:13370/readyz", proc)
+            nzb_bad = build_nzb([[(1, len(ex_data), ex_bad_msgid)]])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "bad.nzb", nzb_bad)
+            assert code == 303
+            bad_job = loc.split("/")[-1]
+            for _ in range(60):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{bad_job}")
+                if "FAILED" in html.decode("utf-8"):
+                    break
+                time.sleep(0.3)
+            else:
+                raise AssertionError("400-exhaustion job did not fail")
+            code, _, _ = http_get("http://127.0.0.1:13370/readyz")
+            assert code == 503, f"readyz should be 503 after provider failure, got {code}"
+            ex_server.persistent_transient.discard(ex_bad_msgid)
+            code = None
+            for _ in range(30):
+                code, _, _ = http_get("http://127.0.0.1:13370/readyz")
+                if code == 200:
+                    break
+                time.sleep(0.5)
+            assert code == 200, "readyz should restore to 200 after DATE probe"
+            nzb_good = build_nzb([[(1, len(ex_data), ex_good_msgid)]])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "good.nzb", nzb_good)
+            assert code == 303
+            good_job = loc.split("/")[-1]
+            token = None
+            for _ in range(30):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{good_job}")
+                html_str = html.decode("utf-8")
+                if "COMPLETE" in html_str:
+                    m = re.search(r'/d/([0-9a-f]{64})', html_str)
+                    assert m, html_str
+                    token = m.group(1)
+                    break
+                time.sleep(0.3)
+            assert token, "Good job did not complete after readiness restored (FIFO resume)"
+        except Exception:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}", flush=True)
+            raise
+        finally:
+            proc.terminate()
+            proc.communicate()
+            ex_server.stop()
+
+        print("[12/14] Testing 430 missing article, no readiness loss (P1-1)...")
+        m_server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        m_server.start()
+        time.sleep(0.2)
+        m_server.missing_articles.add("miss430@nzbunny.test")
+        m_dl = os.path.join(temp_dir, "m_downloads")
+        os.makedirs(m_dl, exist_ok=True)
+        m_env = env.copy()
+        m_env["NNTP_PORT"] = str(m_server.port)
+        m_env["NNTP_TIMEOUT"] = "5s"
+        m_env["DOWNLOAD_DIR"] = m_dl
+        m_env["DB_PATH"] = os.path.join(temp_dir, "m.db")
+        m_env["NNTP_CONNECTIONS"] = "1"
+        m_env["POLL_INTERVAL"] = "1s"
+        proc = subprocess.Popen([str(executable)], env=m_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server(f"http://127.0.0.1:13370/readyz", proc)
+            nzb_miss = build_nzb([[(1, 10, "miss430@nzbunny.test")]])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "miss.nzb", nzb_miss)
+            assert code == 303
+            job_id = loc.split("/")[-1]
+            for _ in range(30):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{job_id}")
+                if "FAILED" in html.decode("utf-8"):
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError("430 job did not fail")
+            code, _, _ = http_get("http://127.0.0.1:13370/readyz")
+            assert code == 200, f"readyz should stay 200 after 430 (no readiness loss), got {code}"
+        except Exception:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            print(f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}", flush=True)
+            raise
+        finally:
+            proc.terminate()
+            proc.communicate()
+            m_server.stop()
+
+        print("[13/14] Testing DB V1 migration & interrupted download restart...")
         mig_db_path = os.path.join(temp_dir, "v1_migrate.db")
         conn = sqlite3.connect(mig_db_path)
         conn.execute("CREATE TABLE nzbunny_schema (version INTEGER NOT NULL)")
@@ -591,7 +797,7 @@ def main():
 
         server.stop()
 
-        print("[10/10] Testing Compose config validation...")
+        print("[14/14] Testing Compose config validation...")
         compose_file = root / "deploy/docker-compose.yml"
         compose_env = env.copy()
         compose_env.update({"NNTP_HOST": "localhost", "NNTP_USER": "u", "NNTP_PASS": "p"})

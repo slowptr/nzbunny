@@ -24,6 +24,29 @@ pub const CaStore = struct {
     }
 };
 
+pub const Response = struct {
+    code: u16,
+
+    pub const Class = enum {
+        ok,
+        missing_article,
+        provider_transient,
+        auth_required,
+        permanent_protocol,
+        unexpected,
+    };
+
+    pub fn classifyBody(self: Response) Class {
+        return switch (self.code) {
+            222 => .ok,
+            430 => .missing_article,
+            400 => .provider_transient,
+            480 => .auth_required,
+            else => if (self.code >= 400) .permanent_protocol else .unexpected,
+        };
+    }
+};
+
 pub const BodyLine = union(enum) {
     line: []const u8,
     end,
@@ -75,10 +98,14 @@ pub const Session = struct {
 
         try self.sendParts("BODY <", message_id, ">\r\n");
         const status = try self.readStatus();
-        if (status.code == 400) return error.NntpTransientResponse;
-        if (status.code == 430) return error.MissingArticle;
-        if (status.code >= 400) return error.PermanentNntpResponse;
-        if (status.code != 222) return error.NntpBodyRequestFailed;
+        switch (status.classifyBody()) {
+            .ok => return,
+            .missing_article => return error.MissingArticle,
+            .provider_transient => return error.NntpTransientResponse,
+            .auth_required => return error.PermanentNntpResponse,
+            .permanent_protocol => return error.PermanentNntpResponse,
+            .unexpected => return error.NntpBodyRequestFailed,
+        }
     }
 
     pub fn readBodyLine(self: *Session, allocator: std.mem.Allocator) !BodyLine {
@@ -114,6 +141,11 @@ pub const Session = struct {
     }
 
     fn connectTransport(self: *Session) !void {
+        // Socket-level connect timeout (ConnectOptions.timeout) is not supported
+        // by the Zig 0.16.0 Threaded I/O implementation (panics with TODO).
+        // runWithDeadline wraps connectTransport, initializeTls, greeting, auth,
+        // BODY, and readLine, providing the per-operation deadline via Select.
+        // The DownloadControl.watch watchdog stays as the job-level ceiling.
         const host: std.Io.net.HostName = .{ .bytes = self.host };
         const stream = try std.Io.net.HostName.connect(host, self.io, self.port, .{
             .mode = .stream,
@@ -180,7 +212,7 @@ pub const Session = struct {
         try self.sendParts(text, "\r\n", "");
     }
 
-    const Status = struct { code: u16 };
+    const Status = Response;
 
     fn readStatus(self: *Session) !Status {
         const line = try self.readLine(self.allocator, 8 * 1024);
@@ -312,4 +344,14 @@ test "BODY command length limit includes brackets and CRLF" {
     var store: CaStore = .{};
     var session = makeSession(std.testing.allocator, std.testing.io, "example.test", 563, "u", "p", &store, 1, null);
     try std.testing.expectError(error.InvalidMessageId, session.requestBody("a" ** 506));
+}
+
+test "response classification maps body codes" {
+    try std.testing.expectEqual(Response.Class.ok, (Response{ .code = 222 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.missing_article, (Response{ .code = 430 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.provider_transient, (Response{ .code = 400 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.auth_required, (Response{ .code = 480 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.permanent_protocol, (Response{ .code = 500 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.permanent_protocol, (Response{ .code = 502 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.unexpected, (Response{ .code = 100 }).classifyBody());
 }
