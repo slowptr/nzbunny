@@ -70,6 +70,7 @@ pub fn prepare(
     job_id: []const u8,
     source: []const u8,
     max_bytes: u64,
+    lease_token: []const u8,
 ) !Result {
     const io_buffer = try allocator.alloc(u8, io_buffer_size);
     defer allocator.free(io_buffer);
@@ -119,8 +120,11 @@ pub fn prepare(
         else => return err,
     }
 
-    var temp_name_buffer: [100]u8 = undefined;
-    const temp_name = try std.fmt.bufPrintZ(&temp_name_buffer, "{s}.tmp", .{final_name});
+    var temp_name_buffer: [116]u8 = undefined;
+    const temp_name = if (lease_token.len >= 8)
+        try std.fmt.bufPrintZ(&temp_name_buffer, "{s}.{s}.tmp", .{ final_name, lease_token[0..8] })
+    else
+        try std.fmt.bufPrintZ(&temp_name_buffer, "{s}.tmp", .{final_name});
     try removeFileAt(artifact_fd, temp_name);
     errdefer removeFileAt(artifact_fd, temp_name) catch |err|
         std.log.err("Temporary artifact cleanup failed for {s}: {t}", .{ temp_name, err });
@@ -511,7 +515,7 @@ test "artifact directory cannot be a symlink" {
 
     try std.testing.expectError(
         error.ArtifactDirectoryUnsafe,
-        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024),
+        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024, ""),
     );
 }
 
@@ -533,6 +537,7 @@ test "directory artifact is written through a safe directory handle" {
         "0123456789abcdef0123456789abcdef",
         "source",
         1024,
+        "",
     );
     defer std.testing.allocator.free(result.relative_path);
     try std.testing.expectEqualStrings(
@@ -565,6 +570,6 @@ test "a symlink inside the source tree is not followed" {
     const download = try std.fmt.bufPrint(&download_buffer, "{s}/downloads", .{base});
     try std.testing.expectError(
         error.SymbolicLinkRejected,
-        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024),
+        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024, ""),
     );
 }

@@ -259,10 +259,13 @@ fn finalize(
     attempt: u32,
     now: i64,
 ) !void {
-    const result = try artifact.prepare(allocator, owner.root, id, download_path, owner.cfg.max_artifact_bytes);
+    const result = try artifact.prepare(allocator, owner.root, id, download_path, owner.cfg.max_artifact_bytes, lease_token);
     if (attempt < max_finalize_attempts) {
-        const renew_until = std.math.add(i64, now, lease_duration_seconds) catch now + lease_duration_seconds;
-        _ = owner.db.renewLease(owner.io, id, lease_token, renew_until, now) catch {};
+        const renew_until = std.math.add(i64, now, lease_renew_seconds) catch now + lease_renew_seconds;
+        _ = owner.db.renewLease(owner.io, id, lease_token, renew_until, now) catch |err| {
+            std.log.err("Job {s} lease renewal failed: {t}", .{ id, err });
+            return error.LeaseRenewalFailed;
+        };
     }
     var attempts: usize = 0;
     while (attempts < 4) : (attempts += 1) {
