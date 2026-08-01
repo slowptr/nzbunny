@@ -509,18 +509,6 @@ pub const Database = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
-    fn casStatus(self: *Database, _: std.Io, id: []const u8, from: []const u8, to: []const u8, now: i64) !bool {
-        const db = try self.connect();
-        defer _ = c.sqlite3_close(db);
-        const stmt = try prepare(db, "UPDATE jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status=?4");
-        defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, to);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
-        bindText(stmt, 4, from);
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
-        return c.sqlite3_changes(db) == 1;
-    }
 };
 
 fn openHandle(path: [:0]const u8) !*c.sqlite3 {
@@ -797,7 +785,6 @@ test "schema version 1 migration converts in-flight jobs and preserves completed
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/v1.db", .{root_buffer[0..root_len]});
     defer std.testing.allocator.free(db_path);
 
-    // Create a raw V1 database
     const zpath = try std.heap.page_allocator.dupeZ(u8, db_path);
     defer std.heap.page_allocator.free(zpath);
     var handle: ?*c.sqlite3 = null;
@@ -831,7 +818,6 @@ test "schema version 1 migration converts in-flight jobs and preserves completed
         \\INSERT INTO jobs VALUES ('j4', 'd.nzb', NULL, 'COMPLETE', 'dl4', 'art4.zip', 10, 'tok4', NULL, 100, 100, 500, 'sab4', 'nzo4');
     );
 
-    // Open database via Database.open, triggering migration
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var db = try Database.open(arena.allocator(), db_path);

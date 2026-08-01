@@ -1,25 +1,16 @@
-"""Container smoke test: upload, download, readiness, shutdown against fake NNTP provider.
-
-Usage: python3 tests/smoke.py
-Requires: Docker, the nzbunny:test image built from Dockerfile.
-"""
-
 import os
+import re
 import sys
 import time
-import zlib
-import sqlite3
 import tempfile
 import subprocess
 import urllib.request
-import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from integration import yenc_encode, FakeNNTPServer, generate_certs
 
 CONTAINER_PORT = 13371
-HOST_PORT = 13371
 IMAGE = "nzbunny:test"
 
 def http_get(url):
@@ -83,16 +74,13 @@ def main():
         server.start()
         time.sleep(0.2)
 
-        # Article data
         fname = "smoke_test.bin"
         fdata = b"Smoke test payload from container"
         msgid = "smoke@nzbunny.test"
         server.articles[msgid] = yenc_encode(fname, len(fdata), 1, 1, 1, len(fdata), fdata)
 
-        # Build NZB
         nzb_bytes = build_nzb([[(1, len(fdata), msgid)]])
 
-        # Start container
         print("[smoke] Starting container...")
         container_id = subprocess.check_output([
             "docker", "run", "--rm", "-d",
@@ -117,12 +105,10 @@ def main():
         base_url = f"http://127.0.0.1:{CONTAINER_PORT}"
 
         try:
-            # Stage 1: readiness
             print("[smoke] Waiting for /readyz...")
             assert wait_for_ready(base_url, timeout=15), "/readyz did not become ready"
             print("[smoke] /readyz OK")
 
-            # Stage 2: upload NZB
             print("[smoke] Uploading NZB...")
             status, location = http_post_file(f"{base_url}/", "smoke.nzb", nzb_bytes)
             assert status == 303, f"Upload failed: {status}"
@@ -130,7 +116,6 @@ def main():
             assert job_id, f"No job ID in location: {location}"
             print(f"[smoke] Job created: {job_id}")
 
-            # Stage 3: wait for download completion
             print("[smoke] Waiting for download...")
             for _ in range(60):
                 status, html, _ = http_get(f"{base_url}/job/{job_id}")
@@ -141,21 +126,17 @@ def main():
             else:
                 raise AssertionError("Job did not complete")
 
-            # Extract download token
-            import re
             match = re.search(r'/d/([a-f0-9]+)', body)
             assert match, f"No download token found in: {body}"
             token = match.group(1)
             print(f"[smoke] Download token: {token}")
 
-            # Stage 4: download artifact
             print("[smoke] Downloading artifact...")
             status, content, _ = http_get(f"{base_url}/d/{token}")
             assert status == 200, f"Download failed: {status}"
             assert content == fdata, f"Content mismatch: {content[:50]}..."
             print(f"[smoke] Artifact verified: {len(content)} bytes match")
 
-            # Stage 5: SIGTERM shutdown
             print("[smoke] Testing SIGTERM shutdown...")
             start = time.time()
             subprocess.run(["docker", "stop", container_id], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -167,8 +148,6 @@ def main():
             subprocess.run(["docker", "kill", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             server.stop()
 
-    # Stage 6: restart and finalize
-    # Verify the artifact directory survived and the DB state is correct
     print("[smoke] All stages passed")
 
 if __name__ == "__main__":

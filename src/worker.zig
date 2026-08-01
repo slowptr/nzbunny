@@ -212,12 +212,12 @@ fn processPending(
             defer dir.close(io);
             cleanupWorkDirs(io, dir, job.id) catch {};
         }
-        if (providerFailure(err)) provider_ready.store(false, .release);
+        if (nntp.isRetryableProviderFailure(err)) provider_ready.store(false, .release);
         const message = if (err == error.Canceled)
             "The download was interrupted by shutdown."
         else if (err == error.Timeout)
             "The download exceeded DOWNLOAD_TIMEOUT."
-        else if (providerFailure(err))
+        else if (nntp.isRetryableProviderFailure(err))
             "The NNTP provider is unavailable; the job failed after retries."
         else
             "The NZB file or downloaded data is not supported.";
@@ -372,10 +372,6 @@ fn cleanupWorkDirs(io: std.Io, root_dir: std.Io.Dir, job_id: []const u8) !void {
     var tmp_buffer: [148]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&tmp_buffer, ".nzbunny-downloads/.tmp-{s}", .{job_id});
     try root_dir.deleteTree(io, tmp);
-}
-
-fn providerFailure(err: anyerror) bool {
-    return nntp.isRetryableProviderFailure(err);
 }
 
 test "provider readiness starts false" {

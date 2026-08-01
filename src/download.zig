@@ -406,7 +406,7 @@ fn fetchItemWithSession(
                 if (attempt + 1 >= session.endpointCount()) return err;
                 std.log.warn("segment {d}/{d} provider endpoint failover {d}/{d} after {t}", .{ file_index + 1, segment_index + 1, attempt + 2, session.endpointCount(), err });
             } else {
-                if (attempt >= 3 or !retryable(err)) return err;
+                if (attempt >= 3 or !nntp.isRetryableProviderFailure(err)) return err;
                 std.log.warn("segment {d}/{d} retry {d}/3 after {t}", .{ file_index + 1, segment_index + 1, attempt + 1, err });
             }
             session.abort();
@@ -523,6 +523,7 @@ fn validateDecodedPartSize(meta: yenc.Part) !void {
     if (range_bytes != meta.decoded)
         return error.InconsistentSegmentSize;
 }
+
 fn validateAggregate(manifest: []FileManifest, included: []const bool, included_count: usize, cfg: anytype) !void {
     for (manifest, included) |file, keep| if (keep and file.name.len == 0) return error.PreflightIncomplete;
     try rejectDuplicateNames(manifest, included);
@@ -805,10 +806,6 @@ fn checkCanceled(control: *shutdown.DownloadControl) !void {
         control.timeout();
         return error.Timeout;
     }
-}
-
-fn retryable(err: anyerror) bool {
-    return nntp.isRetryableProviderFailure(err);
 }
 
 fn ensureDir(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
