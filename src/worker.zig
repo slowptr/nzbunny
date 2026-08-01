@@ -9,6 +9,17 @@ const nntp = @import("nntp.zig");
 const shutdown = @import("shutdown.zig");
 
 pub var provider_ready: std.atomic.Value(bool) = .init(false);
+pub var active_job_hash: std.atomic.Value(u64) = .init(0);
+pub var active_progress: download.Progress = .{};
+
+pub fn progressFor(id: []const u8) ?download.ProgressSnapshot {
+    if (active_job_hash.load(.acquire) != jobHash(id)) return null;
+    return active_progress.snapshot();
+}
+
+fn jobHash(id: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x6e7a62756e6e79, id);
+}
 
 const max_concurrent_finalizers = 2;
 const max_concurrent_cleanup = 8;
@@ -97,8 +108,10 @@ pub fn startup(
         null,
     );
     defer session.deinit();
+    std.log.info("checking NNTP provider {s}:{d}", .{ cfg.nntp_host, cfg.nntp_port });
     try session.connect();
     provider_ready.store(true, .release);
+    std.log.info("NNTP provider is ready", .{});
 }
 
 pub fn run(
@@ -185,10 +198,15 @@ fn processPending(
         return err;
     };
     if (!try db.beginProcessing(io, job.id, now)) return;
+    active_progress.start(io, 0);
+    active_progress.setPhase(io, .parsing);
+    active_job_hash.store(jobHash(job.id), .release);
+    defer active_job_hash.store(0, .release);
+    std.log.info("job {s} started: {s}", .{ job.id, job.filename });
     const started = std.Io.Clock.real.now(io).toSeconds();
     const deadline = std.math.add(i64, started, cfg.download_timeout_seconds) catch return error.Timeout;
     var control = @import("shutdown.zig").DownloadControl.init(io, deadline);
-    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store, &control) catch |err| {
+    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store, &control, &active_progress) catch |err| {
         const root_dir = std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false }) catch null;
         if (root_dir) |dir| {
             defer dir.close(io);
@@ -204,9 +222,11 @@ fn processPending(
         else
             "The NZB file or downloaded data is not supported.";
         try db.fail(io, job.id, message, std.Io.Clock.real.now(io).toSeconds());
+        std.log.err("job {s} download failed: {s} ({t})", .{ job.id, message, err });
         return;
     };
     _ = try db.beginFinalizing(io, job.id, result.relative_path, std.Io.Clock.real.now(io).toSeconds());
+    std.log.info("job {s} download complete; finalization queued", .{job.id});
 }
 
 fn probeProvider(
@@ -238,6 +258,7 @@ fn runFinalize(owner: *Finalizers, job_id: []const u8, lease_token: []const u8, 
     var arena = std.heap.ArenaAllocator.init(owner.allocator);
     defer arena.deinit();
     const now = std.Io.Clock.real.now(owner.io).toSeconds();
+    std.log.info("job {s} finalization started (attempt {d}/{d})", .{ job_id, attempt, max_finalize_attempts });
     finalize(arena.allocator(), owner, job_id, download_path, lease_token, attempt, now) catch |err| {
         std.log.err("Job {s} finalization failed (attempt {d}/{d}): {t}", .{ job_id, attempt, max_finalize_attempts, err });
         if (attempt >= max_finalize_attempts) {
@@ -280,7 +301,10 @@ fn finalize(
             error.DuplicateToken => continue,
             else => return err,
         };
-        if (saved) return;
+        if (saved) {
+            std.log.info("job {s} complete: artifact ready ({d} bytes)", .{ id, result.size });
+            return;
+        }
         return;
     }
     return error.DownloadTokenCollision;

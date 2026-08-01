@@ -325,7 +325,7 @@ fn jobPage(
         \\<link rel="stylesheet" href="/public/styles.css">
     );
     const details = describe(job);
-    if (details.refresh) try w.writeAll("<meta http-equiv=\"refresh\" content=\"5\">");
+    if (details.refresh) try w.writeAll("<meta http-equiv=\"refresh\" content=\"2\">");
     try w.writeAll("<title>nzbunny - job ");
     try htmlEscape(w, job.id);
     try w.writeAll("</title></head><body><main><div class=\"module-container\"><h2>");
@@ -341,6 +341,27 @@ fn jobPage(
     try w.writeAll("\">");
     try w.writeAll(job.status.publicName());
     try w.writeAll("</span></p>");
+    const now = std.Io.Clock.real.now(context.io).toSeconds();
+    if (job.status == .processing) {
+        if (worker.progressFor(job.id)) |progress| {
+            const percent = if (progress.total == 0) 0 else @min(100, progress.completed * 100 / progress.total);
+            try w.writeAll("<p><strong>phase:</strong> ");
+            try w.writeAll(progressPhaseName(progress.phase));
+            try w.writeAll("</p><div class=\"progress-track\" role=\"progressbar\" aria-label=\"Download progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" aria-valuenow=\"");
+            try w.print("{d}\"><span style=\"width:{d}%\"></span></div>", .{ percent, percent });
+            try w.print("<p class=\"progress-detail\">{d} of {d} segments ({d}%)</p>", .{ progress.completed, progress.total, percent });
+            try activityStatus(w, now, progress.last_activity, 30);
+        } else {
+            try w.writeAll("<p><strong>phase:</strong> starting downloader</p>");
+            try activityStatus(w, now, job.updated_at, 30);
+        }
+    } else if (job.status == .finalizing) {
+        try activityStatus(w, now, job.updated_at, 90);
+    } else if (job.status == .pending) {
+        try w.writeAll("<p><strong>queued for:</strong> ");
+        try formatDuration(w, @max(0, now - job.created_at));
+        try w.writeAll("</p>");
+    }
     if (job.fail_reason.len != 0) {
         try w.writeAll("<p><strong>reason:</strong> ");
         try htmlEscape(w, job.fail_reason);
@@ -368,6 +389,36 @@ fn jobPage(
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         .{ .name = "cache-control", .value = "no-store" },
     } });
+}
+
+fn progressPhaseName(phase: @import("download.zig").Phase) []const u8 {
+    return switch (phase) {
+        .idle => "starting downloader",
+        .parsing => "reading NZB metadata",
+        .preparing => "preparing workspace",
+        .preflight => "checking files",
+        .downloading => "downloading segments",
+        .assembling => "assembling files",
+    };
+}
+
+fn activityStatus(writer: *std.Io.Writer, now: i64, last_activity: i64, stall_seconds: i64) !void {
+    const age = @max(0, now - last_activity);
+    try writer.writeAll("<p><strong>last activity:</strong> ");
+    try formatDuration(writer, age);
+    try writer.writeAll(" ago</p>");
+    if (age >= stall_seconds) {
+        try writer.writeAll("<p class=\"stall-warning\"><strong>possible stall:</strong> no progress was recorded recently. The downloader timeout is still active.</p>");
+    } else {
+        try writer.writeAll("<p class=\"activity-ok\">activity is current</p>");
+    }
+}
+
+fn formatDuration(writer: *std.Io.Writer, seconds: i64) !void {
+    if (seconds < 60) return writer.print("{d}s", .{seconds});
+    const minutes = @divFloor(seconds, 60);
+    const remaining = @mod(seconds, 60);
+    return writer.print("{d}m {d}s", .{ minutes, remaining });
 }
 
 fn download(

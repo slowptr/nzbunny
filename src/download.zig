@@ -10,6 +10,66 @@ pub const Result = struct {
     relative_path: []const u8,
 };
 
+pub const Phase = enum(u8) {
+    idle,
+    parsing,
+    preparing,
+    preflight,
+    downloading,
+    assembling,
+};
+
+pub const ProgressSnapshot = struct {
+    phase: Phase,
+    completed: usize,
+    total: usize,
+    last_activity: i64,
+};
+
+pub const Progress = struct {
+    phase: std.atomic.Value(Phase) = .init(.idle),
+    completed: std.atomic.Value(usize) = .init(0),
+    total: std.atomic.Value(usize) = .init(0),
+    last_activity: std.atomic.Value(i64) = .init(0),
+    last_report_bucket: std.atomic.Value(usize) = .init(0),
+
+    pub fn start(self: *Progress, io: std.Io, total: usize) void {
+        self.total.store(total, .release);
+        self.completed.store(0, .release);
+        self.last_report_bucket.store(0, .release);
+        self.setPhase(io, .preparing);
+    }
+
+    pub fn setTotal(self: *Progress, total: usize) void {
+        self.total.store(total, .release);
+    }
+
+    pub fn setPhase(self: *Progress, io: std.Io, phase: Phase) void {
+        self.phase.store(phase, .release);
+        self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
+    }
+
+    pub fn advanced(self: *Progress, io: std.Io) void {
+        const completed = self.completed.fetchAdd(1, .acq_rel) + 1;
+        self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
+        const total = self.total.load(.acquire);
+        if (total == 0) return;
+        const bucket = @min(10, completed * 10 / total);
+        const previous = self.last_report_bucket.load(.acquire);
+        if (bucket > previous and self.last_report_bucket.cmpxchgStrong(previous, bucket, .acq_rel, .acquire) == null)
+            std.log.info("download progress: {d}/{d} segments ({d}%)", .{ completed, total, completed * 100 / total });
+    }
+
+    pub fn snapshot(self: *const Progress) ProgressSnapshot {
+        return .{
+            .phase = self.phase.load(.acquire),
+            .completed = self.completed.load(.acquire),
+            .total = self.total.load(.acquire),
+            .last_activity = self.last_activity.load(.acquire),
+        };
+    }
+};
+
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -19,12 +79,21 @@ pub fn run(
     cfg: anytype,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
 ) !Result {
+    progress.start(io, 0);
+    progress.setPhase(io, .parsing);
+    std.log.info("job {s} parsing NZB metadata ({d} bytes)", .{ job_id, nzb_bytes.len });
     var watchdog: std.Io.Group = .init;
-    watchdog.async(io, shutdown.DownloadControl.watch, .{control});
+    try watchdog.concurrent(io, watchDownload, .{ progress, control, job_id });
     defer watchdog.cancel(io);
     const document = try nzb.parse(allocator, nzb_bytes);
     defer document.deinit(allocator);
+    var total_segments: usize = 0;
+    for (document.files) |file| total_segments += file.segments.len;
+    progress.setTotal(total_segments);
+    progress.setPhase(io, .preparing);
+    std.log.info("download plan: {d} files, {d} segments, {d} connections", .{ document.files.len, total_segments, cfg.nntp_connections });
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
     defer root_dir.close(io);
     try ensureDir(io, root_dir, ".nzbunny-work");
@@ -60,7 +129,9 @@ pub fn run(
         for (manifest[file_index].parts) |*p| p.* = .{ .begin = 0, .end = 0, .rel_path = "" };
     }
 
-    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, control);
+    progress.setPhase(io, .preflight);
+    std.log.info("download phase: checking the first segment of {d} files", .{document.files.len});
+    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, control, progress);
     try validateAggregate(manifest, cfg);
 
     var remaining = std.ArrayList(WorkItem).empty;
@@ -70,14 +141,19 @@ pub fn run(
             try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
         }
     }
-    if (remaining.items.len > 0)
-        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control);
+    if (remaining.items.len > 0) {
+        progress.setPhase(io, .downloading);
+        std.log.info("download phase: fetching {d} remaining segments", .{remaining.items.len});
+        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress);
+    }
 
     for (manifest) |file| {
         try checkCanceled(control);
         validatePartRanges(file.parts, file.size) catch |err| return err;
     }
 
+    progress.setPhase(io, .assembling);
+    std.log.info("download phase: assembling {d} files", .{manifest.len});
     for (manifest, 0..) |file, file_index| {
         try checkCanceled(control);
         std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ file_index + 1, document.files.len, file.name, file.parts.len });
@@ -135,6 +211,7 @@ const SharedCtx = struct {
     cfg: Config,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
     mutex: std.Io.Mutex = .init,
     first_error: ?anyerror = null,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -150,6 +227,7 @@ fn preflightPhase(
     cfg: anytype,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
 ) !void {
     if (files.len == 0) return;
     var ctx = SharedCtx{
@@ -162,6 +240,7 @@ fn preflightPhase(
         .cfg = cfg,
         .ca_store = ca_store,
         .control = control,
+        .progress = progress,
     };
     var next: std.atomic.Value(usize) = .init(0);
     const worker_count = @min(files.len, cfg.nntp_connections);
@@ -214,6 +293,7 @@ fn downloadPhase(
     cfg: anytype,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
 ) !void {
     var ctx = SharedCtx{
         .allocator = allocator,
@@ -225,6 +305,7 @@ fn downloadPhase(
         .cfg = cfg,
         .ca_store = ca_store,
         .control = control,
+        .progress = progress,
     };
     var next: std.atomic.Value(usize) = .init(0);
     const worker_count = @min(items.len, cfg.nntp_connections);
@@ -287,12 +368,34 @@ fn fetchItemWithSession(
         try checkCanceled(ctx.control);
         fetchItemOnce(ctx, session, connected, file_index, segment_index, is_preflight) catch |err| {
             if (attempt >= 3 or !retryable(err)) return err;
+            std.log.warn("segment {d}/{d} retry {d}/3 after {t}", .{ file_index + 1, segment_index + 1, attempt + 1, err });
             session.abort();
             connected.* = false;
             try ctx.control.wait(@as(i64, 1) << @intCast(attempt));
             continue;
         };
+        ctx.progress.advanced(ctx.io);
         return;
+    }
+}
+
+fn watchDownload(progress: *Progress, control: *shutdown.DownloadControl, job_id: []const u8) std.Io.Cancelable!void {
+    var last_warning: i64 = 0;
+    while (!control.isCanceled()) {
+        const now = std.Io.Clock.real.now(control.io).toSeconds();
+        if (now >= control.deadline_seconds) {
+            control.timeout();
+            return;
+        }
+        if (now - last_warning >= 30) {
+            const snapshot = progress.snapshot();
+            const quiet = now - snapshot.last_activity;
+            if (quiet >= 30) {
+                std.log.warn("job {s} possible stall: no segment or phase activity for {d}s ({d}/{d} segments)", .{ job_id, quiet, snapshot.completed, snapshot.total });
+                last_warning = now;
+            }
+        }
+        try std.Io.sleep(control.io, .fromMilliseconds(100), .awake);
     }
 }
 
