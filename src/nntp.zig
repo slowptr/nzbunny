@@ -141,17 +141,17 @@ pub const Session = struct {
     }
 
     fn connectTransport(self: *Session) !void {
-        // Socket-level connect timeout (ConnectOptions.timeout) is not supported
-        // by the Zig 0.16.0 Threaded I/O implementation (panics with TODO).
-        // runWithDeadline wraps connectTransport, initializeTls, greeting, auth,
-        // BODY, and readLine, providing the per-operation deadline via Select.
-        // The DownloadControl.watch watchdog stays as the job-level ceiling.
         const host: std.Io.net.HostName = .{ .bytes = self.host };
         const stream = try std.Io.net.HostName.connect(host, self.io, self.port, .{
             .mode = .stream,
             .timeout = .none,
         });
         self.stream = stream;
+        const seconds = self.operationTimeoutSeconds() catch return error.NntpOperationTimeout;
+        var tv: std.os.linux.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
+        const tv_bytes: [*]const u8 = @ptrCast(&tv);
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
         if (self.control) |control| {
             control.register(stream) catch |err| {
                 self.stream = null;
