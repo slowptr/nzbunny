@@ -2,7 +2,9 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const Database = @import("database.zig").Database;
 const Job = @import("database.zig").Job;
+const shutdown = @import("shutdown.zig");
 const worker = @import("worker.zig");
+const nntp = @import("nntp.zig");
 
 const css = @embedFile("assets/styles.css");
 const javascript = @embedFile("assets/upload.js");
@@ -44,6 +46,7 @@ const Context = struct {
     cfg: Config,
     root: []const u8,
     root_dir: std.Io.Dir,
+    ca_store: *nntp.CaStore,
     connections: std.Io.Semaphore,
     limiter: RateLimiter,
 };
@@ -93,7 +96,7 @@ const RateLimiter = struct {
     }
 };
 
-pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8) !void {
+pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8, ca_store: *nntp.CaStore) !void {
     const address = try std.Io.net.IpAddress.parse("0.0.0.0", cfg.port);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -106,21 +109,34 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
         .cfg = cfg,
         .root = try allocator.dupe(u8, root),
         .root_dir = root_dir,
+        .ca_store = ca_store,
         .connections = .{ .permits = cfg.max_connections },
         .limiter = .{},
     };
     io.random(std.mem.asBytes(&context.limiter.seed));
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root });
-    while (true) {
+    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store });
+    var watcher_group: std.Io.Group = .init;
+    defer watcher_group.cancel(io);
+    watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener }) catch {};
+    while (!shutdown.requested.load(.acquire)) {
         try context.connections.wait(io);
         const stream = listener.accept(io) catch |err| {
             context.connections.post(io);
+            if (shutdown.requested.load(.acquire)) break;
             return err;
         };
         group.async(io, accept, .{ &context, stream });
     }
+    group.await(io) catch {};
+}
+
+fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server) std.Io.Cancelable!void {
+    while (!shutdown.requested.load(.acquire))
+        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+    const stream: std.Io.net.Stream = .{ .socket = listener.socket };
+    stream.shutdown(io, .both) catch {};
 }
 
 fn accept(context: *Context, stream: std.Io.net.Stream) void {
@@ -186,8 +202,8 @@ fn route(
     }
     if (std.mem.eql(u8, target, "/readyz")) {
         if (request.head.method != .GET and request.head.method != .HEAD) return methodNotAllowed(request);
-        if (context.db.ready(context.io)) return respondText(request, .ok, "ready");
-        return respondText(request, .service_unavailable, "Database is not ready.");
+        if (context.db.ready(context.io) and worker.provider_ready.load(.acquire)) return respondText(request, .ok, "ready");
+        return respondText(request, .service_unavailable, "The service is not ready.");
     }
     if (std.mem.eql(u8, target, "/")) {
         return switch (request.head.method) {
@@ -309,7 +325,7 @@ fn jobPage(
         \\<link rel="stylesheet" href="/public/styles.css">
     );
     const details = describe(job);
-    if (details.refresh) try w.writeAll("<meta http-equiv=\"refresh\" content=\"5\">");
+    if (details.refresh) try w.writeAll("<meta http-equiv=\"refresh\" content=\"2\">");
     try w.writeAll("<title>nzbunny - job ");
     try htmlEscape(w, job.id);
     try w.writeAll("</title></head><body><main><div class=\"module-container\"><h2>");
@@ -325,6 +341,27 @@ fn jobPage(
     try w.writeAll("\">");
     try w.writeAll(job.status.publicName());
     try w.writeAll("</span></p>");
+    const now = std.Io.Clock.real.now(context.io).toSeconds();
+    if (job.status == .processing) {
+        if (worker.progressFor(job.id)) |progress| {
+            const percent = if (progress.total == 0) 0 else @min(100, progress.completed * 100 / progress.total);
+            try w.writeAll("<p><strong>phase:</strong> ");
+            try w.writeAll(progressPhaseName(progress.phase));
+            try w.writeAll("</p><div class=\"progress-track\" role=\"progressbar\" aria-label=\"Download progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" aria-valuenow=\"");
+            try w.print("{d}\"><span style=\"width:{d}%\"></span></div>", .{ percent, percent });
+            try w.print("<p class=\"progress-detail\">{d} of {d} segments ({d}%)</p>", .{ progress.completed, progress.total, percent });
+            try activityStatus(w, now, progress.last_activity, 30);
+        } else {
+            try w.writeAll("<p><strong>phase:</strong> starting downloader</p>");
+            try activityStatus(w, now, job.updated_at, 30);
+        }
+    } else if (job.status == .finalizing) {
+        try activityStatus(w, now, job.updated_at, 90);
+    } else if (job.status == .pending) {
+        try w.writeAll("<p><strong>queued for:</strong> ");
+        try formatDuration(w, @max(0, now - job.created_at));
+        try w.writeAll("</p>");
+    }
     if (job.fail_reason.len != 0) {
         try w.writeAll("<p><strong>reason:</strong> ");
         try htmlEscape(w, job.fail_reason);
@@ -352,6 +389,36 @@ fn jobPage(
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         .{ .name = "cache-control", .value = "no-store" },
     } });
+}
+
+fn progressPhaseName(phase: @import("download.zig").Phase) []const u8 {
+    return switch (phase) {
+        .idle => "starting downloader",
+        .parsing => "reading NZB metadata",
+        .preparing => "preparing workspace",
+        .preflight => "checking files",
+        .downloading => "downloading segments",
+        .assembling => "assembling files",
+    };
+}
+
+fn activityStatus(writer: *std.Io.Writer, now: i64, last_activity: i64, stall_seconds: i64) !void {
+    const age = @max(0, now - last_activity);
+    try writer.writeAll("<p><strong>last activity:</strong> ");
+    try formatDuration(writer, age);
+    try writer.writeAll(" ago</p>");
+    if (age >= stall_seconds) {
+        try writer.writeAll("<p class=\"stall-warning\"><strong>possible stall:</strong> no progress was recorded recently. The downloader timeout is still active.</p>");
+    } else {
+        try writer.writeAll("<p class=\"activity-ok\">activity is current</p>");
+    }
+}
+
+fn formatDuration(writer: *std.Io.Writer, seconds: i64) !void {
+    if (seconds < 60) return writer.print("{d}s", .{seconds});
+    const minutes = @divFloor(seconds, 60);
+    const remaining = @mod(seconds, 60);
+    return writer.print("{d}m {d}s", .{ minutes, remaining });
 }
 
 fn download(
@@ -546,7 +613,7 @@ pub fn htmlEscape(writer: *std.Io.Writer, value: []const u8) !void {
 fn describe(job: Job) struct { title: []const u8, detail: []const u8, refresh: bool } {
     return switch (job.status) {
         .pending => .{ .title = "Queued", .detail = "Your NZB is in the queue.", .refresh = true },
-        .submitting, .processing => .{ .title = "Downloading", .detail = "SABnzbd processes the job. This page refreshes automatically.", .refresh = true },
+        .processing => .{ .title = "Downloading", .detail = "The embedded downloader processes the job. This page refreshes automatically.", .refresh = true },
         .finalizing => .{ .title = "Finalizing", .detail = "The file is almost ready. Wait a few seconds.", .refresh = true },
         .complete => .{ .title = "Ready", .detail = "Your temporary download link is active until it expires.", .refresh = false },
         .expired => .{ .title = "Expired", .detail = "This temporary download expired and was removed.", .refresh = false },

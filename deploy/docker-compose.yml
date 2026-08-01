@@ -6,14 +6,19 @@ services:
     container_name: nzbunny
     environment:
       PORT: "1337"
-      SABNZBD_URL: http://sabnzbd:8080
-      SABNZBD_API_KEY: ${SABNZBD_API_KEY:?Set SABNZBD_API_KEY in your environment}
-      SABNZBD_DOWNLOAD_DIR: /downloads
+      NNTP_HOST: ${NNTP_HOST:?Set NNTP_HOST in your environment}
+      NNTP_PORT: ${NNTP_PORT:-563}
+      NNTP_USER: ${NNTP_USER:?Set NNTP_USER in your environment}
+      NNTP_PASS: ${NNTP_PASS:?Set NNTP_PASS in your environment}
+      NNTP_CONNECTIONS: ${NNTP_CONNECTIONS:-4}
+      NNTP_TIMEOUT: ${NNTP_TIMEOUT:-30s}
+      NNTP_CA_FILE: ${NNTP_CA_FILE:-}
+      DOWNLOAD_DIR: /downloads
+      DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT:-2h}
       DB_PATH: /data/nzbunny.db
       RETENTION_TTL: 5m
       CLEANUP_INTERVAL: 30s
       POLL_INTERVAL: 10s
-      SABNZBD_REQUEST_TIMEOUT: 30s
       HTTP_HEADER_TIMEOUT: 15s
       HTTP_REQUEST_TIMEOUT: 5m
       MAX_ARTIFACT_BYTES: "209715200"
@@ -27,11 +32,6 @@ services:
       - downloads:/downloads
     ports:
       - "127.0.0.1:1337:1337"
-    depends_on:
-      sabnzbd:
-        condition: service_healthy
-      sabnzbd-configure:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:1337/readyz"]
       interval: 10s
@@ -39,50 +39,6 @@ services:
       retries: 6
     restart: unless-stopped
 
-  sabnzbd-configure:
-    image: lscr.io/linuxserver/sabnzbd@sha256:302be8972d4627222a0701634f2f9025826d760d856414aa6e67c0a66833e5be
-    environment:
-      SABNZBD_API_KEY: ${SABNZBD_API_KEY:?Set SABNZBD_API_KEY in your environment}
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        response="$$(curl --fail --silent --show-error --get \
-          --data-urlencode mode=set_config \
-          --data-urlencode section=misc \
-          --data-urlencode keyword=complete_dir \
-          --data-urlencode value=/downloads/complete \
-          --data-urlencode output=json \
-          --data-urlencode "apikey=$$SABNZBD_API_KEY" \
-          http://sabnzbd:8080/api)"
-        printf '%s\n' "$$response" | grep -F '"complete_dir":"/downloads/complete"' >/dev/null
-    depends_on:
-      sabnzbd:
-        condition: service_healthy
-    restart: "no"
-
-  sabnzbd:
-    image: lscr.io/linuxserver/sabnzbd@sha256:302be8972d4627222a0701634f2f9025826d760d856414aa6e67c0a66833e5be
-    container_name: nzbunny-sabnzbd
-    hostname: sabnzbd
-    environment:
-      PUID: "10001"
-      PGID: "10001"
-      TZ: Etc/UTC
-    volumes:
-      - sabnzbd-config:/config
-      - sabnzbd-incomplete:/incomplete-downloads
-      - downloads:/downloads
-    ports:
-      - "127.0.0.1:8080:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8080/api?mode=version\\&output=json || wget -q -O /dev/null http://localhost:8080/"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-    restart: unless-stopped
-
 volumes:
   nzbunny-data:
-  sabnzbd-config:
-  sabnzbd-incomplete:
   downloads:

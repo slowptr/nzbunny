@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const skip_integration = b.option(bool, "skip_integration", "Skip Python integration test") orelse false;
 
     const module = b.addModule("nzbunny", .{
         .root_source_file = b.path("src/root.zig"),
@@ -13,6 +14,8 @@ pub fn build(b: *std.Build) void {
     });
     module.linkSystemLibrary("sqlite3", .{});
     module.linkSystemLibrary("archive", .{});
+    module.linkSystemLibrary("xml2", .{ .use_pkg_config = .yes });
+    module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/libxml2" });
 
     const exe = b.addExecutable(.{
         .name = "nzbunny",
@@ -34,8 +37,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
-    const integration = b.addSystemCommand(&.{"python3"});
-    integration.addFileArg(b.path("tests/integration.py"));
-    integration.addArtifactArg(exe);
-    test_step.dependOn(&integration.step);
+    if (!skip_integration) {
+        const integration = b.addSystemCommand(&.{"python3"});
+        integration.addFileArg(b.path("tests/integration.py"));
+        integration.addArtifactArg(exe);
+        test_step.dependOn(&integration.step);
+    }
 }

@@ -2,7 +2,7 @@
 FROM debian:bookworm-slim AS build
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils libsqlite3-dev libarchive-dev \
+    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils libsqlite3-dev libarchive-dev libxml2-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TARGETARCH=amd64
@@ -31,7 +31,7 @@ RUN /opt/zig/zig build -Doptimize=ReleaseSafe --prefix /out
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 libarchive13 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 libarchive13 libxml2 par2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 nzbunny \

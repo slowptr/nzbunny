@@ -120,6 +120,34 @@ button:hover {
     color: #aa1b00;
 }
 
+.progress-track {
+    height: 18px;
+    border: 2px inset #a4a4a4;
+    background: #fff;
+}
+
+.progress-track span {
+    display: block;
+    height: 100%;
+    min-width: 2px;
+    background: repeating-linear-gradient(135deg, #315fbd 0 8px, #4776d5 8px 16px);
+}
+
+.progress-detail {
+    margin-top: 5px;
+}
+
+.activity-ok {
+    color: #136f00;
+}
+
+.stall-warning {
+    padding: 6px;
+    border: 1px solid #aa1b00;
+    background: #ffe0d8;
+    color: #7d1400;
+}
+
 .logo {
     position: fixed;
     right: 0;

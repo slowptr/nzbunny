@@ -13,6 +13,45 @@ const c = @cImport({
 
 const at_removedir = std.os.linux.AT.REMOVEDIR;
 
+const WriteCtx = struct {
+    fd: c_int,
+    written: u64 = 0,
+    cap: u64,
+};
+
+fn boundedWriteCallback(
+    a: ?*c.struct_archive,
+    client_data: ?*anyopaque,
+    buffer: ?*const anyopaque,
+    length: usize,
+) callconv(.c) isize {
+    _ = a;
+    if (length == 0) return 0;
+    const ctx: *WriteCtx = @ptrCast(@alignCast(client_data.?));
+    const new_written = std.math.add(u64, ctx.written, @as(u64, length)) catch return -1;
+    if (new_written > ctx.cap) return -1;
+    const buf: [*]const u8 = @ptrCast(buffer.?);
+    var written: usize = 0;
+    while (written < length) {
+        const rc = std.os.linux.write(ctx.fd, buf + written, length - written);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
+            return -1;
+        }
+        if (signed == 0) return -1;
+        written += @intCast(signed);
+        ctx.written += @as(u64, @intCast(signed));
+    }
+    return @intCast(written);
+}
+
+fn archiveCloseCallback(a: ?*c.struct_archive, client_data: ?*anyopaque) callconv(.c) c_int {
+    _ = a;
+    _ = client_data;
+    return c.ARCHIVE_OK;
+}
+
 pub const Result = struct {
     relative_path: []const u8,
     size: u64,
@@ -34,6 +73,7 @@ pub fn prepare(
     job_id: []const u8,
     source: []const u8,
     max_bytes: u64,
+    lease_token: []const u8,
 ) !Result {
     const io_buffer = try allocator.alloc(u8, io_buffer_size);
     defer allocator.free(io_buffer);
@@ -83,8 +123,11 @@ pub fn prepare(
         else => return err,
     }
 
-    var temp_name_buffer: [100]u8 = undefined;
-    const temp_name = try std.fmt.bufPrintZ(&temp_name_buffer, "{s}.tmp", .{final_name});
+    var temp_name_buffer: [116]u8 = undefined;
+    const temp_name = if (lease_token.len >= 8)
+        try std.fmt.bufPrintZ(&temp_name_buffer, "{s}.{s}.tmp", .{ final_name, lease_token[0..8] })
+    else
+        try std.fmt.bufPrintZ(&temp_name_buffer, "{s}.tmp", .{final_name});
     try removeFileAt(artifact_fd, temp_name);
     errdefer removeFileAt(artifact_fd, temp_name) catch |err|
         std.log.err("Temporary artifact cleanup failed for {s}: {t}", .{ temp_name, err });
@@ -113,7 +156,10 @@ pub fn prepare(
         const archive = c.archive_write_new() orelse return error.ArchiveCreateFailed;
         defer _ = c.archive_write_free(archive);
         if (c.archive_write_set_format_zip(archive) != c.ARCHIVE_OK) return error.ArchiveFormatFailed;
-        if (c.archive_write_open_fd(archive, temp_fd) != c.ARCHIVE_OK)
+        _ = c.archive_write_set_bytes_per_block(archive, 0);
+        _ = c.archive_write_set_bytes_in_last_block(archive, 1);
+        var write_ctx = WriteCtx{ .fd = temp_fd, .cap = max_bytes };
+        if (c.archive_write_open2(archive, &write_ctx, null, boundedWriteCallback, archiveCloseCallback, null) != c.ARCHIVE_OK)
             return error.ArchiveOpenFailed;
         var archive_open = true;
         defer {
@@ -121,9 +167,12 @@ pub fn prepare(
         }
         var limits = Limits{ .max_bytes = max_bytes };
         try walkFd(archive, source_fd.fd, "", &limits, 0, io_buffer);
-        if (c.archive_write_close(archive) != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
+        const close_rc = c.archive_write_close(archive);
+        if (close_rc != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
         archive_open = false;
     }
+
+    if (c.fsync(temp_fd) != 0) return error.ArchiveWriteFailed;
 
     var temp_stat: c.struct_stat = undefined;
     if (c.fstat(temp_fd, &temp_stat) != 0 or (temp_stat.st_mode & c.S_IFMT) != c.S_IFREG)
@@ -134,6 +183,7 @@ pub fn prepare(
     temp_open = false;
     if (c.renameat(artifact_fd, temp_name, artifact_fd, final_name) != 0)
         return error.ArchiveRenameFailed;
+    if (c.fsync(artifact_fd) != 0) return error.ArtifactDirectoryFailed;
     return .{
         .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ artifact_name, final_name }),
         .size = size,
@@ -270,12 +320,19 @@ fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buf
     c.archive_entry_set_perm(entry, 0o600);
     c.archive_entry_set_size(entry, @intCast(size));
     if (c.archive_write_header(archive, entry) != c.ARCHIVE_OK) return error.ArchiveHeaderFailed;
+    var copied: u64 = 0;
     while (true) {
         const n = c.read(fd, buffer.ptr, buffer.len);
+        if (n < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return error.ArtifactReadFailed;
+        }
         if (n == 0) break;
-        if (n < 0) return error.ArtifactReadFailed;
+        copied = std.math.add(u64, copied, @intCast(n)) catch return error.ArtifactSourceChanged;
+        if (copied > size) return error.ArtifactSourceChanged;
         if (c.archive_write_data(archive, buffer.ptr, @intCast(n)) != n) return error.ArchiveWriteFailed;
     }
+    if (copied != size) return error.ArtifactSourceChanged;
 }
 
 pub fn removeValidated(root: []const u8, candidate: []const u8) !void {
@@ -468,7 +525,7 @@ test "artifact directory cannot be a symlink" {
 
     try std.testing.expectError(
         error.ArtifactDirectoryUnsafe,
-        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024),
+        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024, ""),
     );
 }
 
@@ -490,6 +547,7 @@ test "directory artifact is written through a safe directory handle" {
         "0123456789abcdef0123456789abcdef",
         "source",
         1024,
+        "",
     );
     defer std.testing.allocator.free(result.relative_path);
     try std.testing.expectEqualStrings(
@@ -522,6 +580,6 @@ test "a symlink inside the source tree is not followed" {
     const download = try std.fmt.bufPrint(&download_buffer, "{s}/downloads", .{base});
     try std.testing.expectError(
         error.SymbolicLinkRejected,
-        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024),
+        prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024, ""),
     );
 }

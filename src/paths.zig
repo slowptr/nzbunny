@@ -9,9 +9,19 @@ const c = @cImport({
 extern "c" fn realpath(noalias path: [*:0]const u8, noalias resolved: [*]u8) ?[*:0]u8;
 
 pub fn resolveRoot(path: []const u8, out: []u8) ![]const u8 {
+    if (path.len == 0 or path[0] != '/') return error.DownloadRootNotAbsolute;
     const z = try toZ(path, out);
     var resolved: [c.PATH_MAX]u8 = undefined;
-    if (realpath(z.ptr, &resolved) == null) return error.DownloadRootNotAccessible;
+    if (realpath(z.ptr, &resolved) == null) {
+        // Auto-create a single missing leaf directory. Multi-level creation
+        // is not supported; operators must ensure parent directories exist.
+        if (std.c._errno().* == c.ENOENT) {
+            if (c.mkdir(z.ptr, 511) != 0) return error.DownloadRootNotAccessible;
+            if (realpath(z.ptr, &resolved) == null) return error.DownloadRootNotAccessible;
+        } else {
+            return error.DownloadRootNotAccessible;
+        }
+    }
     const result = std.mem.sliceTo(&resolved, 0);
     var stat: c.struct_stat = undefined;
     if (c.lstat(&resolved, &stat) != 0 or (stat.st_mode & c.S_IFMT) != c.S_IFDIR) return error.DownloadRootNotDirectory;

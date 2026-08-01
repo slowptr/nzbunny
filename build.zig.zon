@@ -1,7 +1,7 @@
 .{
     .name = .nzbunny,
     .version = "0.1.0",
-    .fingerprint = 0x6b1ae80c0bae24c7,
+    .fingerprint = 0xc3a1db7964a2eda3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
@@ -9,7 +9,7 @@
         "build.zig.zon",
         "src",
         "tests",
-        "README.md",
+        "readme.txt",
         "Dockerfile",
     },
 }
