@@ -135,24 +135,20 @@ pub fn run(
     const included = try allocator.alloc(bool, manifest.len);
     defer allocator.free(included);
     var included_count: usize = 0;
-    var selected_segments: usize = document.files.len;
-    for (manifest, document.files, included) |file, source, *keep| {
+    for (manifest, included) |file, *keep| {
         keep.* = !isRepairName(file.name);
         if (keep.*) {
             try rejectUnsupportedName(file.name);
             included_count += 1;
-            selected_segments += source.segments.len - 1;
         }
     }
     if (included_count == 0) return error.NoPayloadFiles;
-    progress.setTotal(selected_segments);
-    std.log.info("download selection: {d} payload files, {d} repair files skipped", .{ included_count, manifest.len - included_count });
+    std.log.info("download selection: {d} payload files, {d} PAR2 repair files", .{ included_count, manifest.len - included_count });
     try validateAggregate(manifest, included, included_count, cfg);
 
     var remaining = std.ArrayList(WorkItem).empty;
     defer remaining.deinit(allocator);
     for (document.files, 0..) |file, file_index| {
-        if (!included[file_index]) continue;
         for (1..file.segments.len) |segment_index| {
             try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
         }
@@ -163,21 +159,33 @@ pub fn run(
         try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress);
     }
 
-    for (manifest, included) |file, keep| {
-        if (!keep) continue;
-        try checkCanceled(control);
-        validatePartRanges(file.parts, file.size) catch |err| return err;
-    }
-
     progress.setPhase(io, .assembling);
-    std.log.info("download phase: assembling {d} files", .{included_count});
+    var damaged = false;
+    for (manifest, included) |file, keep| if (keep and !allPartsPresent(file.parts)) {
+        damaged = true;
+        break;
+    };
+    std.log.info("download phase: assembling {d} payload files", .{included_count});
     var assembled: usize = 0;
     for (manifest, 0..) |file, file_index| {
         if (!included[file_index]) continue;
         try checkCanceled(control);
         assembled += 1;
-        std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ assembled, included_count, file.name, file.parts.len });
-        try assembleFile(allocator, io, root_dir, tmp_output_root, file, control);
+        if (damaged) {
+            std.log.info("file {d}/{d} prepared for PAR2 recovery: {s}", .{ assembled, included_count, file.name });
+            try assembleDamagedFile(allocator, io, root_dir, tmp_output_root, file, control);
+        } else {
+            try validatePartRanges(file.parts, file.size);
+            std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ assembled, included_count, file.name, file.parts.len });
+            try assembleFile(allocator, io, root_dir, tmp_output_root, file, control);
+        }
+    }
+    if (damaged) {
+        const repair_name = try assembleRepairFiles(allocator, io, root_dir, tmp_output_root, manifest, included, control);
+        std.log.info("download phase: repairing missing payload data with {s}", .{repair_name});
+        try repairWithPar2(allocator, io, root_dir, tmp_output_root, repair_name, control);
+        for (manifest, included) |file, keep| if (keep)
+            try validateRepairedFile(allocator, io, root_dir, tmp_output_root, file);
     }
 
     var tmp_dir_file = try root_dir.openFile(io, tmp_output_root, .{ .allow_directory = true, .follow_symlinks = false });
@@ -363,6 +371,11 @@ fn downloadWorker(ctx: *SharedCtx, items: []const WorkItem, next: *std.atomic.Va
         if (idx >= items.len) break;
         const item = items[idx];
         fetchItemWithSession(ctx, &session, &connected, item.file_index, item.segment_index, false) catch |err| {
+            if (err == error.MissingArticle) {
+                std.log.warn("file {d} segment {d} is unavailable on all provider endpoints", .{ item.file_index + 1, item.segment_index + 1 });
+                ctx.progress.advanced(ctx.io);
+                continue;
+            }
             recordError(ctx, err);
             return;
         };
@@ -389,11 +402,16 @@ fn fetchItemWithSession(
     while (true) : (attempt += 1) {
         try checkCanceled(ctx.control);
         fetchItemOnce(ctx, session, connected, file_index, segment_index, is_preflight) catch |err| {
-            if (attempt >= 3 or !retryable(err)) return err;
-            std.log.warn("segment {d}/{d} retry {d}/3 after {t}", .{ file_index + 1, segment_index + 1, attempt + 1, err });
+            if (err == error.MissingArticle) {
+                if (attempt + 1 >= session.endpointCount()) return err;
+                std.log.warn("segment {d}/{d} provider endpoint failover {d}/{d} after {t}", .{ file_index + 1, segment_index + 1, attempt + 2, session.endpointCount(), err });
+            } else {
+                if (attempt >= 3 or !retryable(err)) return err;
+                std.log.warn("segment {d}/{d} retry {d}/3 after {t}", .{ file_index + 1, segment_index + 1, attempt + 1, err });
+            }
             session.abort();
             connected.* = false;
-            try ctx.control.wait(@as(i64, 1) << @intCast(attempt));
+            if (err != error.MissingArticle) try ctx.control.wait(@as(i64, 1) << @intCast(attempt));
             continue;
         };
         ctx.progress.advanced(ctx.io);
@@ -510,8 +528,7 @@ fn validateAggregate(manifest: []FileManifest, included: []const bool, included_
     try rejectDuplicateNames(manifest, included);
     try rejectUnsupportedSet(manifest, included, included_count);
     var total_size: u64 = 0;
-    for (manifest, included) |file, keep| {
-        if (!keep) continue;
+    for (manifest) |file| {
         total_size = std.math.add(u64, total_size, file.size) catch return error.ArtifactTooLarge;
         if (total_size > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
     }
@@ -519,6 +536,130 @@ fn validateAggregate(manifest: []FileManifest, included: []const bool, included_
         const envelope = zipEnvelope(included_count);
         const total_with_envelope = std.math.add(u64, total_size, envelope) catch return error.ArtifactTooLarge;
         if (total_with_envelope > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
+    }
+}
+
+fn allPartsPresent(parts: []const Part) bool {
+    for (parts) |part| if (part.rel_path.len == 0) return false;
+    return true;
+}
+
+fn assembleRepairFiles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    output_root: []const u8,
+    manifest: []FileManifest,
+    included: []const bool,
+    control: *shutdown.DownloadControl,
+) ![]const u8 {
+    var repair_name: ?[]const u8 = null;
+    for (manifest, included) |file, keep| {
+        if (keep or !allPartsPresent(file.parts)) continue;
+        try validatePartRanges(file.parts, file.size);
+        try assembleFile(allocator, io, root_dir, output_root, file, control);
+        if (repair_name == null or !isRecoveryName(file.name)) repair_name = file.name;
+    }
+    return repair_name orelse error.InsufficientPar2Data;
+}
+
+fn assembleDamagedFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    output_root: []const u8,
+    output: FileManifest,
+    control: *shutdown.DownloadControl,
+) !void {
+    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
+    defer allocator.free(final_path);
+    var out = try root_dir.createFile(io, final_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
+    defer out.close(io);
+    try out.setLength(io, output.size);
+    var previous_end: u64 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
+    for (output.parts) |part| {
+        if (part.rel_path.len == 0) continue;
+        try checkCanceled(control);
+        if (part.begin <= previous_end or part.end < part.begin or part.end > output.size) return error.InvalidYencRange;
+        previous_end = part.end;
+        var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+        defer input.close(io);
+        const size = try inclusiveRangeLength(part.begin, part.end);
+        var offset: u64 = 0;
+        while (offset < size) {
+            const chunk: usize = @intCast(@min(size - offset, buffer.len));
+            const read = std.os.linux.pread(input.handle, &buffer, chunk, @intCast(offset));
+            if (read == 0 or @as(isize, @bitCast(read)) < 0) return error.DecodedPartChanged;
+            const written = std.os.linux.pwrite(out.handle, buffer[0..read].ptr, read, @intCast(part.begin - 1 + offset));
+            if (written != read) return error.DecodedPartChanged;
+            offset += read;
+        }
+    }
+    try out.sync(io);
+}
+
+fn repairWithPar2(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    output_root: []const u8,
+    repair_name: []const u8,
+    control: *shutdown.DownloadControl,
+) !void {
+    try checkCanceled(control);
+    var output_dir = try root_dir.openDir(io, output_root, .{ .follow_symlinks = false });
+    defer output_dir.close(io);
+    const remaining = control.deadline_seconds - std.Io.Clock.real.now(io).toSeconds();
+    if (remaining <= 0) return error.Timeout;
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "/usr/bin/par2", "repair", "-q", "-p", "--", repair_name },
+        .cwd = .{ .dir = output_dir },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(remaining) } },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    const message = std.mem.trim(u8, result.stderr, " \t\r\n");
+    if (message.len != 0) std.log.err("PAR2 repair failed: {s}", .{message});
+    return error.Par2RepairFailed;
+}
+
+fn validateRepairedFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    output_root: []const u8,
+    output: FileManifest,
+) !void {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
+    defer allocator.free(path);
+    var file = try root_dir.openFile(io, path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    defer file.close(io);
+    if (try file.length(io) != output.size) return error.Par2RepairFailed;
+    var expected: ?u32 = null;
+    for (output.parts) |part| if (part.crc32) |crc| {
+        if (expected) |value| {
+            if (value != crc) return error.YencCrcMismatch;
+        } else expected = crc;
+    };
+    if (expected) |crc| {
+        var actual: std.hash.Crc32 = .init();
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < output.size) {
+            const chunk: usize = @intCast(@min(output.size - offset, buffer.len));
+            const read = std.os.linux.pread(file.handle, &buffer, chunk, @intCast(offset));
+            if (read == 0 or @as(isize, @bitCast(read)) < 0) return error.Par2RepairFailed;
+            actual.update(buffer[0..read]);
+            offset += read;
+        }
+        if (actual.final() != crc) return error.YencCrcMismatch;
     }
 }
 
@@ -619,11 +760,18 @@ fn isRepairName(name: []const u8) bool {
     return endsWithIgnoreCase(name, ".par2");
 }
 
+fn isRecoveryName(name: []const u8) bool {
+    const lower = std.ascii.allocLowerString(std.heap.page_allocator, name) catch return true;
+    defer std.heap.page_allocator.free(lower);
+    return std.mem.indexOf(u8, lower, ".vol") != null and std.mem.endsWith(u8, lower, ".par2");
+}
+
 fn subjectFileName(subject: []const u8) ?[]const u8 {
     var value = std.mem.trim(u8, subject, " \t\r\n");
-    if (std.mem.lastIndexOf(u8, value, " (")) |suffix| value = std.mem.trimEnd(u8, value[0..suffix], " \t");
-    if (value.len >= 2 and value[value.len - 1] == '"') {
-        if (std.mem.lastIndexOfScalar(u8, value[0 .. value.len - 1], '"')) |start| value = value[start + 1 .. value.len - 1];
+    if (std.mem.lastIndexOfScalar(u8, value, '"')) |end| {
+        if (std.mem.lastIndexOfScalar(u8, value[0..end], '"')) |start| value = value[start + 1 .. end];
+    } else if (std.mem.lastIndexOf(u8, value, " (")) |suffix| {
+        value = std.mem.trimEnd(u8, value[0..suffix], " \t");
     }
     value = std.mem.trim(u8, value, " \t\"");
     if (value.len == 0 or value.len > 255 or std.mem.findAny(u8, value, "/\\\r\n\x00") != null) return null;
@@ -707,12 +855,15 @@ test "validates decoded part size against yEnc range" {
 test "identifies PAR2 repair files" {
     try std.testing.expect(isRepairName("release.par2"));
     try std.testing.expect(isRepairName("release.vol03+04.PAR2"));
+    try std.testing.expect(isRecoveryName("release.vol03+04.PAR2"));
+    try std.testing.expect(!isRecoveryName("release.par2"));
     try std.testing.expect(!isRepairName("comic.cbr"));
 }
 
 test "extracts safe filenames from NZB subjects" {
     try std.testing.expectEqualStrings("comic.cbr", subjectFileName("comic.cbr (1/0)").?);
     try std.testing.expectEqualStrings("comic.par2", subjectFileName("\"comic.par2\" (1/1)").?);
+    try std.testing.expectEqualStrings("cd915d49f55605dcc7c8853f.rar", subjectFileName("cd915d49f55605dcc7c8853f [2/4] - \"cd915d49f55605dcc7c8853f.rar\" yEnc 35472270 (1/55)").?);
     try std.testing.expect(subjectFileName("obfuscated subject") == null);
     try std.testing.expect(subjectFileName("../comic.cbr (1/1)") == null);
 }

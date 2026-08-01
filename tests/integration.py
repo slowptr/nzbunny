@@ -108,11 +108,14 @@ def yenc_encode(name, size, part_num, total_parts, begin, end, data):
 
     offset = 0
     while offset < len(encoded_data):
-        chunk = encoded_data[offset : offset + 128]
+        end = min(offset + 128, len(encoded_data))
+        if end < len(encoded_data) and encoded_data[end - 1] == 61:
+            end -= 1
+        chunk = encoded_data[offset:end]
         if chunk.startswith(b"."):
             chunk = b"." + chunk  # dot-stuffing
         lines.append(bytes(chunk) + b"\r\n")
-        offset += 128
+        offset = end
 
     part_crc = zlib.crc32(data) & 0xFFFFFFFF
     if total_parts > 1:
@@ -453,7 +456,15 @@ def main():
                     token = m.group(1)
                     break
                 time.sleep(0.2)
-            assert token, "Job did not reach COMPLETE"
+            if not token:
+                conn = sqlite3.connect(db_path)
+                try:
+                    state = conn.execute(
+                        "SELECT status, fail_reason FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                finally:
+                    conn.close()
+                raise AssertionError(f"Job did not reach COMPLETE: {state}")
 
             code, content, headers = http_get(f"http://127.0.0.1:13370/d/{token}")
             assert code == 200
@@ -561,6 +572,60 @@ def main():
             code, mixed_content, _ = http_get(f"http://127.0.0.1:13370/d/{mixed_token}")
             assert code == 200
             assert mixed_content == comic_data
+
+            repairable_data = bytes(range(256)) * 1024
+            server.fragment_sends = False
+            server.body_delay_seconds = 0
+            repairable_path = os.path.join(temp_dir, "repairable.bin")
+            repair_set_path = os.path.join(temp_dir, "repairable.par2")
+            with open(repairable_path, "wb") as f:
+                f.write(repairable_data)
+            subprocess.run(
+                ["/usr/bin/par2", "create", "-q", "-b8", "-r100", "-n1", repair_set_path, repairable_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            split_at = len(repairable_data) // 2
+            data_first = repairable_data[:split_at]
+            data_second = repairable_data[split_at:]
+            first_msg = "repairable-1@nzbunny.test"
+            missing_msg = "repairable-2@nzbunny.test"
+            server.articles.clear()
+            server.missing_articles.add(missing_msg)
+            server.articles[first_msg] = yenc_encode(
+                "repairable.bin", len(repairable_data), 1, 2, 1, split_at, data_first
+            )
+            repair_nzb_files = [[
+                (1, len(data_first) + 200, first_msg),
+                (2, len(data_second) + 200, missing_msg),
+            ]]
+            for index, par_path in enumerate(sorted(Path(temp_dir).glob("repairable*.par2"))):
+                par_data = par_path.read_bytes()
+                message_id = f"repair-{index}@nzbunny.test"
+                server.articles[message_id] = yenc_encode(
+                    par_path.name, len(par_data), 1, 1, 1, len(par_data), par_data
+                )
+                repair_nzb_files.append([(1, len(par_data) + 200, message_id)])
+            repair_nzb = build_nzb(repair_nzb_files)
+            code, loc = http_post_file("http://127.0.0.1:13370/", "repair.nzb", repair_nzb)
+            assert code == 303, (code, loc)
+            repair_id = loc.split("/")[-1]
+            repair_token = None
+            for _ in range(100):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{repair_id}")
+                html_str = html.decode("utf-8")
+                if "COMPLETE" in html_str:
+                    match = re.search(r'/d/([0-9a-f]{64})', html_str)
+                    assert match, html_str
+                    repair_token = match.group(1)
+                    break
+                time.sleep(0.2)
+            assert repair_token, "PAR2 recovery job did not complete"
+            code, repaired_content, _ = http_get(f"http://127.0.0.1:13370/d/{repair_token}")
+            assert code == 200
+            assert repaired_content == repairable_data
+            server.missing_articles.remove(missing_msg)
         except Exception:
             proc.kill()
             stdout, stderr = proc.communicate()

@@ -27,10 +27,14 @@ DESCRIPTION
      published.
 
 SUPPORTED INPUT
-     NZB files must contain direct yEnc files.  The downloader rejects password
-     metadata, PAR2 files, split archives, base64, uuencode, and password
-     protected content.  A single .zip, .7z, or .rar file is allowed when it is
-     not part of a split volume.
+     NZB files must contain direct yEnc files.  The downloader uses complete
+     PAR2 files when provider backends cannot return all payload articles.  It
+     rejects split archives, base64, and uuencode.  A single .zip, .7z, or .rar
+     file is allowed when it is not part of a split volume.  Password metadata
+     is preserved in the NZB but is not used because archives are not extracted.
+
+     PAR2 recovery requires /usr/bin/par2 from par2cmdline.  The container image
+     includes this dependency.
 
 FILES
      .env             Service configuration.  See ENVIRONMENT below.

@@ -1,6 +1,8 @@
 const std = @import("std");
 const shutdown = @import("shutdown.zig");
 
+var next_endpoint: std.atomic.Value(usize) = .init(0);
+
 pub const CaStore = struct {
     bundle: std.crypto.Certificate.Bundle = .empty,
     lock: std.Io.RwLock = .init,
@@ -64,6 +66,9 @@ pub const Session = struct {
     control: ?*shutdown.DownloadControl = null,
     stream: ?std.Io.net.Stream = null,
     registered: bool = false,
+    endpoints: [32]std.Io.net.IpAddress = undefined,
+    endpoint_count: usize = 0,
+    endpoint_index: usize = 0,
     stream_reader: ?std.Io.net.Stream.Reader = null,
     stream_writer: ?std.Io.net.Stream.Writer = null,
     tls: ?std.crypto.tls.Client = null,
@@ -130,6 +135,10 @@ pub const Session = struct {
         }
     }
 
+    pub fn endpointCount(self: *const Session) usize {
+        return self.endpoint_count;
+    }
+
     pub fn deinit(self: *Session) void {
         if (self.tls) |*tls| tls.end() catch {};
         if (self.stream) |stream| {
@@ -144,11 +153,20 @@ pub const Session = struct {
     }
 
     fn connectTransport(self: *Session) !void {
-        const host: std.Io.net.HostName = .{ .bytes = self.host };
-        const stream = try std.Io.net.HostName.connect(host, self.io, self.port, .{
-            .mode = .stream,
-            .timeout = .none,
-        });
+        if (self.endpoint_count == 0) try self.resolveEndpoints();
+        var attempts: usize = 0;
+        var last_error: ?std.Io.net.IpAddress.ConnectError = null;
+        const stream = while (attempts < self.endpoint_count) : (attempts += 1) {
+            const index = self.endpoint_index % self.endpoint_count;
+            self.endpoint_index +%= 1;
+            break self.endpoints[index].connect(self.io, .{
+                .mode = .stream,
+                .timeout = .none,
+            }) catch |err| {
+                last_error = err;
+                continue;
+            };
+        } else return last_error orelse error.UnknownHostName;
         self.stream = stream;
         const seconds = self.operationTimeoutSeconds() catch return error.NntpOperationTimeout;
         var tv: std.os.linux.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
@@ -165,6 +183,29 @@ pub const Session = struct {
         }
         self.stream_reader = stream.reader(self.io, &self.read_buffer);
         self.stream_writer = stream.writer(self.io, &self.write_buffer);
+    }
+
+    fn resolveEndpoints(self: *Session) !void {
+        const host: std.Io.net.HostName = .{ .bytes = self.host };
+        var results_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+        var results: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&results_buffer);
+        try host.lookup(self.io, &results, .{ .port = self.port });
+        while (results.getOneUncancelable(self.io)) |result| switch (result) {
+            .canonical_name => {},
+            .address => |address| {
+                for (self.endpoints[0..self.endpoint_count]) |existing| {
+                    if (std.meta.eql(existing, address)) break;
+                } else {
+                    if (self.endpoint_count == self.endpoints.len) return error.TooManyProviderEndpoints;
+                    self.endpoints[self.endpoint_count] = address;
+                    self.endpoint_count += 1;
+                }
+            },
+        } else |err| switch (err) {
+            error.Closed => {},
+        }
+        if (self.endpoint_count == 0) return error.UnknownHostName;
+        self.endpoint_index %= self.endpoint_count;
     }
 
     fn initializeTls(self: *Session) !void {
@@ -370,6 +411,7 @@ pub fn makeSession(
         .ca_store = ca_store,
         .timeout_seconds = timeout_seconds,
         .control = control,
+        .endpoint_index = next_endpoint.fetchAdd(1, .monotonic),
     };
 }
 

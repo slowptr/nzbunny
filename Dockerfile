@@ -31,7 +31,7 @@ RUN /opt/zig/zig build -Doptimize=ReleaseSafe --prefix /out
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 libarchive13 libxml2 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 libarchive13 libxml2 par2 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 nzbunny \
