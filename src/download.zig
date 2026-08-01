@@ -404,14 +404,14 @@ fn assembleFile(
     defer out.close(io);
     var out_buffer: [64 * 1024]u8 = undefined;
     var writer = out.writer(io, &out_buffer);
-    var buffer: [64 * 1024]u8 = undefined;
+    var reader_buf: [64 * 1024]u8 = undefined;
     var expected_crc: ?u32 = null;
     for (output.parts) |part| {
         try checkCanceled(control);
         var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
         defer input.close(io);
         const size = try inclusiveRangeLength(part.begin, part.end);
-        var reader = std.Io.File.Reader.initSize(input, io, &buffer, size);
+        var reader = std.Io.File.Reader.initSize(input, io, &reader_buf, size);
         const sent = try writer.interface.sendFileAll(&reader, .limited(size));
         if (sent != size) return error.DecodedPartChanged;
         if (part.crc32) |crc| {
