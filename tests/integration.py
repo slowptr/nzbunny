@@ -130,6 +130,7 @@ class FakeNNTPServer:
         self.two_step_auth = two_step_auth
         self.articles = {}
         self.transient_errors = set()
+        self.no_group_once = set()
         self.persistent_transient = set()
         self.missing_articles = set()
         self.reject_connections = False
@@ -137,6 +138,7 @@ class FakeNNTPServer:
         self.body_delay_seconds = 0
         self.stall_after_tls = False
         self.stall_body = set()
+        self.close_body_once = set()
         self.active_conns = 0
         self.peak_conns = 0
         self.handshake_count = 0
@@ -263,6 +265,11 @@ class FakeNNTPServer:
                             sock.sendall(b"400 Transient server error\r\n")
                             time.sleep(0.01)
                             continue
+                        if msgid in self.no_group_once:
+                            self.no_group_once.remove(msgid)
+                            sock.sendall(b"412 No group selected\r\n")
+                            time.sleep(0.01)
+                            continue
                         if msgid in self.transient_errors:
                             self.transient_errors.remove(msgid)
                             sock.sendall(b"400 Transient server error\r\n")
@@ -273,6 +280,10 @@ class FakeNNTPServer:
                             time.sleep(0.01)
                             continue
                         if msgid in self.articles:
+                            if msgid in self.close_body_once:
+                                self.close_body_once.remove(msgid)
+                                sock.close()
+                                return
                             if msgid in self.stall_body:
                                 time.sleep(self.body_delay_seconds)
                             payload = self.articles[msgid] + b".\r\n"
@@ -620,6 +631,8 @@ def main():
         t_msgid = "trecov@nzbunny.test"
         t_server.articles[t_msgid] = yenc_encode("trecov.bin", len(t_data), 1, 1, 1, len(t_data), t_data)
         t_server.transient_errors.add(t_msgid)
+        t_server.no_group_once.add(t_msgid)
+        t_server.close_body_once.add(t_msgid)
         t_dl = os.path.join(temp_dir, "t_downloads")
         os.makedirs(t_dl, exist_ok=True)
         t_env = env.copy()
@@ -637,7 +650,7 @@ def main():
             assert code == 303, (code, loc)
             job_id = loc.split("/")[-1]
             token = None
-            for _ in range(30):
+            for _ in range(60):
                 _, html, _ = http_get(f"http://127.0.0.1:13370/job/{job_id}")
                 html_str = html.decode("utf-8")
                 if "COMPLETE" in html_str:
@@ -649,6 +662,7 @@ def main():
             assert token, "Transient 400 job did not recover and complete"
             _, content, _ = http_get(f"http://127.0.0.1:13370/d/{token}")
             assert content == t_data
+            assert len(t_server.body_requests) >= 3, t_server.body_requests
         except Exception:
             proc.kill()
             stdout, stderr = proc.communicate()
@@ -951,6 +965,95 @@ def main():
         finally:
             proc.terminate()
             proc.communicate()
+
+        final_db_path = os.path.join(temp_dir, "finalizing_recovery.db")
+        final_id = "f" * 32
+        final_root = os.path.join(temp_dir, "finalizing_downloads")
+        final_source = os.path.join(final_root, ".nzbunny-downloads", final_id, "nested")
+        os.makedirs(final_source, exist_ok=True)
+        with open(os.path.join(final_source, "file.txt"), "wb") as f:
+            f.write(b"finalizing recovery payload")
+        conn = sqlite3.connect(final_db_path)
+        conn.executescript("""
+            CREATE TABLE nzbunny_schema (version INTEGER NOT NULL);
+            INSERT INTO nzbunny_schema VALUES (3);
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, filename TEXT NOT NULL, content BLOB, status TEXT NOT NULL,
+                download_path TEXT, artifact_path TEXT, artifact_size INTEGER NOT NULL DEFAULT 0,
+                download_token TEXT UNIQUE, fail_reason TEXT, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, expires_at INTEGER, finalize_attempts INTEGER NOT NULL DEFAULT 0,
+                finalize_next_at INTEGER, finalize_lease_until INTEGER, finalize_lease_token TEXT
+            );
+        """)
+        conn.execute("INSERT INTO jobs VALUES (?, 'recovery.nzb', NULL, 'FINALIZING', ?, NULL, 0, NULL, NULL, ?, ?, NULL, 0, ?, ?, ?)",
+                     (final_id, f".nzbunny-downloads/{final_id}", now_ts, now_ts, now_ts - 1, now_ts - 1, "stale-token"))
+        conn.commit()
+        conn.close()
+        final_env = env.copy()
+        final_env["NNTP_PORT"] = str(server.port)
+        final_env["DOWNLOAD_DIR"] = final_root
+        final_env["DB_PATH"] = final_db_path
+        final_env["NNTP_CONNECTIONS"] = "1"
+        final_proc = subprocess.Popen([str(executable)], env=final_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server("http://127.0.0.1:13370/readyz", final_proc)
+            token = None
+            for _ in range(60):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{final_id}")
+                match = re.search(r'/d/([0-9a-f]{64})', html.decode("utf-8"))
+                if "COMPLETE" in html.decode("utf-8") and match:
+                    token = match.group(1)
+                    break
+                time.sleep(0.2)
+            assert token, "stale finalizing job did not recover"
+            _, content, _ = http_get(f"http://127.0.0.1:13370/d/{token}")
+            assert content.startswith(b"PK"), "recovered finalizing artifact is not a zip"
+        finally:
+            final_proc.terminate()
+            final_proc.communicate()
+
+        archive_fail_db = os.path.join(temp_dir, "archive_failure.db")
+        archive_fail_id = "a" * 32
+        archive_fail_root = os.path.join(temp_dir, "archive_failure_downloads")
+        archive_fail_source = os.path.join(archive_fail_root, ".nzbunny-downloads", archive_fail_id)
+        os.makedirs(archive_fail_source, exist_ok=True)
+        os.mkfifo(os.path.join(archive_fail_source, "unsafe.pipe"))
+        conn = sqlite3.connect(archive_fail_db)
+        conn.executescript("""
+            CREATE TABLE nzbunny_schema (version INTEGER NOT NULL);
+            INSERT INTO nzbunny_schema VALUES (3);
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, filename TEXT NOT NULL, content BLOB, status TEXT NOT NULL,
+                download_path TEXT, artifact_path TEXT, artifact_size INTEGER NOT NULL DEFAULT 0,
+                download_token TEXT UNIQUE, fail_reason TEXT, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, expires_at INTEGER, finalize_attempts INTEGER NOT NULL DEFAULT 0,
+                finalize_next_at INTEGER, finalize_lease_until INTEGER, finalize_lease_token TEXT
+            );
+        """)
+        conn.execute("INSERT INTO jobs VALUES (?, 'archive-failure.nzb', NULL, 'FINALIZING', ?, NULL, 0, NULL, NULL, ?, ?, NULL, 5, ?, ?, ?)",
+                     (archive_fail_id, f".nzbunny-downloads/{archive_fail_id}", now_ts, now_ts, now_ts - 1, now_ts - 1, "archive-token"))
+        conn.commit()
+        conn.close()
+        archive_fail_env = env.copy()
+        archive_fail_env["NNTP_PORT"] = str(server.port)
+        archive_fail_env["DOWNLOAD_DIR"] = archive_fail_root
+        archive_fail_env["DB_PATH"] = archive_fail_db
+        archive_fail_env["NNTP_CONNECTIONS"] = "1"
+        archive_fail_proc = subprocess.Popen([str(executable)], env=archive_fail_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_for_server("http://127.0.0.1:13370/readyz", archive_fail_proc)
+            failed = False
+            for _ in range(60):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{archive_fail_id}")
+                if "FAILED" in html.decode("utf-8"):
+                    failed = True
+                    break
+                time.sleep(0.2)
+            assert failed, "archive failure job did not fail"
+            assert not os.path.exists(os.path.join(archive_fail_root, ".nzbunny-artifacts", f"{archive_fail_id}.zip"))
+        finally:
+            archive_fail_proc.terminate()
+            archive_fail_proc.communicate()
 
         server.stop()
 

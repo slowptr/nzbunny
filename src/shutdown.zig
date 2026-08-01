@@ -27,6 +27,7 @@ pub const DownloadControl = struct {
     io: std.Io,
     deadline_seconds: i64,
     canceled: std.atomic.Value(bool) = .init(false),
+    timed_out: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
     streams: [16]?std.Io.net.Stream = @splat(null),
 
@@ -46,6 +47,15 @@ pub const DownloadControl = struct {
         for (self.streams) |stream| {
             if (stream) |active| active.shutdown(self.io, .both) catch {};
         }
+    }
+
+    pub fn timeout(self: *DownloadControl) void {
+        self.timed_out.store(true, .release);
+        self.cancel();
+    }
+
+    pub fn isTimedOut(self: *DownloadControl) bool {
+        return self.timed_out.load(.acquire);
     }
 
     pub fn register(self: *DownloadControl, stream: std.Io.net.Stream) !void {
@@ -77,9 +87,13 @@ pub const DownloadControl = struct {
     pub fn wait(self: *DownloadControl, seconds: i64) !void {
         const end = std.math.add(i64, std.Io.Clock.real.now(self.io).toSeconds(), seconds) catch self.deadline_seconds;
         while (true) {
+            if (self.isTimedOut()) return error.Timeout;
             if (self.isCanceled()) return error.Canceled;
             const now = std.Io.Clock.real.now(self.io).toSeconds();
-            if (now >= end or now >= self.deadline_seconds) return;
+            if (now >= end or now >= self.deadline_seconds) {
+                if (now >= self.deadline_seconds) self.timeout();
+                return;
+            }
             std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch return error.Canceled;
         }
     }
@@ -87,13 +101,21 @@ pub const DownloadControl = struct {
     pub fn watch(self: *DownloadControl) std.Io.Cancelable!void {
         while (!self.isCanceled()) {
             if (std.Io.Clock.real.now(self.io).toSeconds() >= self.deadline_seconds) {
-                self.cancel();
+                self.timeout();
                 return;
             }
             try std.Io.sleep(self.io, .fromMilliseconds(100), .awake);
         }
     }
 };
+
+test "timeout state remains distinct from cancellation" {
+    var control = DownloadControl.init(std.testing.io, std.math.minInt(i64));
+    control.timeout();
+    try std.testing.expect(control.isTimedOut());
+    try std.testing.expect(control.isCanceled());
+    try std.testing.expectError(error.Timeout, control.wait(1));
+}
 
 test "cancellation interrupts waits" {
     var control = DownloadControl.init(std.testing.io, std.math.maxInt(i64));

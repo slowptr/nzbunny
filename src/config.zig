@@ -100,7 +100,9 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Envir
 }
 
 fn validateNntpValue(text: []const u8) !void {
-    if (std.mem.findAny(u8, text, "\x00\r\n") != null) return error.InvalidNntpConfigurationValue;
+    for (text) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidNntpConfigurationValue;
+    }
 }
 
 fn validateCidrs(value_text: []const u8) !void {
@@ -192,4 +194,8 @@ test "duration parser rejects silent fallbacks" {
 
 test "NNTP configuration rejects unsafe control bytes and connection range" {
     try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("bad\nhost"));
+    try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("user name"));
+    try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("user\tname"));
+    try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("user\x7fname"));
+    try validateNntpValue("provider.example");
 }

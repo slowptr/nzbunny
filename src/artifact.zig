@@ -31,16 +31,19 @@ fn boundedWriteCallback(
     const new_written = std.math.add(u64, ctx.written, @as(u64, length)) catch return -1;
     if (new_written > ctx.cap) return -1;
     const buf: [*]const u8 = @ptrCast(buffer.?);
-    while (true) {
-        const rc = std.os.linux.write(ctx.fd, buf, length);
+    var written: usize = 0;
+    while (written < length) {
+        const rc = std.os.linux.write(ctx.fd, buf + written, length - written);
         const signed: isize = @bitCast(rc);
         if (signed < 0) {
             if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
             return -1;
         }
+        if (signed == 0) return -1;
+        written += @intCast(signed);
         ctx.written += @as(u64, @intCast(signed));
-        return signed;
     }
+    return @intCast(written);
 }
 
 fn archiveCloseCallback(a: ?*c.struct_archive, client_data: ?*anyopaque) callconv(.c) c_int {
@@ -317,12 +320,19 @@ fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buf
     c.archive_entry_set_perm(entry, 0o600);
     c.archive_entry_set_size(entry, @intCast(size));
     if (c.archive_write_header(archive, entry) != c.ARCHIVE_OK) return error.ArchiveHeaderFailed;
+    var copied: u64 = 0;
     while (true) {
         const n = c.read(fd, buffer.ptr, buffer.len);
+        if (n < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return error.ArtifactReadFailed;
+        }
         if (n == 0) break;
-        if (n < 0) return error.ArtifactReadFailed;
+        copied = std.math.add(u64, copied, @intCast(n)) catch return error.ArtifactSourceChanged;
+        if (copied > size) return error.ArtifactSourceChanged;
         if (c.archive_write_data(archive, buffer.ptr, @intCast(n)) != n) return error.ArchiveWriteFailed;
     }
+    if (copied != size) return error.ArtifactSourceChanged;
 }
 
 pub fn removeValidated(root: []const u8, candidate: []const u8) !void {

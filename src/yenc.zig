@@ -20,6 +20,8 @@ pub const Decoder = struct {
     meta: ?Part = null,
     in_data: bool = false,
     saw_yend: bool = false,
+    saw_data: bool = false,
+    saw_ypart: bool = false,
     crc: std.hash.Crc32 = .init(),
 
     pub fn init(allocator: std.mem.Allocator, output: *std.Io.Writer, max_size: u64) Decoder {
@@ -32,6 +34,7 @@ pub const Decoder = struct {
     }
 
     pub fn consumeLine(self: *Decoder, line: []const u8) !void {
+        if (self.saw_yend) return error.TrailingYencData;
         if (std.mem.startsWith(u8, line, "=ybegin ")) {
             if (self.meta != null) return error.DuplicateYbegin;
             self.meta = try parseYbegin(self.allocator, line);
@@ -42,6 +45,7 @@ pub const Decoder = struct {
         }
         if (std.mem.startsWith(u8, line, "=ypart ")) {
             if (self.meta == null or !self.in_data) return error.YpartBeforeYbegin;
+            if (self.saw_ypart) return error.DuplicateYpart;
             if (self.meta.?.part == 0) return error.YpartInSinglepart;
             const range = try parseYpart(line);
             var meta = self.meta.?;
@@ -50,10 +54,12 @@ pub const Decoder = struct {
             meta.end = range.end;
             self.meta = meta;
             self.budget = try inclusiveRangeLength(range.begin, range.end);
+            self.saw_ypart = true;
             return;
         }
         if (std.mem.startsWith(u8, line, "=yend ")) {
             if (self.meta == null or !self.in_data) return error.YendBeforeYbegin;
+            if (!self.saw_data) return error.EmptyYencData;
             var meta = self.meta.?;
             const end = try parseYend(line);
             if (end.part) |part| {
@@ -87,6 +93,7 @@ pub const Decoder = struct {
         }
         if (!self.in_data or self.meta == null) return;
         try self.decodeData(line);
+        self.saw_data = true;
     }
 
     pub fn finish(self: *Decoder) !Part {
@@ -125,7 +132,10 @@ fn parseYbegin(allocator: std.mem.Allocator, line: []const u8) !Part {
     try validateName(name);
     const part = optionalInt(u32, line, "part=") catch return error.InvalidYencPart;
     const total = optionalInt(u32, line, "total=") catch return error.InvalidYencPart;
-    if (total != null and total.? == 0) return error.InvalidYencPart;
+    if (part == null and total != null) return error.InvalidYencPart;
+    if (part != null and total == null) return error.InvalidYencPart;
+    if (part != null and part.? == 0) return error.InvalidYencPart;
+    if (part != null and total != null and (total.? == 0 or part.? > total.?)) return error.InvalidYencPart;
     return .{
         .name = try allocator.dupe(u8, name),
         .size = size,
@@ -206,6 +216,57 @@ fn validateName(name: []const u8) !void {
     }
 }
 
+test "rejects inconsistent multipart metadata" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin part=2 total=2 line=128 size=3 name=a.bin");
+    var second = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer second.deinit();
+    try std.testing.expectError(error.InvalidYencPart, second.consumeLine("=ybegin total=2 line=128 size=3 name=a.bin"));
+    var incomplete = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer incomplete.deinit();
+    try std.testing.expectError(error.InvalidYencPart, incomplete.consumeLine("=ybegin part=1 line=128 size=3 name=a.bin"));
+    var third = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer third.deinit();
+    try std.testing.expectError(error.InvalidYencPart, third.consumeLine("=ybegin part=3 total=2 line=128 size=3 name=a.bin"));
+}
+
+test "accepts explicit single-part metadata" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin part=1 total=1 line=128 size=1 name=a.bin");
+    try decoder.consumeLine("=ypart begin=1 end=1");
+    try decoder.consumeLine("\x8b");
+    try decoder.consumeLine("=yend size=1 part=1 crc32=352441c2");
+    const meta = try decoder.finish();
+    try std.testing.expectEqual(@as(u32, 1), meta.part);
+    try std.testing.expectEqual(@as(u32, 1), meta.total);
+}
+
+test "rejects empty yenc data" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin line=128 size=1 name=a.bin");
+    try std.testing.expectError(error.EmptyYencData, decoder.consumeLine("=yend size=1"));
+}
+
+test "rejects trailing data after yend" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin line=128 size=1 name=a.bin");
+    try decoder.consumeLine("\x8b");
+    try decoder.consumeLine("=yend size=1");
+    try std.testing.expectError(error.TrailingYencData, decoder.consumeLine("unexpected"));
+}
+
 test "decodes escaped bytes" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -247,8 +308,18 @@ test "rejects invalid multipart range" {
     defer out.deinit();
     var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
-    try decoder.consumeLine("=ybegin part=1 line=128 size=3 name=a.bin");
+    try decoder.consumeLine("=ybegin part=1 total=2 line=128 size=3 name=a.bin");
     try std.testing.expectError(error.InvalidYencRange, decoder.consumeLine("=ypart begin=3 end=2"));
+}
+
+test "rejects duplicate ypart sections" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin part=1 total=2 line=128 size=3 name=a.bin");
+    try decoder.consumeLine("=ypart begin=1 end=3");
+    try std.testing.expectError(error.DuplicateYpart, decoder.consumeLine("=ypart begin=1 end=3"));
 }
 
 test "rejects duplicate yenc fields" {
@@ -273,7 +344,7 @@ test "per-part budget rejects oversized decoded body" {
     defer out.deinit();
     var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
     defer decoder.deinit();
-    try decoder.consumeLine("=ybegin part=1 line=128 size=10 name=a.bin");
+    try decoder.consumeLine("=ybegin part=1 total=2 line=128 size=10 name=a.bin");
     try decoder.consumeLine("=ypart begin=1 end=3");
     try std.testing.expectError(error.InvalidYencDecodedSize, decoder.consumeLine("\x8b\x8c\x8d\x8e"));
 }

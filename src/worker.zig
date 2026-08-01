@@ -34,7 +34,8 @@ const Finalizers = struct {
 
     fn schedule(self: *Finalizers, job: Job) !void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        var locked = true;
+        defer if (locked) self.mutex.unlock(self.io);
         if (self.active.count() >= max_concurrent_finalizers) return;
         if (self.active.contains(job.id)) return;
         const now = std.Io.Clock.real.now(self.io).toSeconds();
@@ -46,6 +47,8 @@ const Finalizers = struct {
         errdefer self.allocator.free(owned_download_path);
         try self.active.put(self.allocator, owned_id, {});
         const attempt = job.finalize_attempts + 1;
+        self.mutex.unlock(self.io);
+        locked = false;
         self.group.concurrent(self.io, runFinalize, .{ self, owned_id, token, owned_download_path, attempt }) catch
             runFinalize(self, owned_id, token, owned_download_path, attempt);
     }
@@ -259,14 +262,14 @@ fn finalize(
     attempt: u32,
     now: i64,
 ) !void {
+    _ = attempt;
+    const before = std.Io.Clock.real.now(owner.io).toSeconds();
+    const before_until = std.math.add(i64, before, lease_duration_seconds) catch return error.LeaseRenewalFailed;
+    if (!(try owner.db.renewLease(owner.io, id, lease_token, before_until, before))) return error.LeaseRenewalFailed;
     const result = try artifact.prepare(allocator, owner.root, id, download_path, owner.cfg.max_artifact_bytes, lease_token);
-    if (attempt < max_finalize_attempts) {
-        const renew_until = std.math.add(i64, now, lease_renew_seconds) catch now + lease_renew_seconds;
-        _ = owner.db.renewLease(owner.io, id, lease_token, renew_until, now) catch |err| {
-            std.log.err("Job {s} lease renewal failed: {t}", .{ id, err });
-            return error.LeaseRenewalFailed;
-        };
-    }
+    const after = std.Io.Clock.real.now(owner.io).toSeconds();
+    const after_until = std.math.add(i64, after, lease_duration_seconds) catch return error.LeaseRenewalFailed;
+    if (!(try owner.db.renewLease(owner.io, id, lease_token, after_until, after))) return error.LeaseRenewalFailed;
     var attempts: usize = 0;
     while (attempts < 4) : (attempts += 1) {
         var random: [32]u8 = undefined;
@@ -324,11 +327,14 @@ fn cleanupJob(task: CleanupTask, job: Job) !void {
     var root_dir = try std.Io.Dir.openDirAbsolute(task.io, task.root, .{ .follow_symlinks = false });
     defer root_dir.close(task.io);
     if (job.status == .expired) return task.db.purgeExpired(task.io, job.id, task.now - 1800);
-    cleanupWorkDirs(task.io, root_dir, job.id) catch {};
+    cleanupWorkDirs(task.io, root_dir, job.id) catch |err| {
+        std.log.err("Job {s} work cleanup failed: {t}", .{ job.id, err });
+        return err;
+    };
     if (job.download_path.len != 0)
-        artifact.removeValidated(task.root, job.download_path) catch {};
+        try artifact.removeValidated(task.root, job.download_path);
     if (job.artifact_path.len != 0 and !std.mem.eql(u8, job.artifact_path, job.download_path))
-        artifact.removeValidated(task.root, job.artifact_path) catch {};
+        try artifact.removeValidated(task.root, job.artifact_path);
     _ = try task.db.markExpired(task.io, job.id, job.status, task.now);
 }
 

@@ -49,6 +49,7 @@ pub const ParseError = error{
     DuplicateSegmentNumber,
     NonContiguousSegmentNumbers,
     InvalidMessageId,
+    InvalidNzbStructure,
     OutOfMemory,
 };
 
@@ -90,6 +91,7 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         current_segments.deinit(allocator);
     }
     var in_file = false;
+    var in_segments = false;
     var in_segment = false;
     var in_head = false;
     var in_password_meta = false;
@@ -148,17 +150,32 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                     return error.UnsupportedNzbNamespace;
                 }
                 saw_root = true;
+            } else if (std.mem.eql(u8, name, "nzb") or
+                (std.mem.eql(u8, name, "file") and in_file) or
+                (std.mem.eql(u8, name, "segments") and !in_file) or
+                (std.mem.eql(u8, name, "segment") and (!in_file or !in_segments or in_segment)) or
+                (std.mem.eql(u8, name, "head") and in_head) or
+                (std.mem.eql(u8, name, "meta") and !in_head))
+            {
+                setDiag(diag, reader);
+                return error.InvalidNzbStructure;
             }
-            if (std.mem.eql(u8, name, "file")) {
+            if (std.mem.eql(u8, name, "file") and !in_head and !in_segment) {
                 if (files.items.len >= max_files) {
                     setDiag(diag, reader);
                     return error.TooManyNzbFiles;
                 }
                 in_file = true;
                 current_segments.clearRetainingCapacity();
+            } else if (std.mem.eql(u8, name, "segments")) {
+                if (!in_file) {
+                    setDiag(diag, reader);
+                    return error.InvalidNzbStructure;
+                }
+                in_segments = true;
             } else if (std.mem.eql(u8, name, "head")) {
                 in_head = true;
-            } else if (std.mem.eql(u8, name, "segment") and in_file) {
+            } else if (std.mem.eql(u8, name, "segment") and in_file and in_segments) {
                 in_segment = true;
                 segment_number = (attrInt(u32, reader, "number") catch |err| {
                     setDiag(diag, reader);
@@ -221,11 +238,29 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         if (node_type == c.XML_READER_TYPE_END_ELEMENT) {
             const name = xmlText(c.xmlTextReaderConstLocalName(reader));
             if (std.mem.eql(u8, name, "segment")) {
+                if (!in_segment) {
+                    setDiag(diag, reader);
+                    return error.InvalidNzbStructure;
+                }
                 in_segment = false;
+            } else if (std.mem.eql(u8, name, "segments")) {
+                if (!in_segments or in_segment) {
+                    setDiag(diag, reader);
+                    return error.InvalidNzbStructure;
+                }
+                in_segments = false;
             } else if (std.mem.eql(u8, name, "head")) {
+                if (!in_head) {
+                    setDiag(diag, reader);
+                    return error.InvalidNzbStructure;
+                }
                 in_head = false;
                 in_password_meta = false;
             } else if (std.mem.eql(u8, name, "meta")) {
+                if (!in_head) {
+                    setDiag(diag, reader);
+                    return error.InvalidNzbStructure;
+                }
                 in_password_meta = false;
             } else if (std.mem.eql(u8, name, "file") and in_file) {
                 validateSegments(current_segments.items) catch |err| {
@@ -376,6 +411,20 @@ fn normalizeMessageId(allocator: std.mem.Allocator, raw: []const u8) ![]const u8
 fn xmlText(raw: [*c]const u8) []const u8 {
     if (raw == null) return "";
     return std.mem.span(raw);
+}
+
+test "rejects incomplete structural containers" {
+    const missing_segments_close = "<nzb><file><segments><segment bytes=\"1\" number=\"1\">a@b</segment></file></nzb>";
+    try std.testing.expectError(error.NzbParseFailed, parse(std.testing.allocator, missing_segments_close));
+    const missing_segment_close = "<nzb><file><segments><segment bytes=\"1\" number=\"1\">a@b</segments></file></nzb>";
+    try std.testing.expectError(error.NzbParseFailed, parse(std.testing.allocator, missing_segment_close));
+}
+
+test "rejects invalid structural nesting" {
+    const direct_segment = "<nzb><file><segment bytes=\"1\" number=\"1\">a@b</segment></file></nzb>";
+    try std.testing.expectError(error.InvalidNzbStructure, parse(std.testing.allocator, direct_segment));
+    const nested_file = "<nzb><file><file><segments><segment bytes=\"1\" number=\"1\">a@b</segment></segments></file></file></nzb>";
+    try std.testing.expectError(error.InvalidNzbStructure, parse(std.testing.allocator, nested_file));
 }
 
 test "parses direct segment text" {

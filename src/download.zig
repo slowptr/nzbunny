@@ -336,8 +336,12 @@ fn fetchItemOnce(
     }
     const meta = try decoder.finish();
     if (ctx.files[file_index].segments.len == 1) {
-        if (meta.part != 0) return error.YencPartMismatch;
-    } else if (meta.part != segment.number) return error.YencPartMismatch;
+        if (!((meta.part == 0 and meta.total == 0) or (meta.part == 1 and meta.total == 1)))
+            return error.YencPartMismatch;
+    } else {
+        if (meta.part != segment.number or meta.total != @as(u32, @intCast(ctx.files[file_index].segments.len)))
+            return error.YencPartMismatch;
+    }
     if (meta.total != 0) {
         const expected_total: u32 = @intCast(ctx.files[file_index].segments.len);
         if (meta.total != expected_total) return error.YencPartMismatch;
@@ -345,8 +349,7 @@ fn fetchItemOnce(
     try file_writer.interface.flush();
     try out_file.sync(ctx.io);
 
-    const part_bytes = try inclusiveRangeLength(meta.begin, meta.end);
-    if (part_bytes != segment.declared_bytes) return error.InconsistentSegmentSize;
+    try validateDecodedPartSize(meta, segment.declared_bytes);
 
     if (is_preflight) {
         try rejectUnsupportedName(meta.name);
@@ -367,6 +370,11 @@ fn fetchItemOnce(
     };
 }
 
+fn validateDecodedPartSize(meta: yenc.Part, declared_bytes: u64) !void {
+    const range_bytes = try inclusiveRangeLength(meta.begin, meta.end);
+    if (range_bytes != declared_bytes or meta.decoded != declared_bytes)
+        return error.InconsistentSegmentSize;
+}
 fn validateAggregate(manifest: []FileManifest, cfg: anytype) !void {
     for (manifest) |file| if (file.name.len == 0) return error.PreflightIncomplete;
     try rejectDuplicateNames(manifest);
@@ -494,9 +502,10 @@ fn splitName(name: []const u8) bool {
 }
 
 fn checkCanceled(control: *shutdown.DownloadControl) !void {
+    if (control.isTimedOut()) return error.Timeout;
     if (control.isCanceled()) return error.Canceled;
     if (std.Io.Clock.real.now(control.io).toSeconds() >= control.deadline_seconds) {
-        control.cancel();
+        control.timeout();
         return error.Timeout;
     }
 }
@@ -524,6 +533,26 @@ fn removeTree(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
 fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
     if (value.len < suffix.len) return false;
     return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
+}
+
+test "validates decoded part size against NZB declaration" {
+    var meta: yenc.Part = .{
+        .name = "a.bin",
+        .size = 3,
+        .part = 0,
+        .total = 0,
+        .begin = 1,
+        .end = 3,
+        .pcrc32 = null,
+        .crc32 = null,
+        .decoded = 3,
+    };
+    try validateDecodedPartSize(meta, 3);
+    meta.decoded = 2;
+    try std.testing.expectError(error.InconsistentSegmentSize, validateDecodedPartSize(meta, 3));
+    meta.decoded = 3;
+    meta.end = 2;
+    try std.testing.expectError(error.InconsistentSegmentSize, validateDecodedPartSize(meta, 3));
 }
 
 test "rejects split archive names" {

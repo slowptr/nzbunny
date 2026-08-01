@@ -39,9 +39,9 @@ pub const Response = struct {
     pub fn classifyBody(self: Response) Class {
         return switch (self.code) {
             222 => .ok,
-            430 => .missing_article,
-            400 => .provider_transient,
-            480 => .auth_required,
+            430, 423 => .missing_article,
+            400...422, 424...429, 431...479 => .provider_transient,
+            480, 481, 482 => .auth_required,
             else => if (self.code >= 400) .permanent_protocol else .unexpected,
         };
     }
@@ -74,9 +74,9 @@ pub const Session = struct {
 
     pub fn connect(self: *Session) !void {
         self.deinit();
+        errdefer self.deinit();
         try std.Io.net.HostName.validate(self.host);
         try self.runWithDeadline(connectTransport, .{self});
-        errdefer self.deinit();
         try self.runWithDeadline(initializeTls, .{self});
         const greeting_code = try self.readStatus();
         if (greeting_code.code != 200 and greeting_code.code != 201) return error.NntpGreetingFailed;
@@ -93,7 +93,7 @@ pub const Session = struct {
     pub fn requestBody(self: *Session, message_id: []const u8) !void {
         if (message_id.len == 0 or "BODY ".len + 1 + message_id.len + 1 + "\r\n".len > 512)
             return error.InvalidMessageId;
-        for (message_id) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidMessageId;
+        try validateMessageId(message_id);
         if (self.tls == null) try self.connect();
 
         try self.sendParts("BODY <", message_id, ">\r\n");
@@ -124,7 +124,10 @@ pub const Session = struct {
     }
 
     pub fn abort(self: *Session) void {
-        if (self.stream) |stream| stream.shutdown(self.io, .both) catch {};
+        if (self.stream) |stream| {
+            stream.shutdown(self.io, .both) catch {};
+            self.deinit();
+        }
     }
 
     pub fn deinit(self: *Session) void {
@@ -217,10 +220,7 @@ pub const Session = struct {
     fn readStatus(self: *Session) !Status {
         const line = try self.readLine(self.allocator, 8 * 1024);
         defer self.allocator.free(line);
-        if (line.len < 3) return error.InvalidNntpStatus;
-        const code = std.fmt.parseInt(u16, line[0..3], 10) catch return error.InvalidNntpStatus;
-        if (line.len > 3 and line[3] != ' ' and line[3] != '-') return error.InvalidNntpStatus;
-        return .{ .code = code };
+        return parseStatusLine(line);
     }
 
     fn readLine(self: *Session, allocator: std.mem.Allocator, max: usize) ![]u8 {
@@ -266,23 +266,36 @@ pub const Session = struct {
             .operation => |result| result catch |err| return self.normalizeTransportError(err),
             .timeout => {
                 self.abort();
+                if (self.control) |control| {
+                    if (std.Io.Clock.real.now(self.io).toSeconds() >= control.deadline_seconds)
+                        control.timeout();
+                }
                 return error.NntpOperationTimeout;
             },
         }
     }
 
     fn operationTimeoutSeconds(self: *Session) !i64 {
-        if (self.control) |control| if (control.isCanceled()) return error.Canceled;
+        if (self.control) |control| {
+            if (control.isTimedOut()) return error.Timeout;
+            if (control.isCanceled()) return error.Canceled;
+        }
         const now = std.Io.Clock.real.now(self.io).toSeconds();
         const configured_deadline = std.math.add(i64, now, self.timeout_seconds) catch return error.NntpOperationTimeout;
         const deadline = if (self.control) |control| @min(configured_deadline, control.deadline_seconds) else configured_deadline;
-        if (now >= deadline) return error.NntpOperationTimeout;
+        if (now >= deadline) {
+            if (self.control) |control| control.timeout();
+            return error.NntpOperationTimeout;
+        }
         return deadline - now;
     }
 
     fn normalizeTransportError(self: *Session, err: anyerror) anyerror {
-        if (self.control) |control| if (control.isCanceled()) return error.Canceled;
-        if (err == error.ReadFailed or err == error.WriteFailed) {
+        if (self.control) |control| {
+            if (control.isTimedOut()) return error.Timeout;
+            if (control.isCanceled()) return error.Canceled;
+        }
+        if (err == error.ReadFailed or err == error.WriteFailed or err == error.EndOfStream) {
             if (self.stream_reader) |stream_reader| if (stream_reader.err) |stream_err| return stream_err;
             if (self.stream_writer) |stream_writer| if (stream_writer.err) |stream_err| return stream_err;
             return error.NntpTransportFailure;
@@ -298,6 +311,26 @@ pub const Session = struct {
         return &self.tls.?.writer;
     }
 };
+
+fn validateMessageId(message_id: []const u8) !void {
+    if (message_id.len == 0 or "BODY ".len + 1 + message_id.len + 1 + "\r\n".len > 512)
+        return error.InvalidMessageId;
+    for (message_id) |byte| if (byte <= 0x20 or byte == 0x7f or byte == '<' or byte == '>' or byte == ',' or byte == ';' or byte == '"') return error.InvalidMessageId;
+    const at = std.mem.indexOfScalar(u8, message_id, '@') orelse return error.InvalidMessageId;
+    if (at == 0 or at + 1 >= message_id.len or std.mem.indexOfScalarPos(u8, message_id, at + 1, '@') != null)
+        return error.InvalidMessageId;
+    if (message_id[0] == '.' or message_id[at - 1] == '.' or message_id[at + 1] == '.' or message_id[message_id.len - 1] == '.')
+        return error.InvalidMessageId;
+}
+
+fn parseStatusLine(line: []const u8) !Response {
+    if (line.len < 3) return error.InvalidNntpStatus;
+    const code = std.fmt.parseInt(u16, line[0..3], 10) catch return error.InvalidNntpStatus;
+    if (code < 100 or code > 599) return error.InvalidNntpStatus;
+    if (line.len > 3 and line[3] == '-') return error.UnsupportedMultilineStatus;
+    if (line.len > 3 and line[3] != ' ') return error.InvalidNntpStatus;
+    return .{ .code = code };
+}
 
 fn waitForDeadline(io: std.Io, seconds: i64) std.Io.Cancelable!void {
     try std.Io.sleep(io, .fromSeconds(seconds), .awake);
@@ -340,17 +373,55 @@ pub fn makeSession(
     };
 }
 
+test "classifies dropped connections as retryable transport failures" {
+    try std.testing.expect(isRetryableProviderFailure(error.NntpTransportFailure));
+    try std.testing.expect(!isRetryableProviderFailure(error.MissingArticle));
+}
+
+test "parses valid status lines" {
+    try std.testing.expectEqual(@as(u16, 222), (try parseStatusLine("222 body follows")).code);
+    try std.testing.expectEqual(@as(u16, 200), (try parseStatusLine("200")).code);
+}
+
+test "rejects malformed status lines" {
+    try std.testing.expectError(error.InvalidNntpStatus, parseStatusLine("99 bad"));
+    try std.testing.expectError(error.InvalidNntpStatus, parseStatusLine("600 bad"));
+    try std.testing.expectError(error.InvalidNntpStatus, parseStatusLine("abc bad"));
+    try std.testing.expectError(error.InvalidNntpStatus, parseStatusLine("222: bad"));
+    try std.testing.expectError(error.UnsupportedMultilineStatus, parseStatusLine("222-continued"));
+}
+
 test "BODY command length limit includes brackets and CRLF" {
     var store: CaStore = .{};
     var session = makeSession(std.testing.allocator, std.testing.io, "example.test", 563, "u", "p", &store, 1, null);
     try std.testing.expectError(error.InvalidMessageId, session.requestBody("a" ** 506));
 }
 
+test "validates message ids" {
+    try validateMessageId("abc.def@example.test");
+    try std.testing.expectError(error.InvalidMessageId, validateMessageId("missing-at"));
+    try std.testing.expectError(error.InvalidMessageId, validateMessageId("a@@example.test"));
+    try std.testing.expectError(error.InvalidMessageId, validateMessageId(".a@example.test"));
+    try std.testing.expectError(error.InvalidMessageId, validateMessageId("a.@example.test"));
+    try std.testing.expectError(error.InvalidMessageId, validateMessageId("a@example.test."));
+}
+
+test "rejects malformed message ids" {
+    var store: CaStore = .{};
+    var session = makeSession(std.testing.allocator, std.testing.io, "example.test", 563, "u", "p", &store, 1, null);
+    try std.testing.expectError(error.InvalidMessageId, session.requestBody("missing-at"));
+    try std.testing.expectError(error.InvalidMessageId, session.requestBody("bad<id@example"));
+}
+
 test "response classification maps body codes" {
     try std.testing.expectEqual(Response.Class.ok, (Response{ .code = 222 }).classifyBody());
     try std.testing.expectEqual(Response.Class.missing_article, (Response{ .code = 430 }).classifyBody());
-    try std.testing.expectEqual(Response.Class.provider_transient, (Response{ .code = 400 }).classifyBody());
-    try std.testing.expectEqual(Response.Class.auth_required, (Response{ .code = 480 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.missing_article, (Response{ .code = 423 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.provider_transient, (Response{ .code = 412 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.provider_transient, (Response{ .code = 411 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.provider_transient, (Response{ .code = 421 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.auth_required, (Response{ .code = 481 }).classifyBody());
+    try std.testing.expectEqual(Response.Class.auth_required, (Response{ .code = 482 }).classifyBody());
     try std.testing.expectEqual(Response.Class.permanent_protocol, (Response{ .code = 500 }).classifyBody());
     try std.testing.expectEqual(Response.Class.permanent_protocol, (Response{ .code = 502 }).classifyBody());
     try std.testing.expectEqual(Response.Class.unexpected, (Response{ .code = 100 }).classifyBody());
