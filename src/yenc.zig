@@ -4,6 +4,7 @@ pub const Part = struct {
     name: []const u8,
     size: u64,
     part: u32,
+    total: u32,
     begin: u64,
     end: u64,
     pcrc32: ?u32,
@@ -71,8 +72,12 @@ pub const Decoder = struct {
                 if (meta.size != meta.decoded) return error.InvalidYencDecodedSize;
             }
             const actual = self.crc.final();
-            if (end.pcrc32) |expected| if (expected != actual) return error.YencCrcMismatch;
-            if (end.crc32) |expected| if (expected != actual) return error.YencCrcMismatch;
+            if (meta.part == 0) {
+                if (end.crc32) |expected| if (expected != actual) return error.YencCrcMismatch;
+            } else {
+                if (end.pcrc32) |expected| if (expected != actual) return error.YencCrcMismatch;
+                if (end.crc32) |expected| meta.crc32 = expected;
+            }
             meta.pcrc32 = end.pcrc32;
             meta.crc32 = end.crc32;
             self.meta = meta;
@@ -119,10 +124,13 @@ fn parseYbegin(allocator: std.mem.Allocator, line: []const u8) !Part {
     const name = try requiredText(line, "name=");
     try validateName(name);
     const part = optionalInt(u32, line, "part=") catch return error.InvalidYencPart;
+    const total = optionalInt(u32, line, "total=") catch return error.InvalidYencPart;
+    if (total != null and total.? == 0) return error.InvalidYencPart;
     return .{
         .name = try allocator.dupe(u8, name),
         .size = size,
         .part = part orelse 0,
+        .total = total orelse 0,
         .begin = 0,
         .end = 0,
         .pcrc32 = null,

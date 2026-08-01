@@ -117,6 +117,7 @@ const Part = struct {
     begin: u64,
     end: u64,
     rel_path: []const u8,
+    crc32: ?u32 = null,
 };
 
 const WorkItem = struct {
@@ -337,6 +338,10 @@ fn fetchItemOnce(
     if (ctx.files[file_index].segments.len == 1) {
         if (meta.part != 0) return error.YencPartMismatch;
     } else if (meta.part != segment.number) return error.YencPartMismatch;
+    if (meta.total != 0) {
+        const expected_total: u32 = @intCast(ctx.files[file_index].segments.len);
+        if (meta.total != expected_total) return error.YencPartMismatch;
+    }
     try file_writer.interface.flush();
     try out_file.sync(ctx.io);
 
@@ -358,6 +363,7 @@ fn fetchItemOnce(
         .begin = meta.begin,
         .end = meta.end,
         .rel_path = try ctx.allocator.dupe(u8, part_path),
+        .crc32 = meta.crc32,
     };
 }
 
@@ -399,6 +405,7 @@ fn assembleFile(
     var out_buffer: [64 * 1024]u8 = undefined;
     var writer = out.writer(io, &out_buffer);
     var buffer: [64 * 1024]u8 = undefined;
+    var expected_crc: ?u32 = null;
     for (output.parts) |part| {
         try checkCanceled(control);
         var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
@@ -407,6 +414,13 @@ fn assembleFile(
         var reader = std.Io.File.Reader.initSize(input, io, &buffer, size);
         const sent = try writer.interface.sendFileAll(&reader, .limited(size));
         if (sent != size) return error.DecodedPartChanged;
+        if (part.crc32) |crc| {
+            if (expected_crc) |prev| {
+                if (prev != crc) return error.YencCrcMismatch;
+            } else {
+                expected_crc = crc;
+            }
+        }
     }
     try writer.interface.flush();
     try out.sync(io);
