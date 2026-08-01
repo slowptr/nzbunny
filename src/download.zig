@@ -132,11 +132,27 @@ pub fn run(
     progress.setPhase(io, .preflight);
     std.log.info("download phase: checking the first segment of {d} files", .{document.files.len});
     try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, control, progress);
-    try validateAggregate(manifest, cfg);
+    const included = try allocator.alloc(bool, manifest.len);
+    defer allocator.free(included);
+    var included_count: usize = 0;
+    var selected_segments: usize = document.files.len;
+    for (manifest, document.files, included) |file, source, *keep| {
+        keep.* = !isRepairName(file.name);
+        if (keep.*) {
+            try rejectUnsupportedName(file.name);
+            included_count += 1;
+            selected_segments += source.segments.len - 1;
+        }
+    }
+    if (included_count == 0) return error.NoPayloadFiles;
+    progress.setTotal(selected_segments);
+    std.log.info("download selection: {d} payload files, {d} repair files skipped", .{ included_count, manifest.len - included_count });
+    try validateAggregate(manifest, included, included_count, cfg);
 
     var remaining = std.ArrayList(WorkItem).empty;
     defer remaining.deinit(allocator);
     for (document.files, 0..) |file, file_index| {
+        if (!included[file_index]) continue;
         for (1..file.segments.len) |segment_index| {
             try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
         }
@@ -147,16 +163,20 @@ pub fn run(
         try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress);
     }
 
-    for (manifest) |file| {
+    for (manifest, included) |file, keep| {
+        if (!keep) continue;
         try checkCanceled(control);
         validatePartRanges(file.parts, file.size) catch |err| return err;
     }
 
     progress.setPhase(io, .assembling);
-    std.log.info("download phase: assembling {d} files", .{manifest.len});
+    std.log.info("download phase: assembling {d} files", .{included_count});
+    var assembled: usize = 0;
     for (manifest, 0..) |file, file_index| {
+        if (!included[file_index]) continue;
         try checkCanceled(control);
-        std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ file_index + 1, document.files.len, file.name, file.parts.len });
+        assembled += 1;
+        std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ assembled, included_count, file.name, file.parts.len });
         try assembleFile(allocator, io, root_dir, tmp_output_root, file, control);
     }
 
@@ -172,8 +192,10 @@ pub fn run(
 
     try removeTree(io, root_dir, work_root);
 
-    if (document.files.len == 1)
-        return .{ .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, manifest[0].name }) };
+    if (included_count == 1) {
+        for (manifest, included) |file, keep| if (keep)
+            return .{ .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, file.name }) };
+    }
     return .{ .relative_path = try allocator.dupe(u8, output_root) };
 }
 
@@ -452,16 +474,21 @@ fn fetchItemOnce(
     try file_writer.interface.flush();
     try out_file.sync(ctx.io);
 
-    try validateDecodedPartSize(meta, segment.declared_bytes);
+    validateDecodedPartSize(meta) catch |err| {
+        std.log.err("segment {d}/{d} decoded size mismatch: begin={d} end={d} decoded={d}", .{ file_index + 1, segment_index + 1, meta.begin, meta.end, meta.decoded });
+        return err;
+    };
 
     if (is_preflight) {
-        try rejectUnsupportedName(meta.name);
-        ctx.manifest[file_index].name = try ctx.allocator.dupe(u8, meta.name);
+        const name = subjectFileName(ctx.files[file_index].subject) orelse meta.name;
+        ctx.manifest[file_index].name = try ctx.allocator.dupe(u8, name);
         ctx.manifest[file_index].size = meta.size;
+        std.log.info("file {d} metadata: {s}, {d} bytes, {d} segments", .{ file_index + 1, name, meta.size, ctx.files[file_index].segments.len });
     } else {
-        if (!std.mem.eql(u8, ctx.manifest[file_index].name, meta.name) or
-            ctx.manifest[file_index].size != meta.size)
+        if (ctx.manifest[file_index].size != meta.size) {
+            std.log.err("file {d} segment {d} size changed: expected {d}, received {d}", .{ file_index + 1, segment_index + 1, ctx.manifest[file_index].size, meta.size });
             return error.InconsistentYencMetadata;
+        }
     }
 
     try ctx.root_dir.rename(tmp_path, ctx.root_dir, part_path, ctx.io);
@@ -473,22 +500,23 @@ fn fetchItemOnce(
     };
 }
 
-fn validateDecodedPartSize(meta: yenc.Part, declared_bytes: u64) !void {
+fn validateDecodedPartSize(meta: yenc.Part) !void {
     const range_bytes = try inclusiveRangeLength(meta.begin, meta.end);
-    if (range_bytes != declared_bytes or meta.decoded != declared_bytes)
+    if (range_bytes != meta.decoded)
         return error.InconsistentSegmentSize;
 }
-fn validateAggregate(manifest: []FileManifest, cfg: anytype) !void {
-    for (manifest) |file| if (file.name.len == 0) return error.PreflightIncomplete;
-    try rejectDuplicateNames(manifest);
-    try rejectUnsupportedSet(manifest);
+fn validateAggregate(manifest: []FileManifest, included: []const bool, included_count: usize, cfg: anytype) !void {
+    for (manifest, included) |file, keep| if (keep and file.name.len == 0) return error.PreflightIncomplete;
+    try rejectDuplicateNames(manifest, included);
+    try rejectUnsupportedSet(manifest, included, included_count);
     var total_size: u64 = 0;
-    for (manifest) |file| {
+    for (manifest, included) |file, keep| {
+        if (!keep) continue;
         total_size = std.math.add(u64, total_size, file.size) catch return error.ArtifactTooLarge;
         if (total_size > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
     }
-    if (manifest.len > 1) {
-        const envelope = zipEnvelope(manifest.len);
+    if (included_count > 1) {
+        const envelope = zipEnvelope(included_count);
         const total_with_envelope = std.math.add(u64, total_size, envelope) catch return error.ArtifactTooLarge;
         if (total_with_envelope > cfg.max_artifact_bytes) return error.ArtifactTooLarge;
     }
@@ -569,20 +597,38 @@ fn inclusiveRangeLength(begin: u64, end: u64) !u64 {
     return std.math.add(u64, end - begin, 1) catch error.InvalidYencRange;
 }
 
-fn rejectDuplicateNames(outputs: []FileManifest) !void {
+fn rejectDuplicateNames(outputs: []FileManifest, included: []const bool) !void {
     for (outputs, 0..) |a, i| {
-        for (outputs[i + 1 ..]) |b| {
+        if (!included[i]) continue;
+        for (outputs[i + 1 ..], included[i + 1 ..]) |b, keep| {
+            if (!keep) continue;
             if (std.ascii.eqlIgnoreCase(a.name, b.name)) return error.DuplicateOutputName;
         }
     }
 }
 
-fn rejectUnsupportedSet(outputs: []FileManifest) !void {
-    for (outputs) |output| try rejectUnsupportedName(output.name);
-    if (outputs.len <= 1) return;
-    for (outputs) |output| {
+fn rejectUnsupportedSet(outputs: []FileManifest, included: []const bool, included_count: usize) !void {
+    if (included_count <= 1) return;
+    for (outputs, included) |output, keep| {
+        if (!keep) continue;
         if (archiveSingleName(output.name)) return error.SplitArchiveRejected;
     }
+}
+
+fn isRepairName(name: []const u8) bool {
+    return endsWithIgnoreCase(name, ".par2");
+}
+
+fn subjectFileName(subject: []const u8) ?[]const u8 {
+    var value = std.mem.trim(u8, subject, " \t\r\n");
+    if (std.mem.lastIndexOf(u8, value, " (")) |suffix| value = std.mem.trimEnd(u8, value[0..suffix], " \t");
+    if (value.len >= 2 and value[value.len - 1] == '"') {
+        if (std.mem.lastIndexOfScalar(u8, value[0 .. value.len - 1], '"')) |start| value = value[start + 1 .. value.len - 1];
+    }
+    value = std.mem.trim(u8, value, " \t\"");
+    if (value.len == 0 or value.len > 255 or std.mem.findAny(u8, value, "/\\\r\n\x00") != null) return null;
+    if (std.mem.lastIndexOfScalar(u8, value, '.') == null) return null;
+    return value;
 }
 
 fn rejectUnsupportedName(name: []const u8) !void {
@@ -638,7 +684,7 @@ fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
 
-test "validates decoded part size against NZB declaration" {
+test "validates decoded part size against yEnc range" {
     var meta: yenc.Part = .{
         .name = "a.bin",
         .size = 3,
@@ -650,12 +696,25 @@ test "validates decoded part size against NZB declaration" {
         .crc32 = null,
         .decoded = 3,
     };
-    try validateDecodedPartSize(meta, 3);
+    try validateDecodedPartSize(meta);
     meta.decoded = 2;
-    try std.testing.expectError(error.InconsistentSegmentSize, validateDecodedPartSize(meta, 3));
+    try std.testing.expectError(error.InconsistentSegmentSize, validateDecodedPartSize(meta));
     meta.decoded = 3;
     meta.end = 2;
-    try std.testing.expectError(error.InconsistentSegmentSize, validateDecodedPartSize(meta, 3));
+    try std.testing.expectError(error.InconsistentSegmentSize, validateDecodedPartSize(meta));
+}
+
+test "identifies PAR2 repair files" {
+    try std.testing.expect(isRepairName("release.par2"));
+    try std.testing.expect(isRepairName("release.vol03+04.PAR2"));
+    try std.testing.expect(!isRepairName("comic.cbr"));
+}
+
+test "extracts safe filenames from NZB subjects" {
+    try std.testing.expectEqualStrings("comic.cbr", subjectFileName("comic.cbr (1/0)").?);
+    try std.testing.expectEqualStrings("comic.par2", subjectFileName("\"comic.par2\" (1/1)").?);
+    try std.testing.expect(subjectFileName("obfuscated subject") == null);
+    try std.testing.expect(subjectFileName("../comic.cbr (1/1)") == null);
 }
 
 test "rejects split archive names" {

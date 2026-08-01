@@ -16,9 +16,11 @@ pub const Segment = struct {
 };
 
 pub const File = struct {
+    subject: []const u8 = "",
     segments: []Segment,
 
     pub fn deinit(self: File, allocator: std.mem.Allocator) void {
+        if (self.subject.len != 0) allocator.free(self.subject);
         for (self.segments) |segment| allocator.free(segment.message_id);
         allocator.free(self.segments);
     }
@@ -86,7 +88,9 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         files.deinit(allocator);
     }
     var current_segments: std.ArrayList(Segment) = .empty;
+    var current_subject: []const u8 = "";
     errdefer {
+        if (current_subject.len != 0) allocator.free(current_subject);
         for (current_segments.items) |segment| allocator.free(segment.message_id);
         current_segments.deinit(allocator);
     }
@@ -167,6 +171,11 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                 }
                 in_file = true;
                 current_segments.clearRetainingCapacity();
+                const subject = attrValue(reader, "subject") orelse "";
+                if (subject.len != 0) current_subject = allocator.dupe(u8, subject) catch |err| {
+                    setDiag(diag, reader);
+                    return err;
+                };
             } else if (std.mem.eql(u8, name, "segments")) {
                 if (!in_file) {
                     setDiag(diag, reader);
@@ -271,11 +280,12 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                     setDiag(diag, reader);
                     return err;
                 };
-                files.append(allocator, .{ .segments = owned }) catch |err| {
+                files.append(allocator, .{ .subject = current_subject, .segments = owned }) catch |err| {
                     setDiag(diag, reader);
                     return err;
                 };
                 current_segments = .empty;
+                current_subject = "";
                 in_file = false;
             }
         }

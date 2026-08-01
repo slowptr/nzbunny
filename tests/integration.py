@@ -532,6 +532,35 @@ def main():
 
             assert server.peak_conns > 1, f"Expected concurrency > 1, got {server.peak_conns}"
             assert server.peak_conns <= 4, f"Expected concurrency <= 4, got {server.peak_conns}"
+
+            repair_data = b"PAR2 repair metadata"
+            comic_data = b"CBR payload bytes"
+            repair_msg = "repair@nzbunny.test"
+            comic_msg = "comic@nzbunny.test"
+            server.articles.clear()
+            server.articles[repair_msg] = yenc_encode("comic.vol00+01.par2", len(repair_data), 1, 1, 1, len(repair_data), repair_data)
+            server.articles[comic_msg] = yenc_encode("comic.cbr", len(comic_data), 1, 1, 1, len(comic_data), comic_data)
+            mixed_nzb = build_nzb([
+                [(1, len(repair_data) + 200, repair_msg)],
+                [(1, len(comic_data) + 200, comic_msg)],
+            ])
+            code, loc = http_post_file("http://127.0.0.1:13370/", "mixed.nzb", mixed_nzb)
+            assert code == 303, (code, loc)
+            mixed_id = loc.split("/")[-1]
+            mixed_token = None
+            for _ in range(50):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{mixed_id}")
+                html_str = html.decode("utf-8")
+                if "COMPLETE" in html_str:
+                    match = re.search(r'/d/([0-9a-f]{64})', html_str)
+                    assert match, html_str
+                    mixed_token = match.group(1)
+                    break
+                time.sleep(0.2)
+            assert mixed_token, "NZB with PAR2 repair files did not complete"
+            code, mixed_content, _ = http_get(f"http://127.0.0.1:13370/d/{mixed_token}")
+            assert code == 200
+            assert mixed_content == comic_data
         except Exception:
             proc.kill()
             stdout, stderr = proc.communicate()
