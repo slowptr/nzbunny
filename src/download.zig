@@ -406,14 +406,24 @@ fn assembleFile(
     var writer = out.writer(io, &out_buffer);
     var reader_buf: [64 * 1024]u8 = undefined;
     var expected_crc: ?u32 = null;
+    var file_crc: std.hash.Crc32 = .init();
     for (output.parts) |part| {
         try checkCanceled(control);
         var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
         defer input.close(io);
         const size = try inclusiveRangeLength(part.begin, part.end);
-        var reader = std.Io.File.Reader.initSize(input, io, &reader_buf, size);
-        const sent = try writer.interface.sendFileAll(&reader, .limited(size));
-        if (sent != size) return error.DecodedPartChanged;
+        var remaining = size;
+        var off: u64 = 0;
+        while (remaining > 0) {
+            const chunk = @min(remaining, reader_buf.len);
+            const n = std.os.linux.pread(input.handle, &reader_buf, chunk, @intCast(off));
+            if (n == 0) return error.DecodedPartChanged;
+            if (@as(isize, @bitCast(n)) < 0) return error.DecodedPartChanged;
+            file_crc.update(reader_buf[0..n]);
+            try writer.interface.writeAll(reader_buf[0..n]);
+            remaining -= n;
+            off += n;
+        }
         if (part.crc32) |crc| {
             if (expected_crc) |prev| {
                 if (prev != crc) return error.YencCrcMismatch;
@@ -424,6 +434,9 @@ fn assembleFile(
     }
     try writer.interface.flush();
     try out.sync(io);
+    if (expected_crc) |crc| {
+        if (file_crc.final() != crc) return error.YencCrcMismatch;
+    }
 }
 
 fn validatePartRanges(parts: []Part, size: u64) !void {
