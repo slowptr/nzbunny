@@ -88,8 +88,8 @@ pub fn startup(
         for (interrupted) |job| job.deinit(db.allocator);
         db.allocator.free(interrupted);
     }
-    db.reclaimStaleLeases(io, now) catch |err|
-        std.log.err("Stale lease reclaim failed: {t}", .{err});
+    db.reclaimAllFinalizingLeases(io, now) catch |err|
+        std.log.err("Startup lease reclaim failed: {t}", .{err});
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
     defer root_dir.close(io);
     root_dir.deleteTree(io, ".nzbunny-work") catch {};

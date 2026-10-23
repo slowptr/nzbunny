@@ -268,6 +268,10 @@ fn upload(
         return respondText(request, .bad_request, "The multipart content type is required.");
     const boundary = parseBoundary(content_type) catch
         return respondText(request, .bad_request, "The multipart boundary is not valid.");
+    const has_capacity = context.db.hasCapacity(context.io, context.cfg.max_active_jobs) catch
+        return respondText(request, .internal_server_error, "The job could not be saved.");
+    if (!has_capacity)
+        return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
 
     context.root_dir.createDirPath(context.io, ".nzbunny-work") catch {};
     var random: [16]u8 = undefined;
@@ -413,6 +417,7 @@ fn progressPhaseName(phase: @import("download.zig").Phase) []const u8 {
         .preflight => "checking files",
         .downloading => "downloading segments",
         .assembling => "assembling files",
+        .repairing => "repairing files",
     };
 }
 

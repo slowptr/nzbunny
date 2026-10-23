@@ -78,11 +78,11 @@ pub const Decoder = struct {
                 if (meta.size != meta.decoded) return error.InvalidYencDecodedSize;
             }
             const actual = self.crc.final();
-            if (meta.part == 0) {
+            if (meta.part == 0 or (meta.total <= 1 and meta.begin == 1 and meta.end == meta.size)) {
+                if (end.pcrc32) |expected| if (expected != actual) return error.YencCrcMismatch;
                 if (end.crc32) |expected| if (expected != actual) return error.YencCrcMismatch;
             } else {
                 if (end.pcrc32) |expected| if (expected != actual) return error.YencCrcMismatch;
-                if (end.crc32) |expected| meta.crc32 = expected;
             }
             meta.pcrc32 = end.pcrc32;
             meta.crc32 = end.crc32;
@@ -253,10 +253,17 @@ test "accepts explicit single-part metadata" {
     try decoder.consumeLine("=ybegin part=1 total=1 line=128 size=1 name=a.bin");
     try decoder.consumeLine("=ypart begin=1 end=1");
     try decoder.consumeLine("\x8b");
-    try decoder.consumeLine("=yend size=1 part=1 crc32=352441c2");
+    try decoder.consumeLine("=yend size=1 part=1 crc32=e8b7be43");
     const meta = try decoder.finish();
     try std.testing.expectEqual(@as(u32, 1), meta.part);
     try std.testing.expectEqual(@as(u32, 1), meta.total);
+
+    var bad = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer bad.deinit();
+    try bad.consumeLine("=ybegin part=1 total=1 line=128 size=1 name=a.bin");
+    try bad.consumeLine("=ypart begin=1 end=1");
+    try bad.consumeLine("\x8b");
+    try std.testing.expectError(error.YencCrcMismatch, bad.consumeLine("=yend size=1 part=1 crc32=00000000"));
 }
 
 test "rejects empty yenc data" {

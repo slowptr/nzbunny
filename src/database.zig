@@ -89,6 +89,12 @@ pub const Database = struct {
         return c.sqlite3_step(stmt) == c.SQLITE_ROW;
     }
 
+    pub fn hasCapacity(self: *Database, io: std.Io, max_active: u32) !bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return (try activeCount(self.handle)) < max_active;
+    }
+
     pub fn createFileIfCapacity(
         self: *Database,
         io: std.Io,
@@ -162,11 +168,11 @@ pub const Database = struct {
             \\VALUES (?1, ?2, ?3, 'PENDING', ?4, ?4)
         );
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, id);
-        bindText(stmt, 2, filename);
+        try bindText(stmt, 1, id);
+        try bindText(stmt, 2, filename);
         if (c.sqlite3_bind_zeroblob64(stmt, 3, content_size) != c.SQLITE_OK)
-            return error.DatabaseWriteFailed;
-        _ = c.sqlite3_bind_int64(stmt, 4, now);
+            return error.DatabaseBindFailed;
+        try bindInt64(stmt, 4, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return id;
     }
@@ -217,9 +223,9 @@ pub const Database = struct {
             "(status='FAILED' AND updated_at<=?2) OR " ++
             "(status='EXPIRED' AND updated_at<=?3)");
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, now);
-        _ = c.sqlite3_bind_int64(stmt, 2, failed_before);
-        _ = c.sqlite3_bind_int64(stmt, 3, expired_before);
+        try bindInt64(stmt, 1, now);
+        try bindInt64(stmt, 2, failed_before);
+        try bindInt64(stmt, 3, expired_before);
         var result: std.ArrayList(Job) = .empty;
         errdefer {
             for (result.items) |job| job.deinit(self.allocator);
@@ -245,7 +251,7 @@ pub const Database = struct {
         const stmt = try prepare(self.handle, "SELECT id,filename," ++ content ++ ",status,download_path,artifact_path," ++
             "artifact_size,download_token,fail_reason,created_at,updated_at,expires_at,finalize_attempts,finalize_next_at,finalize_lease_until,finalize_lease_token FROM jobs WHERE " ++ field ++ "=?1");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, value);
+        try bindText(stmt, 1, value);
         const result = c.sqlite3_step(stmt);
         if (result == c.SQLITE_DONE) return null;
         if (result != c.SQLITE_ROW) return error.DatabaseReadFailed;
@@ -257,8 +263,8 @@ pub const Database = struct {
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle, "UPDATE jobs SET status='PROCESSING',content=NULL,updated_at=?1 WHERE id=?2 AND status='PENDING'");
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, now);
-        bindText(stmt, 2, id);
+        try bindInt64(stmt, 1, now);
+        try bindText(stmt, 2, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(self.handle) == 1;
     }
@@ -268,9 +274,9 @@ pub const Database = struct {
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle, "UPDATE jobs SET status='FINALIZING',download_path=?1,updated_at=?2 WHERE id=?3 AND status='PROCESSING'");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, download_path);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
+        try bindText(stmt, 1, download_path);
+        try bindInt64(stmt, 2, now);
+        try bindText(stmt, 3, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(self.handle) == 1;
     }
@@ -298,10 +304,10 @@ pub const Database = struct {
             \\AND (finalize_next_at IS NULL OR finalize_next_at <= ?3)
         );
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, lease_until);
-        bindText(stmt, 2, token_buf[0..]);
-        _ = c.sqlite3_bind_int64(stmt, 3, now);
-        bindText(stmt, 4, id);
+        try bindInt64(stmt, 1, lease_until);
+        try bindText(stmt, 2, token_buf[0..]);
+        try bindInt64(stmt, 3, now);
+        try bindText(stmt, 4, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         if (c.sqlite3_changes(self.handle) == 0) return null;
         return try self.allocator.dupe(u8, token_buf[0..]);
@@ -316,10 +322,10 @@ pub const Database = struct {
             \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
         );
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, retry_after);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
-        bindText(stmt, 4, token);
+        try bindInt64(stmt, 1, retry_after);
+        try bindInt64(stmt, 2, now);
+        try bindText(stmt, 3, id);
+        try bindText(stmt, 4, token);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
@@ -331,10 +337,10 @@ pub const Database = struct {
             \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
         );
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, new_lease_until);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
-        bindText(stmt, 4, token);
+        try bindInt64(stmt, 1, new_lease_until);
+        try bindInt64(stmt, 2, now);
+        try bindText(stmt, 3, id);
+        try bindText(stmt, 4, token);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(self.handle) == 1;
     }
@@ -356,13 +362,13 @@ pub const Database = struct {
             "expires_at=?4,updated_at=?5,finalize_lease_until=NULL,finalize_lease_token=NULL " ++
             "WHERE id=?6 AND status='FINALIZING' AND finalize_lease_token=?7");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, artifact_path);
-        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(size));
-        bindText(stmt, 3, download_token);
-        _ = c.sqlite3_bind_int64(stmt, 4, expires);
-        _ = c.sqlite3_bind_int64(stmt, 5, now);
-        bindText(stmt, 6, id);
-        bindText(stmt, 7, lease_token);
+        try bindText(stmt, 1, artifact_path);
+        try bindInt64(stmt, 2, @intCast(size));
+        try bindText(stmt, 3, download_token);
+        try bindInt64(stmt, 4, expires);
+        try bindInt64(stmt, 5, now);
+        try bindText(stmt, 6, id);
+        try bindText(stmt, 7, lease_token);
         const result = c.sqlite3_step(stmt);
         if (result == c.SQLITE_CONSTRAINT) return error.DuplicateToken;
         if (result != c.SQLITE_DONE) return error.DatabaseWriteFailed;
@@ -378,10 +384,10 @@ pub const Database = struct {
             \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
         );
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, reason);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
-        bindText(stmt, 4, lease_token);
+        try bindText(stmt, 1, reason);
+        try bindInt64(stmt, 2, now);
+        try bindText(stmt, 3, id);
+        try bindText(stmt, 4, lease_token);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
@@ -393,7 +399,19 @@ pub const Database = struct {
             \\WHERE status='FINALIZING' AND finalize_lease_until IS NOT NULL AND finalize_lease_until <= ?1
         );
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, now);
+        try bindInt64(stmt, 1, now);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
+    }
+
+    pub fn reclaimAllFinalizingLeases(self: *Database, io: std.Io, now: i64) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const stmt = try prepare(self.handle,
+            \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL, updated_at=?1
+            \\WHERE status='FINALIZING' AND finalize_lease_until IS NOT NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindInt64(stmt, 1, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
@@ -402,9 +420,9 @@ pub const Database = struct {
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle, "UPDATE jobs SET status='FAILED',fail_reason=?1,content=NULL,updated_at=?2 WHERE id=?3 AND status NOT IN ('COMPLETE','EXPIRED')");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, reason);
-        _ = c.sqlite3_bind_int64(stmt, 2, now);
-        bindText(stmt, 3, id);
+        try bindText(stmt, 1, reason);
+        try bindInt64(stmt, 2, now);
+        try bindText(stmt, 3, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
@@ -430,7 +448,7 @@ pub const Database = struct {
         };
         const update = try prepare(db, "UPDATE jobs SET status='FAILED',content=NULL,fail_reason='Download was interrupted; upload the NZB again.',updated_at=?1 WHERE status='PROCESSING'");
         defer _ = c.sqlite3_finalize(update);
-        _ = c.sqlite3_bind_int64(update, 1, now);
+        try bindInt64(update, 1, now);
         if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         try exec(db, "COMMIT;");
         return result.toOwnedSlice(self.allocator);
@@ -442,9 +460,9 @@ pub const Database = struct {
         const stmt = try prepare(self.handle, "UPDATE jobs SET status='EXPIRED',content=NULL,download_path=NULL,artifact_path=NULL," ++
             "artifact_size=0,fail_reason='The download expired.',updated_at=?1 WHERE id=?2 AND status=?3");
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, now);
-        bindText(stmt, 2, id);
-        bindText(stmt, 3, statusName(expected));
+        try bindInt64(stmt, 1, now);
+        try bindText(stmt, 2, id);
+        try bindText(stmt, 3, statusName(expected));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(self.handle) == 1;
     }
@@ -454,8 +472,8 @@ pub const Database = struct {
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle, "DELETE FROM jobs WHERE id=?1 AND status='EXPIRED' AND updated_at<=?2");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, id);
-        _ = c.sqlite3_bind_int64(stmt, 2, before);
+        try bindText(stmt, 1, id);
+        try bindInt64(stmt, 2, before);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 };
@@ -603,7 +621,7 @@ fn migrateV2ToV3(db: *c.sqlite3) !void {
 fn tableExists(db: *c.sqlite3, name: []const u8) !bool {
     const stmt = try prepare(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1");
     defer _ = c.sqlite3_finalize(stmt);
-    bindText(stmt, 1, name);
+    try bindText(stmt, 1, name);
     return switch (c.sqlite3_step(stmt)) {
         c.SQLITE_ROW => true,
         c.SQLITE_DONE => false,
@@ -625,8 +643,15 @@ fn exec(db: *c.sqlite3, sql: [*:0]const u8) !void {
     }
 }
 
-fn bindText(stmt: *c.sqlite3_stmt, index: c_int, value: []const u8) void {
-    _ = c.sqlite3_bind_text(stmt, index, value.ptr, @intCast(value.len), null);
+fn bindText(stmt: *c.sqlite3_stmt, index: c_int, value: []const u8) !void {
+    const ptr: [*c]const u8 = if (value.len == 0) "" else value.ptr;
+    if (c.sqlite3_bind_text(stmt, index, ptr, @intCast(value.len), null) != c.SQLITE_OK)
+        return error.DatabaseBindFailed;
+}
+
+fn bindInt64(stmt: *c.sqlite3_stmt, index: c_int, value: i64) !void {
+    if (c.sqlite3_bind_int64(stmt, index, value) != c.SQLITE_OK)
+        return error.DatabaseBindFailed;
 }
 
 fn text(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, column: c_int) ![]const u8 {
@@ -728,7 +753,9 @@ test "SQLite job transitions use compare and set" {
     try tmp.dir.writeFile(io, .{ .sub_path = "sample.nzb", .data = "<nzb/>" });
     var sample_file = try tmp.dir.openFile(io, "sample.nzb", .{});
     defer sample_file.close(io);
+    try std.testing.expect(try db.hasCapacity(io, 1));
     const id = (try db.createFileIfCapacity(io, "sample.nzb", sample_file, 6, 100, 1)).?;
+    try std.testing.expect(!try db.hasCapacity(io, 1));
     const pending = (try db.get(io, id)).?;
     try std.testing.expectEqual(Status.pending, pending.status);
     try std.testing.expectEqual(@as(usize, 0), pending.content.len);
@@ -738,7 +765,10 @@ test "SQLite job transitions use compare and set" {
     try std.testing.expect(try db.beginProcessing(io, id, 101));
     try std.testing.expect(!try db.beginProcessing(io, id, 102));
     try std.testing.expect(try db.beginFinalizing(io, id, "output", 104));
-    const lease_token = (try db.tryClaimFinalizing(io, id, 104, 60)).?;
+    _ = (try db.tryClaimFinalizing(io, id, 104, 60)).?;
+    try std.testing.expect((try db.tryClaimFinalizing(io, id, 105, 60)) == null);
+    try db.reclaimAllFinalizingLeases(io, 105);
+    const lease_token = (try db.tryClaimFinalizing(io, id, 105, 60)).?;
     const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     try std.testing.expect(try db.completeWithToken(io, id, lease_token, "artifact.zip", 42, token, 200, 105));
     const complete_job = (try db.getByToken(io, token)).?;

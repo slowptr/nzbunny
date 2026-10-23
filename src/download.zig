@@ -17,6 +17,7 @@ pub const Phase = enum(u8) {
     preflight,
     downloading,
     assembling,
+    repairing,
 };
 
 pub const ProgressSnapshot = struct {
@@ -46,6 +47,10 @@ pub const Progress = struct {
 
     pub fn setPhase(self: *Progress, io: std.Io, phase: Phase) void {
         self.phase.store(phase, .release);
+        self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
+    }
+
+    pub fn touch(self: *Progress, io: std.Io) void {
         self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
     }
 
@@ -191,19 +196,23 @@ pub fn run(
         assembled += 1;
         if (damaged) {
             std.log.info("file {d}/{d} prepared for PAR2 recovery: {s}", .{ assembled, included_count, file.name });
-            try assembleDamagedFile(allocator, io, root_dir, tmp_output_root, file, control);
+            try assembleDamagedFile(allocator, io, root_dir, tmp_output_root, file, control, progress);
         } else {
             try validatePartRanges(file.parts, file.size);
             std.log.info("file {d}/{d} assembled: {s} ({d} segments)", .{ assembled, included_count, file.name, file.parts.len });
-            try assembleFile(allocator, io, root_dir, tmp_output_root, file, control);
+            try assembleFile(allocator, io, root_dir, tmp_output_root, file, control, progress);
         }
     }
     if (damaged) {
-        const repair_name = try assembleRepairFiles(allocator, io, root_dir, tmp_output_root, manifest, included, control);
+        progress.setPhase(io, .repairing);
+        const repair_name = try assembleRepairFiles(allocator, io, root_dir, tmp_output_root, manifest, included, control, progress);
         std.log.info("download phase: repairing missing payload data with {s}", .{repair_name});
         try repairWithPar2(allocator, io, root_dir, tmp_output_root, repair_name, control);
-        for (manifest, included) |file, keep| if (keep)
+        progress.touch(io);
+        for (manifest, included) |file, keep| if (keep) {
             try validateRepairedFile(allocator, io, root_dir, tmp_output_root, file);
+            progress.touch(io);
+        };
         cleanupRepairFiles(allocator, io, root_dir, tmp_output_root, manifest, included);
     }
 
@@ -594,12 +603,13 @@ fn assembleRepairFiles(
     manifest: []FileManifest,
     included: []const bool,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
 ) ![]const u8 {
     var repair_name: ?[]const u8 = null;
     for (manifest, included) |file, keep| {
         if (keep or !allPartsPresent(file.parts)) continue;
         try validatePartRanges(file.parts, file.size);
-        try assembleFile(allocator, io, root_dir, output_root, file, control);
+        try assembleFile(allocator, io, root_dir, output_root, file, control, progress);
         if (repair_name == null or !isRecoveryName(file.name)) repair_name = file.name;
     }
     return repair_name orelse error.InsufficientPar2Data;
@@ -612,6 +622,7 @@ fn assembleDamagedFile(
     output_root: []const u8,
     output: FileManifest,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
 ) !void {
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
     defer allocator.free(final_path);
@@ -635,6 +646,7 @@ fn assembleDamagedFile(
             try pwriteAll(out.handle, buffer[0..read], part.begin - 1 + offset);
             offset += read;
         }
+        progress.touch(io);
     }
     try out.sync(io);
 }
@@ -732,12 +744,7 @@ fn validateRepairedFile(
     var file = try root_dir.openFile(io, path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
     defer file.close(io);
     if (try file.length(io) != output.size) return error.Par2RepairFailed;
-    var expected: ?u32 = null;
-    for (output.parts) |part| if (part.crc32) |crc| {
-        if (expected) |value| {
-            if (value != crc) return error.YencCrcMismatch;
-        } else expected = crc;
-    };
+    const expected: ?u32 = if (output.parts.len > 0) output.parts[output.parts.len - 1].crc32 else null;
     if (expected) |crc| {
         var actual: std.hash.Crc32 = .init();
         var buffer: [64 * 1024]u8 = undefined;
@@ -765,6 +772,7 @@ fn assembleFile(
     output_root: []const u8,
     output: FileManifest,
     control: *shutdown.DownloadControl,
+    progress: *Progress,
 ) !void {
     try checkCanceled(control);
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
@@ -774,7 +782,7 @@ fn assembleFile(
     var out_buffer: [64 * 1024]u8 = undefined;
     var writer = out.writer(io, &out_buffer);
     var reader_buf: [64 * 1024]u8 = undefined;
-    var expected_crc: ?u32 = null;
+    const expected_crc: ?u32 = if (output.parts.len > 0) output.parts[output.parts.len - 1].crc32 else null;
     var file_crc: std.hash.Crc32 = .init();
     for (output.parts) |part| {
         try checkCanceled(control);
@@ -791,13 +799,7 @@ fn assembleFile(
             remaining -= n;
             off += n;
         }
-        if (part.crc32) |crc| {
-            if (expected_crc) |prev| {
-                if (prev != crc) return error.YencCrcMismatch;
-            } else {
-                expected_crc = crc;
-            }
-        }
+        progress.touch(io);
     }
     try writer.interface.flush();
     try out.sync(io);
