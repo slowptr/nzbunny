@@ -13,6 +13,7 @@ pub const shutdown = @import("shutdown.zig");
 pub const web = @import("web.zig");
 
 pub fn run(init: std.process.Init) !void {
+    nzb.initParser();
     shutdown.requested.store(false, .release);
     shutdown.installSignalHandlers();
     const cfg = config.load(init.gpa, init.io, init.minimal.environ) catch |err| {

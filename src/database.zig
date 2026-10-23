@@ -104,6 +104,16 @@ pub const Database = struct {
         now: i64,
         max_active: u32,
     ) !?[]const u8 {
+        const len = std.math.cast(usize, size) orelse return error.UploadFileChanged;
+        const content = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(content);
+        var offset: usize = 0;
+        while (offset < len) {
+            const count = try file.readPositional(io, &.{content[offset..]}, offset);
+            if (count == 0) return error.UploadFileChanged;
+            offset += count;
+        }
+
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const db = self.handle;
@@ -114,38 +124,9 @@ pub const Database = struct {
             try exec(db, "COMMIT;");
             return null;
         }
-        const id = try self.createFileLocked(db, io, filename, file, size, now);
+        const id = try self.insertJob(db, io, filename, content, now);
         errdefer self.allocator.free(id);
         try exec(db, "COMMIT;");
-        return id;
-    }
-
-    fn createFileLocked(
-        self: *Database,
-        db: *c.sqlite3,
-        io: std.Io,
-        filename: []const u8,
-        file: std.Io.File,
-        size: u64,
-        now: i64,
-    ) ![]const u8 {
-        const id = try self.insertJob(db, io, filename, size, now);
-        errdefer self.allocator.free(id);
-        var blob: ?*c.sqlite3_blob = null;
-        if (c.sqlite3_blob_open(db, "main", "jobs", "content", c.sqlite3_last_insert_rowid(db), 1, &blob) != c.SQLITE_OK)
-            return error.DatabaseBlobOpenFailed;
-        defer _ = c.sqlite3_blob_close(blob);
-        const buffer = try self.allocator.alloc(u8, 64 * 1024);
-        defer self.allocator.free(buffer);
-        var offset: u64 = 0;
-        while (offset < size) {
-            const wanted: usize = @intCast(@min(size - offset, buffer.len));
-            const count = try file.readPositional(io, &.{buffer[0..wanted]}, offset);
-            if (count == 0) return error.UploadFileChanged;
-            if (c.sqlite3_blob_write(blob, buffer.ptr, @intCast(count), @intCast(offset)) != c.SQLITE_OK)
-                return error.DatabaseWriteFailed;
-            offset += count;
-        }
         return id;
     }
 
@@ -154,7 +135,7 @@ pub const Database = struct {
         db: *c.sqlite3,
         io: std.Io,
         filename: []const u8,
-        content_size: u64,
+        content: []const u8,
         now: i64,
     ) ![]const u8 {
         var random: [16]u8 = undefined;
@@ -170,7 +151,8 @@ pub const Database = struct {
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, id);
         try bindText(stmt, 2, filename);
-        if (c.sqlite3_bind_zeroblob64(stmt, 3, content_size) != c.SQLITE_OK)
+        const blob_ptr: ?*const anyopaque = if (content.len == 0) "" else content.ptr;
+        if (c.sqlite3_bind_blob64(stmt, 3, blob_ptr, content.len, null) != c.SQLITE_OK)
             return error.DatabaseBindFailed;
         try bindInt64(stmt, 4, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
@@ -388,18 +370,6 @@ pub const Database = struct {
         try bindInt64(stmt, 2, now);
         try bindText(stmt, 3, id);
         try bindText(stmt, 4, lease_token);
-        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
-    }
-
-    pub fn reclaimStaleLeases(self: *Database, io: std.Io, now: i64) !void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const stmt = try prepare(self.handle,
-            \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL, updated_at=?1
-            \\WHERE status='FINALIZING' AND finalize_lease_until IS NOT NULL AND finalize_lease_until <= ?1
-        );
-        defer _ = c.sqlite3_finalize(stmt);
-        try bindInt64(stmt, 1, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
@@ -638,7 +608,10 @@ fn prepare(db: *c.sqlite3, sql: [*:0]const u8) !*c.sqlite3_stmt {
 fn exec(db: *c.sqlite3, sql: [*:0]const u8) !void {
     var message: [*c]u8 = null;
     if (c.sqlite3_exec(db, sql, null, null, &message) != c.SQLITE_OK) {
-        if (message != null) c.sqlite3_free(message);
+        if (message != null) {
+            std.log.err("SQLite exec failed: {s}", .{std.mem.span(message)});
+            c.sqlite3_free(message);
+        }
         return error.DatabaseSchemaFailed;
     }
 }

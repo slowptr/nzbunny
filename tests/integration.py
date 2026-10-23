@@ -539,6 +539,7 @@ def main():
             code, zip_bytes, headers = http_get(f"http://127.0.0.1:13370/d/{token}")
             assert code == 200
             assert "application/zip" in headers.get("content-type")
+            assert 'attachment; filename="multi.zip"' in headers.get("content-disposition")
 
             zip_path = os.path.join(temp_dir, "art.zip")
             with open(zip_path, "wb") as f:
@@ -643,6 +644,36 @@ def main():
             assert not os.path.exists(os.path.join(download_dir, ".nzbunny-downloads", repair_id)), "Staging download dir should be removed after finalization"
             assert not os.path.exists(os.path.join(download_dir, ".nzbunny-work", repair_id)), "Staging work dir should be removed after finalization"
             server.missing_articles.remove(missing_msg)
+
+            # Also verify PAR2 recovery when segment 1 (index 0) of the payload file is missing
+            second_msg = "repairable-seg2-ok@nzbunny.test"
+            server.missing_articles.add(first_msg)
+            server.articles[second_msg] = yenc_encode(
+                "repairable.bin", len(repairable_data), 2, 2, split_at + 1, len(repairable_data), data_second
+            )
+            seg0_repair_files = [[
+                (1, len(data_first) + 200, first_msg),
+                (2, len(data_second) + 200, second_msg),
+            ]] + repair_nzb_files[1:]
+            seg0_repair_nzb = build_nzb(seg0_repair_files)
+            code, loc = http_post_file("http://127.0.0.1:13370/", "repair_seg0.nzb", seg0_repair_nzb)
+            assert code == 303, (code, loc)
+            seg0_repair_id = loc.split("/")[-1]
+            seg0_repair_token = None
+            for _ in range(100):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{seg0_repair_id}")
+                html_str = html.decode("utf-8")
+                if "COMPLETE" in html_str:
+                    match = re.search(r'/d/([0-9a-f]{64})', html_str)
+                    assert match, html_str
+                    seg0_repair_token = match.group(1)
+                    break
+                time.sleep(0.2)
+            assert seg0_repair_token, "PAR2 recovery job for missing segment 1 did not complete"
+            code, seg0_repaired_content, _ = http_get(f"http://127.0.0.1:13370/d/{seg0_repair_token}")
+            assert code == 200
+            assert seg0_repaired_content == repairable_data
+            server.missing_articles.remove(first_msg)
         except Exception:
             proc.kill()
             stdout, stderr = proc.communicate()

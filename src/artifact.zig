@@ -74,11 +74,7 @@ pub fn prepare(
     max_bytes: u64,
     lease_token: []const u8,
 ) !Result {
-    const io_buffer = try allocator.alloc(u8, io_buffer_size);
-    defer allocator.free(io_buffer);
-    var source_buffer: [c.PATH_MAX]u8 = undefined;
-    const resolved = try paths.resolveContained(root, source, &source_buffer);
-    try paths.rejectSymlinks(root, source);
+    const rel = try paths.relativeToRoot(root, source);
     const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{
         .DIRECTORY = true,
         .NOFOLLOW = true,
@@ -100,9 +96,11 @@ pub fn prepare(
     ) catch return error.ArtifactDirectoryUnsafe;
     defer _ = c.close(artifact_fd);
 
-    if (!paths.inside(root, resolved) or resolved.len <= root.len) return error.PathOutsideRoot;
-    const source_fd = openRelative(root_fd, resolved[root.len + 1 ..]) catch
-        return error.ArtifactSourceNotAccessible;
+    const source_fd = openRelative(root_fd, rel) catch |err| switch (err) {
+        error.SymbolicLinkRejected => return error.SymbolicLinkRejected,
+        error.FileNotFound, error.PathNotFound => return error.PathNotFound,
+        else => return error.ArtifactSourceNotAccessible,
+    };
     defer _ = c.close(source_fd.fd);
     const mode = source_fd.stat.st_mode & c.S_IFMT;
     if (mode != c.S_IFREG and mode != c.S_IFDIR) return error.SpecialFileRejected;
@@ -130,6 +128,23 @@ pub fn prepare(
     try removeFileAt(artifact_fd, temp_name);
     errdefer removeFileAt(artifact_fd, temp_name) catch |err|
         std.log.err("Temporary artifact cleanup failed for {s}: {t}", .{ temp_name, err });
+
+    if (mode == c.S_IFREG) {
+        const source_size: u64 = @intCast(source_fd.stat.st_size);
+        if (source_size > max_bytes) return error.ArtifactTooLarge;
+        if (tryHardlinkRelative(root_fd, rel, artifact_fd, temp_name, source_fd.stat)) {
+            if (c.renameat(artifact_fd, temp_name, artifact_fd, final_name) != 0)
+                return error.ArchiveRenameFailed;
+            if (c.fsync(artifact_fd) != 0) return error.ArtifactDirectoryFailed;
+            return .{
+                .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ artifact_name, final_name }),
+                .size = source_size,
+            };
+        }
+    }
+
+    const io_buffer = try allocator.alloc(u8, io_buffer_size);
+    defer allocator.free(io_buffer);
     const temp_fd = std.posix.openat(
         artifact_fd,
         temp_name,
@@ -149,7 +164,6 @@ pub fn prepare(
 
     if (mode == c.S_IFREG) {
         const source_size: u64 = @intCast(source_fd.stat.st_size);
-        if (source_size > max_bytes) return error.ArtifactTooLarge;
         try copyFd(source_fd.fd, temp_fd, source_size, io_buffer);
     } else {
         const archive = c.archive_write_new() orelse return error.ArchiveCreateFailed;
@@ -336,23 +350,17 @@ fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buf
 
 pub fn removeValidated(root: []const u8, candidate: []const u8) !void {
     if (candidate.len == 0) return;
-    paths.rejectSymlinks(root, candidate) catch |err| switch (err) {
-        error.PathNotFound => return,
-        else => return err,
-    };
-    var resolved_buffer: [c.PATH_MAX]u8 = undefined;
-    const resolved = paths.resolveContained(root, candidate, &resolved_buffer) catch |err| switch (err) {
-        error.PathNotFound => return,
-        else => return err,
-    };
-    if (std.mem.eql(u8, resolved, root)) return error.RefuseRootRemoval;
+    const rel = try paths.relativeToRoot(root, candidate);
     const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{
         .DIRECTORY = true,
         .NOFOLLOW = true,
         .CLOEXEC = true,
     }, 0) catch return error.DownloadRootNotAccessible;
     defer _ = c.close(root_fd);
-    try removeRelative(root_fd, resolved[root.len + 1 ..]);
+    removeRelative(root_fd, rel) catch |err| switch (err) {
+        error.PathNotFound => return,
+        else => return err,
+    };
 }
 
 pub fn sweepOrphanTemps(root: []const u8) void {
@@ -363,6 +371,7 @@ pub fn sweepOrphanTemps(root: []const u8) void {
     }, 0) catch return;
     defer _ = c.close(root_fd);
     sweepMatchingInDir(root_fd, "", ".nzbunny-upload-", ".tmp");
+    sweepMatchingInDir(root_fd, ".nzbunny-work", ".nzbunny-upload-", ".tmp");
     sweepMatchingInDir(root_fd, ".nzbunny-artifacts", "", ".tmp");
     sweepMatchingInDir(root_fd, ".nzbunny-downloads", ".tmp-", "");
 }
@@ -516,6 +525,41 @@ fn existingRegularAt(directory_fd: c_int, name: [:0]const u8, max: u64) !u64 {
     return size;
 }
 
+fn tryHardlinkRelative(
+    root_fd: c_int,
+    rel: []const u8,
+    artifact_fd: c_int,
+    temp_name: [:0]const u8,
+    expected_stat: c.struct_stat,
+) bool {
+    var name_z: [c.PATH_MAX + 1]u8 = undefined;
+    if (std.mem.lastIndexOfScalar(u8, rel, '/')) |slash| {
+        const name = rel[slash + 1 ..];
+        if (name.len == 0) return false;
+        const parent_fd = openDirPath(root_fd, rel[0..slash]) catch return false;
+        defer _ = c.close(parent_fd);
+        const z = paths.toZ(name, &name_z) catch return false;
+        if (c.linkat(parent_fd, z.ptr, artifact_fd, temp_name.ptr, 0) != 0) return false;
+    } else {
+        const z = paths.toZ(rel, &name_z) catch return false;
+        if (c.linkat(root_fd, z.ptr, artifact_fd, temp_name.ptr, 0) != 0) return false;
+    }
+    const linked = openChild(artifact_fd, temp_name) catch {
+        removeFileAt(artifact_fd, temp_name) catch {};
+        return false;
+    };
+    defer _ = c.close(linked.fd);
+    if ((linked.stat.st_mode & c.S_IFMT) != c.S_IFREG or
+        linked.stat.st_ino != expected_stat.st_ino or
+        linked.stat.st_dev != expected_stat.st_dev or
+        linked.stat.st_size != expected_stat.st_size)
+    {
+        removeFileAt(artifact_fd, temp_name) catch {};
+        return false;
+    }
+    return true;
+}
+
 fn removeFileAt(directory_fd: c_int, name: [:0]const u8) !void {
     if (c.unlinkat(directory_fd, name.ptr, 0) == 0 or std.c._errno().* == c.ENOENT) return;
     return error.TemporaryArtifactCleanupFailed;
@@ -617,10 +661,12 @@ test "sweepOrphanTemps removes only temporary staging files and directories" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "downloads/.nzbunny-work");
     try tmp.dir.createDirPath(io, "downloads/.nzbunny-artifacts");
     try tmp.dir.createDirPath(io, "downloads/.nzbunny-downloads/.tmp-job1");
     try tmp.dir.createDirPath(io, "downloads/.nzbunny-downloads/job2");
     try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-upload-123.tmp", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-work/.nzbunny-upload-456.tmp", .data = "x" });
     try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-artifacts/job1.zip.tmp", .data = "x" });
     try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-artifacts/job2.zip", .data = "keep" });
     try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-downloads/.tmp-job1/part.bin", .data = "x" });
@@ -634,6 +680,7 @@ test "sweepOrphanTemps removes only temporary staging files and directories" {
     sweepOrphanTemps(download);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-upload-123.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-work/.nzbunny-upload-456.tmp", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-artifacts/job1.zip.tmp", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-downloads/.tmp-job1/part.bin", .{}));
     var keep_art = try tmp.dir.openFile(io, "downloads/.nzbunny-artifacts/job2.zip", .{});

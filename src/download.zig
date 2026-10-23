@@ -129,14 +129,33 @@ pub fn run(
         for (manifest[file_index].parts) |*p| p.* = .{ .begin = 0, .end = 0, .rel_path = "" };
     }
 
+    const sessions = try allocator.alloc(nntp.Session, cfg.nntp_connections);
+    for (sessions) |*s| {
+        s.* = nntp.makeSession(
+            allocator,
+            io,
+            cfg.nntp_host,
+            cfg.nntp_port,
+            cfg.nntp_user,
+            cfg.nntp_pass,
+            ca_store,
+            cfg.nntp_timeout_seconds,
+            control,
+        );
+    }
+    defer {
+        for (sessions) |*s| s.deinit();
+        allocator.free(sessions);
+    }
+
     progress.setPhase(io, .preflight);
     std.log.info("download phase: checking the first segment of {d} files", .{document.files.len});
-    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, control, progress);
+    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, sessions, control, progress);
     const included = try allocator.alloc(bool, manifest.len);
     defer allocator.free(included);
     var included_count: usize = 0;
     for (manifest, included) |file, *keep| {
-        keep.* = !isRepairName(file.name);
+        keep.* = file.name.len != 0 and !isRepairName(file.name);
         if (keep.*) {
             try rejectUnsupportedName(file.name);
             included_count += 1;
@@ -153,6 +172,7 @@ pub fn run(
         if (!included[file_index]) continue;
         payload_segments += file.segments.len - 1;
         for (1..file.segments.len) |segment_index| {
+            if (manifest[file_index].parts[segment_index].rel_path.len != 0) continue;
             try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
         }
     }
@@ -161,7 +181,7 @@ pub fn run(
     if (remaining.items.len > 0) {
         progress.setPhase(io, .downloading);
         std.log.info("download phase: fetching {d} remaining segments", .{remaining.items.len});
-        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress, has_repair_files);
+        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, sessions, control, progress, has_repair_files);
     }
 
     var damaged = false;
@@ -175,6 +195,7 @@ pub fn run(
         for (document.files, 0..) |file, file_index| {
             if (included[file_index]) continue;
             for (1..file.segments.len) |segment_index| {
+                if (manifest[file_index].parts[segment_index].rel_path.len != 0) continue;
                 try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
             }
         }
@@ -182,9 +203,9 @@ pub fn run(
             progress.setTotal(total_segments);
             progress.setPhase(io, .downloading);
             std.log.info("download phase: fetching {d} PAR2 repair segments", .{remaining.items.len});
-            try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress, true);
+            try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, sessions, control, progress, true);
         }
-        if (!hasCompleteRepairFile(manifest, included)) return error.InsufficientPar2Data;
+        if (!hasUsableRepairFile(manifest, included)) return error.InsufficientPar2Data;
     }
 
     progress.setPhase(io, .assembling);
@@ -194,7 +215,7 @@ pub fn run(
         if (!included[file_index]) continue;
         try checkCanceled(control);
         assembled += 1;
-        if (damaged) {
+        if (!allPartsPresent(file.parts)) {
             std.log.info("file {d}/{d} prepared for PAR2 recovery: {s}", .{ assembled, included_count, file.name });
             try assembleDamagedFile(allocator, io, root_dir, tmp_output_root, file, control, progress);
         } else {
@@ -239,6 +260,7 @@ const FileManifest = struct {
     name: []const u8 = "",
     size: u64 = 0,
     parts: []Part = &.{},
+    preflight_err: ?anyerror = null,
 
     fn deinit(self: FileManifest, allocator: std.mem.Allocator) void {
         if (self.name.len != 0) allocator.free(self.name);
@@ -285,6 +307,7 @@ fn preflightPhase(
     files: []const nzb.File,
     cfg: anytype,
     ca_store: *nntp.CaStore,
+    sessions: []nntp.Session,
     control: *shutdown.DownloadControl,
     progress: *Progress,
 ) !void {
@@ -302,31 +325,19 @@ fn preflightPhase(
         .progress = progress,
     };
     var next: std.atomic.Value(usize) = .init(0);
-    const worker_count = @min(files.len, cfg.nntp_connections);
+    const worker_count = @min(files.len, sessions.len);
     if (worker_count == 0) return;
     var group: std.Io.Group = .init;
     var w: usize = 0;
     while (w < worker_count) : (w += 1) {
-        group.concurrent(io, preflightWorker, .{ &ctx, &next }) catch preflightWorker(&ctx, &next);
+        group.concurrent(io, preflightWorker, .{ &ctx, &sessions[w], &next }) catch preflightWorker(&ctx, &sessions[w], &next);
     }
     try group.await(io);
     if (ctx.first_error) |err| return err;
+    try resolvePreflightFailures(&ctx, &sessions[0]);
 }
 
-fn preflightWorker(ctx: *SharedCtx, next: *std.atomic.Value(usize)) void {
-    var session = nntp.makeSession(
-        ctx.allocator,
-        ctx.io,
-        ctx.cfg.nntp_host,
-        ctx.cfg.nntp_port,
-        ctx.cfg.nntp_user,
-        ctx.cfg.nntp_pass,
-        ctx.ca_store,
-        ctx.cfg.nntp_timeout_seconds,
-        ctx.control,
-    );
-    defer session.deinit();
-    var connected = false;
+fn preflightWorker(ctx: *SharedCtx, session: *nntp.Session, next: *std.atomic.Value(usize)) void {
     while (!ctx.canceled.load(.acquire)) {
         if (ctx.control.isCanceled()) {
             ctx.canceled.store(true, .release);
@@ -334,10 +345,71 @@ fn preflightWorker(ctx: *SharedCtx, next: *std.atomic.Value(usize)) void {
         }
         const file_index = next.fetchAdd(1, .monotonic);
         if (file_index >= ctx.files.len) break;
-        fetchItemWithSession(ctx, &session, &connected, file_index, 0, true) catch |err| {
+        fetchItemWithSession(ctx, session, file_index, 0, true) catch |err| {
+            if (ctx.files.len > 1 and isRepairableSegmentError(err)) {
+                ctx.manifest[file_index].preflight_err = err;
+                ctx.progress.advanced(ctx.io);
+                continue;
+            }
             recordError(ctx, err);
             return;
         };
+    }
+}
+
+fn hasAnyKnownPar2(manifest: []const FileManifest, files: []const nzb.File) bool {
+    for (manifest, files) |file, nzb_file| {
+        if (file.name.len != 0 and isRepairName(file.name)) return true;
+        if (subjectFileName(nzb_file.subject)) |subj| {
+            if (isRepairName(subj)) return true;
+        }
+    }
+    return false;
+}
+
+fn resolvePreflightFailures(ctx: *SharedCtx, session: *nntp.Session) !void {
+    var has_failures = false;
+    for (ctx.manifest) |file| {
+        if (file.preflight_err != null) {
+            has_failures = true;
+            break;
+        }
+    }
+    if (!has_failures) return;
+
+    var has_par2 = hasAnyKnownPar2(ctx.manifest, ctx.files);
+    for (ctx.manifest, 0..) |*file, file_index| {
+        const preflight_err = file.preflight_err orelse continue;
+        const nzb_file = ctx.files[file_index];
+        if (subjectFileName(nzb_file.subject)) |subj| {
+            if (isRepairName(subj)) {
+                if (file.name.len == 0) file.name = try ctx.allocator.dupe(u8, subj);
+                has_par2 = true;
+                continue;
+            }
+        }
+        if (nzb_file.segments.len > 1) {
+            const limit = if (has_par2) nzb_file.segments.len else @min(nzb_file.segments.len, 2);
+            for (1..limit) |seg_idx| {
+                if (fetchItemWithSession(ctx, session, file_index, seg_idx, true)) |_| {
+                    if (isRepairName(file.name)) has_par2 = true;
+                    break;
+                } else |err| {
+                    if (!isRepairableSegmentError(err)) return err;
+                }
+            }
+        }
+        if (!has_par2) return preflight_err;
+    }
+
+    for (ctx.manifest) |file| {
+        if (file.preflight_err) |err| {
+            if (file.name.len == 0) {
+                if (has_par2) continue;
+                return err;
+            }
+            if (!isRepairName(file.name) and !has_par2) return err;
+        }
     }
 }
 
@@ -351,6 +423,7 @@ fn downloadPhase(
     files: []const nzb.File,
     cfg: anytype,
     ca_store: *nntp.CaStore,
+    sessions: []nntp.Session,
     control: *shutdown.DownloadControl,
     progress: *Progress,
     allow_repairable_errors: bool,
@@ -369,11 +442,11 @@ fn downloadPhase(
         .allow_repairable_errors = allow_repairable_errors,
     };
     var next: std.atomic.Value(usize) = .init(0);
-    const worker_count = @min(items.len, cfg.nntp_connections);
+    const worker_count = @min(items.len, sessions.len);
     var group: std.Io.Group = .init;
     var w: usize = 0;
     while (w < worker_count) : (w += 1) {
-        group.concurrent(io, downloadWorker, .{ &ctx, items, &next }) catch downloadWorker(&ctx, items, &next);
+        group.concurrent(io, downloadWorker, .{ &ctx, &sessions[w], items, &next }) catch downloadWorker(&ctx, &sessions[w], items, &next);
     }
     try group.await(io);
     if (ctx.first_error) |err| return err;
@@ -389,20 +462,7 @@ fn isRepairableSegmentError(err: anyerror) bool {
         err == error.MissingYpart;
 }
 
-fn downloadWorker(ctx: *SharedCtx, items: []const WorkItem, next: *std.atomic.Value(usize)) void {
-    var session = nntp.makeSession(
-        ctx.allocator,
-        ctx.io,
-        ctx.cfg.nntp_host,
-        ctx.cfg.nntp_port,
-        ctx.cfg.nntp_user,
-        ctx.cfg.nntp_pass,
-        ctx.ca_store,
-        ctx.cfg.nntp_timeout_seconds,
-        ctx.control,
-    );
-    defer session.deinit();
-    var connected = false;
+fn downloadWorker(ctx: *SharedCtx, session: *nntp.Session, items: []const WorkItem, next: *std.atomic.Value(usize)) void {
     while (!ctx.canceled.load(.acquire)) {
         if (ctx.control.isCanceled()) {
             ctx.canceled.store(true, .release);
@@ -411,7 +471,7 @@ fn downloadWorker(ctx: *SharedCtx, items: []const WorkItem, next: *std.atomic.Va
         const idx = next.fetchAdd(1, .monotonic);
         if (idx >= items.len) break;
         const item = items[idx];
-        fetchItemWithSession(ctx, &session, &connected, item.file_index, item.segment_index, false) catch |err| {
+        fetchItemWithSession(ctx, session, item.file_index, item.segment_index, false) catch |err| {
             if (ctx.allow_repairable_errors and isRepairableSegmentError(err)) {
                 std.log.warn("file {d} segment {d} is unavailable or damaged ({t})", .{ item.file_index + 1, item.segment_index + 1, err });
                 ctx.progress.advanced(ctx.io);
@@ -434,7 +494,6 @@ fn recordError(ctx: *SharedCtx, err: anyerror) void {
 fn fetchItemWithSession(
     ctx: *SharedCtx,
     session: *nntp.Session,
-    connected: *bool,
     file_index: usize,
     segment_index: usize,
     is_preflight: bool,
@@ -442,7 +501,7 @@ fn fetchItemWithSession(
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         try checkCanceled(ctx.control);
-        fetchItemOnce(ctx, session, connected, file_index, segment_index, is_preflight) catch |err| {
+        fetchItemOnce(ctx, session, file_index, segment_index, is_preflight) catch |err| {
             if (err == error.MissingArticle) {
                 if (attempt + 1 >= session.endpointCount()) return err;
                 std.log.warn("segment {d}/{d} provider endpoint failover {d}/{d} after {t}", .{ file_index + 1, segment_index + 1, attempt + 2, session.endpointCount(), err });
@@ -451,7 +510,6 @@ fn fetchItemWithSession(
                 std.log.warn("segment {d}/{d} retry {d}/3 after {t}", .{ file_index + 1, segment_index + 1, attempt + 1, err });
             }
             session.abort();
-            connected.* = false;
             if (err != error.MissingArticle) try ctx.control.wait(@as(i64, 1) << @intCast(attempt));
             continue;
         };
@@ -483,7 +541,6 @@ fn watchDownload(progress: *Progress, control: *shutdown.DownloadControl, job_id
 fn fetchItemOnce(
     ctx: *SharedCtx,
     session: *nntp.Session,
-    connected: *bool,
     file_index: usize,
     segment_index: usize,
     is_preflight: bool,
@@ -504,9 +561,8 @@ fn fetchItemOnce(
     var decoder = yenc.Decoder.init(ctx.allocator, &file_writer.interface, ctx.cfg.max_artifact_bytes);
     defer decoder.deinit();
 
-    if (!connected.*) {
+    if (session.tls == null) {
         try session.connect();
-        connected.* = true;
     }
     try session.requestBody(segment.message_id);
     var line_buffer: [64 * 1024 + 2]u8 = undefined;
@@ -530,25 +586,27 @@ fn fetchItemOnce(
         if (meta.total != expected_total) return error.YencPartMismatch;
     }
     try file_writer.interface.flush();
-    try out_file.sync(ctx.io);
 
     validateDecodedPartSize(meta) catch |err| {
         std.log.err("segment {d}/{d} decoded size mismatch: begin={d} end={d} decoded={d}", .{ file_index + 1, segment_index + 1, meta.begin, meta.end, meta.decoded });
         return err;
     };
 
-    if (!is_preflight and ctx.manifest[file_index].size != meta.size) {
-        std.log.err("file {d} segment {d} size changed: expected {d}, received {d}", .{ file_index + 1, segment_index + 1, ctx.manifest[file_index].size, meta.size });
-        return error.InconsistentYencMetadata;
-    }
-
-    try ctx.root_dir.rename(tmp_path, ctx.root_dir, part_path, ctx.io);
-    if (is_preflight) {
-        const name = subjectFileName(ctx.files[file_index].subject) orelse meta.name;
-        if (ctx.manifest[file_index].name.len != 0) ctx.allocator.free(ctx.manifest[file_index].name);
-        ctx.manifest[file_index].name = try ctx.allocator.dupe(u8, name);
-        ctx.manifest[file_index].size = meta.size;
-        std.log.info("file {d} metadata: {s}, {d} bytes, {d} segments", .{ file_index + 1, name, meta.size, ctx.files[file_index].segments.len });
+    {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+        if (!is_preflight and ctx.manifest[file_index].size != 0 and ctx.manifest[file_index].size != meta.size) {
+            std.log.err("file {d} segment {d} size changed: expected {d}, received {d}", .{ file_index + 1, segment_index + 1, ctx.manifest[file_index].size, meta.size });
+            return error.InconsistentYencMetadata;
+        }
+        try ctx.root_dir.rename(tmp_path, ctx.root_dir, part_path, ctx.io);
+        if (is_preflight or ctx.manifest[file_index].size == 0) {
+            const name = subjectFileName(ctx.files[file_index].subject) orelse meta.name;
+            if (ctx.manifest[file_index].name.len != 0) ctx.allocator.free(ctx.manifest[file_index].name);
+            ctx.manifest[file_index].name = try ctx.allocator.dupe(u8, name);
+            ctx.manifest[file_index].size = meta.size;
+            std.log.info("file {d} metadata: {s}, {d} bytes, {d} segments", .{ file_index + 1, name, meta.size, ctx.files[file_index].segments.len });
+        }
     }
     if (ctx.manifest[file_index].parts[segment_index].rel_path.len != 0)
         ctx.allocator.free(ctx.manifest[file_index].parts[segment_index].rel_path);
@@ -588,9 +646,14 @@ fn allPartsPresent(parts: []const Part) bool {
     return true;
 }
 
-fn hasCompleteRepairFile(manifest: []const FileManifest, included: []const bool) bool {
+fn hasAnyPartPresent(parts: []const Part) bool {
+    for (parts) |part| if (part.rel_path.len != 0) return true;
+    return false;
+}
+
+fn hasUsableRepairFile(manifest: []const FileManifest, included: []const bool) bool {
     for (manifest, included) |file, keep| {
-        if (!keep and allPartsPresent(file.parts)) return true;
+        if (!keep and file.name.len != 0 and file.size > 0 and hasAnyPartPresent(file.parts)) return true;
     }
     return false;
 }
@@ -607,9 +670,13 @@ fn assembleRepairFiles(
 ) ![]const u8 {
     var repair_name: ?[]const u8 = null;
     for (manifest, included) |file, keep| {
-        if (keep or !allPartsPresent(file.parts)) continue;
-        try validatePartRanges(file.parts, file.size);
-        try assembleFile(allocator, io, root_dir, output_root, file, control, progress);
+        if (keep or file.name.len == 0 or file.size == 0 or !hasAnyPartPresent(file.parts)) continue;
+        if (allPartsPresent(file.parts)) {
+            try validatePartRanges(file.parts, file.size);
+            try assembleFile(allocator, io, root_dir, output_root, file, control, progress);
+        } else {
+            try assembleDamagedFile(allocator, io, root_dir, output_root, file, control, progress);
+        }
         if (repair_name == null or !isRecoveryName(file.name)) repair_name = file.name;
     }
     return repair_name orelse error.InsufficientPar2Data;
@@ -642,8 +709,8 @@ fn assembleDamagedFile(
         var offset: u64 = 0;
         while (offset < size) {
             const chunk: usize = @intCast(@min(size - offset, buffer.len));
-            const read = try preadChunk(input.handle, buffer[0..chunk], offset);
-            try pwriteAll(out.handle, buffer[0..read], part.begin - 1 + offset);
+            const read = try preadChunk(input, io, buffer[0..chunk], offset);
+            try pwriteAll(out, io, buffer[0..read], part.begin - 1 + offset);
             offset += read;
         }
         progress.touch(io);
@@ -665,6 +732,9 @@ fn cleanupRepairFiles(
             const par_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, file.name }) catch continue;
             defer allocator.free(par_path);
             root_dir.deleteFile(io, par_path) catch {};
+            const par_bak = std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, file.name }) catch continue;
+            defer allocator.free(par_bak);
+            root_dir.deleteFile(io, par_bak) catch {};
         } else {
             const bak_path = std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, file.name }) catch continue;
             defer allocator.free(bak_path);
@@ -673,31 +743,14 @@ fn cleanupRepairFiles(
     }
 }
 
-fn preadChunk(fd: std.posix.fd_t, buffer: []u8, offset: u64) !usize {
-    while (true) {
-        const rc = std.os.linux.pread(fd, buffer.ptr, buffer.len, @intCast(offset));
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) {
-            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
-            return error.DecodedPartChanged;
-        }
-        if (signed == 0) return error.DecodedPartChanged;
-        return @intCast(signed);
-    }
+fn preadChunk(file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) !usize {
+    const count = file.readPositional(io, &.{buffer}, offset) catch return error.DecodedPartChanged;
+    if (count == 0) return error.DecodedPartChanged;
+    return count;
 }
 
-fn pwriteAll(fd: std.posix.fd_t, bytes: []const u8, start_offset: u64) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const rc = std.os.linux.pwrite(fd, bytes[written..].ptr, bytes.len - written, @intCast(start_offset + written));
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) {
-            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
-            return error.DecodedPartChanged;
-        }
-        if (signed == 0) return error.DecodedPartChanged;
-        written += @intCast(signed);
-    }
+fn pwriteAll(file: std.Io.File, io: std.Io, bytes: []const u8, start_offset: u64) !void {
+    file.writePositionalAll(io, bytes, start_offset) catch return error.DecodedPartChanged;
 }
 
 fn repairWithPar2(
@@ -714,7 +767,7 @@ fn repairWithPar2(
     const remaining = control.deadline_seconds - std.Io.Clock.real.now(io).toSeconds();
     if (remaining <= 0) return error.Timeout;
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "/usr/bin/par2", "repair", "-q", "-p", "--", repair_name },
+        .argv = &.{ "/usr/bin/par2", "repair", "-q", "--", repair_name },
         .cwd = .{ .dir = output_dir },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
@@ -732,6 +785,13 @@ fn repairWithPar2(
     return error.Par2RepairFailed;
 }
 
+fn expectedFileCrc(parts: []const Part) ?u32 {
+    for (parts) |part| {
+        if (part.crc32) |crc| return crc;
+    }
+    return null;
+}
+
 fn validateRepairedFile(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -744,14 +804,21 @@ fn validateRepairedFile(
     var file = try root_dir.openFile(io, path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
     defer file.close(io);
     if (try file.length(io) != output.size) return error.Par2RepairFailed;
-    const expected: ?u32 = if (output.parts.len > 0) output.parts[output.parts.len - 1].crc32 else null;
+    const expected = expectedFileCrc(output.parts);
+    if (!allPartsPresent(output.parts) and expected == null) {
+        const bak_path = try std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, output.name });
+        defer allocator.free(bak_path);
+        var bak = root_dir.openFile(io, bak_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true }) catch
+            return error.Par2RepairFailed;
+        bak.close(io);
+    }
     if (expected) |crc| {
         var actual: std.hash.Crc32 = .init();
         var buffer: [64 * 1024]u8 = undefined;
         var offset: u64 = 0;
         while (offset < output.size) {
             const chunk: usize = @intCast(@min(output.size - offset, buffer.len));
-            const read = preadChunk(file.handle, buffer[0..chunk], offset) catch return error.Par2RepairFailed;
+            const read = preadChunk(file, io, buffer[0..chunk], offset) catch return error.Par2RepairFailed;
             actual.update(buffer[0..read]);
             offset += read;
         }
@@ -782,7 +849,7 @@ fn assembleFile(
     var out_buffer: [64 * 1024]u8 = undefined;
     var writer = out.writer(io, &out_buffer);
     var reader_buf: [64 * 1024]u8 = undefined;
-    const expected_crc: ?u32 = if (output.parts.len > 0) output.parts[output.parts.len - 1].crc32 else null;
+    const expected_crc = expectedFileCrc(output.parts);
     var file_crc: std.hash.Crc32 = .init();
     for (output.parts) |part| {
         try checkCanceled(control);
@@ -793,7 +860,7 @@ fn assembleFile(
         var off: u64 = 0;
         while (remaining > 0) {
             const chunk: usize = @intCast(@min(remaining, reader_buf.len));
-            const n = try preadChunk(input.handle, reader_buf[0..chunk], off);
+            const n = try preadChunk(input, io, reader_buf[0..chunk], off);
             file_crc.update(reader_buf[0..n]);
             try writer.interface.writeAll(reader_buf[0..n]);
             remaining -= n;
@@ -981,7 +1048,7 @@ test "cleanupRepairFiles removes par2 and backup files" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "out/repair.vol00+01.PAR2", .{}));
 }
 
-test "identifies repairable segment errors and complete repair files" {
+test "identifies repairable segment errors and usable repair files" {
     try std.testing.expect(isRepairableSegmentError(error.MissingArticle));
     try std.testing.expect(isRepairableSegmentError(error.YencCrcMismatch));
     try std.testing.expect(isRepairableSegmentError(error.InconsistentSegmentSize));
@@ -994,11 +1061,45 @@ test "identifies repairable segment errors and complete repair files" {
         .{ .name = "repair.par2", .size = 10, .parts = @constCast(&parts_missing) },
     };
     const included = [_]bool{ true, false };
-    try std.testing.expect(!hasCompleteRepairFile(&manifest_incomplete, &included));
+    try std.testing.expect(!hasUsableRepairFile(&manifest_incomplete, &included));
 
-    const manifest_complete = [_]FileManifest{
-        .{ .name = "payload.bin", .size = 10, .parts = @constCast(&parts_ok) },
-        .{ .name = "repair.par2", .size = 10, .parts = @constCast(&parts_ok) },
+    const parts_partial = [_]Part{
+        .{ .begin = 0, .end = 0, .rel_path = "" },
+        .{ .begin = 11, .end = 20, .rel_path = "1/1.part" },
     };
-    try std.testing.expect(hasCompleteRepairFile(&manifest_complete, &included));
+    const manifest_partial = [_]FileManifest{
+        .{ .name = "payload.bin", .size = 10, .parts = @constCast(&parts_ok) },
+        .{ .name = "repair.vol00+01.par2", .size = 20, .parts = @constCast(&parts_partial) },
+    };
+    try std.testing.expect(hasUsableRepairFile(&manifest_partial, &included));
+}
+
+test "validateRepairedFile requires backup proof when damaged payload lacks full-file crc" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "out");
+    {
+        var file = try tmp.dir.createFile(io, "out/payload.bin", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "0123456789");
+    }
+    const damaged_parts = [_]Part{
+        .{ .begin = 1, .end = 5, .rel_path = "0/0.part", .crc32 = null },
+        .{ .begin = 0, .end = 0, .rel_path = "", .crc32 = null },
+    };
+    const output = FileManifest{
+        .name = "payload.bin",
+        .size = 10,
+        .parts = @constCast(&damaged_parts),
+    };
+    try std.testing.expectError(
+        error.Par2RepairFailed,
+        validateRepairedFile(std.testing.allocator, io, tmp.dir, "out", output),
+    );
+    {
+        var bak = try tmp.dir.createFile(io, "out/payload.bin.1", .{});
+        bak.close(io);
+    }
+    try validateRepairedFile(std.testing.allocator, io, tmp.dir, "out", output);
 }

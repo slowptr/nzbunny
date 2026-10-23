@@ -467,8 +467,10 @@ fn download(
         return respondText(request, .not_found, "The download file is not available.");
     if (stat.kind != .file or stat.size > context.cfg.max_artifact_bytes)
         return respondText(request, .not_found, "The download file is not available.");
-    const safe_name = try safeDownloadName(allocator, downloadName(job));
+    const safe_name = try downloadName(allocator, job);
+    defer allocator.free(safe_name);
     const disposition = try std.fmt.allocPrint(allocator, "attachment; filename=\"{s}\"", .{safe_name});
+    defer allocator.free(disposition);
     const content_type = if (std.mem.endsWith(u8, safe_name, ".zip")) "application/zip" else "application/octet-stream";
     var response_buffer: [64 * 1024]u8 = undefined;
     var response = try request.respondStreaming(&response_buffer, .{
@@ -722,13 +724,28 @@ fn validHex(value: []const u8, length: usize) bool {
     return true;
 }
 
-fn downloadName(job: Job) []const u8 {
-    const path = if (std.mem.endsWith(u8, job.artifact_path, ".zip"))
-        job.artifact_path
-    else
-        job.download_path;
-    const last = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
-    return path[last + 1 ..];
+fn downloadName(allocator: std.mem.Allocator, job: Job) ![]const u8 {
+    if (std.mem.endsWith(u8, job.artifact_path, ".zip")) {
+        const base = if (std.mem.lastIndexOfScalar(u8, job.filename, '/')) |last|
+            job.filename[last + 1 ..]
+        else
+            job.filename;
+        const stem = if (base.len > 4 and std.ascii.endsWithIgnoreCase(base, ".nzb"))
+            base[0 .. base.len - 4]
+        else
+            base;
+        if (stem.len > 0) {
+            const raw_zip = try std.fmt.allocPrint(allocator, "{s}.zip", .{stem});
+            defer allocator.free(raw_zip);
+            return safeDownloadName(allocator, raw_zip);
+        }
+        const path = job.artifact_path;
+        const name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |last| path[last + 1 ..] else path;
+        return safeDownloadName(allocator, name);
+    }
+    const path = job.download_path;
+    const name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |last| path[last + 1 ..] else path;
+    return safeDownloadName(allocator, name);
 }
 
 fn safeDownloadName(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -803,6 +820,23 @@ test "download names cannot inject response headers" {
     const name = try safeDownloadName(std.testing.allocator, "result\r\nx-review: injected.bin");
     defer std.testing.allocator.free(name);
     try std.testing.expectEqualStrings("result__x-review__injected.bin", name);
+}
+
+test "downloadName derives zip name from nzb stem and preserves single-file names" {
+    var zip_job = std.mem.zeroes(Job);
+    zip_job.filename = "Ubuntu-24.04.NZB";
+    zip_job.artifact_path = ".nzbunny-artifacts/0123456789abcdef0123456789abcdef.zip";
+    const zip_name = try downloadName(std.testing.allocator, zip_job);
+    defer std.testing.allocator.free(zip_name);
+    try std.testing.expectEqualStrings("Ubuntu-24.04.zip", zip_name);
+
+    var file_job = std.mem.zeroes(Job);
+    file_job.filename = "sample.nzb";
+    file_job.download_path = ".nzbunny-downloads/0123/test_direct.bin";
+    file_job.artifact_path = ".nzbunny-artifacts/0123456789abcdef0123456789abcdef";
+    const file_name = try downloadName(std.testing.allocator, file_job);
+    defer std.testing.allocator.free(file_name);
+    try std.testing.expectEqualStrings("test_direct.bin", file_name);
 }
 
 test "forwarded addresses require a trusted direct peer" {

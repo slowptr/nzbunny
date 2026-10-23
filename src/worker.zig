@@ -208,7 +208,6 @@ fn processPending(
     defer document.deinit(allocator);
     if (!try db.beginProcessing(io, job.id, now)) return;
     active_progress.start(io, 0);
-    active_progress.setPhase(io, .parsing);
     active_job_hash.store(jobHash(job.id), .release);
     defer active_job_hash.store(0, .release);
     std.log.info("job {s} started: {s}", .{ job.id, job.filename });
@@ -225,14 +224,7 @@ fn processPending(
             provider_ready.store(false, .release);
             shutdown.wake_worker.store(false, .release);
         }
-        const message = if (err == error.Canceled)
-            "The download was interrupted by shutdown."
-        else if (err == error.Timeout)
-            "The download exceeded DOWNLOAD_TIMEOUT."
-        else if (nntp.isRetryableProviderFailure(err))
-            "The NNTP provider is unavailable; the job failed after retries."
-        else
-            "The NZB file or downloaded data is not supported.";
+        const message = failureMessage(err);
         try db.fail(io, job.id, message, std.Io.Clock.real.now(io).toSeconds());
         std.log.err("job {s} download failed: {s} ({t})", .{ job.id, message, err });
         return;
@@ -245,6 +237,19 @@ fn processPending(
             finalizers.schedule(finalizing_job) catch {};
         }
     }
+}
+
+fn failureMessage(err: anyerror) []const u8 {
+    if (err == error.Canceled or shutdown.requested.load(.acquire)) return "The download was interrupted by shutdown.";
+    if (err == error.Timeout) return "The download exceeded DOWNLOAD_TIMEOUT.";
+    if (nntp.isRetryableProviderFailure(err)) return "The NNTP provider is unavailable; the job failed after retries.";
+    return switch (err) {
+        error.MissingArticle, error.InsufficientPar2Data => "Required articles are missing on the NNTP provider and could not be repaired.",
+        error.ArtifactTooLarge, error.YencSizeExceedsBudget => "The download exceeds MAX_ARTIFACT_BYTES.",
+        error.SplitArchiveRejected => "Split archives are not supported by the downloader.",
+        error.YencCrcMismatch, error.Par2RepairFailed, error.InconsistentSegmentSize, error.InconsistentYencMetadata => "Downloaded article data is corrupted and could not be repaired.",
+        else => "The NZB file or downloaded data is not supported.",
+    };
 }
 
 fn probeProvider(

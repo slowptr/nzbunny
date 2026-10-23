@@ -31,51 +31,22 @@ pub fn resolveRoot(path: []const u8, out: []u8) ![]const u8 {
     return out[0..result.len];
 }
 
-pub fn resolveContained(root: []const u8, candidate: []const u8, out: []u8) ![]const u8 {
+pub fn relativeToRoot(root: []const u8, candidate: []const u8) ![]const u8 {
     if (candidate.len == 0 or std.mem.findScalar(u8, candidate, 0) != null) return error.InvalidPath;
-    var joined: [c.PATH_MAX]u8 = undefined;
-    const text = if (candidate[0] == '/') candidate else try std.fmt.bufPrint(&joined, "{s}/{s}", .{ root, candidate });
-    var zbuf: [c.PATH_MAX + 1]u8 = undefined;
-    const z = try toZ(text, &zbuf);
-    var resolved: [c.PATH_MAX]u8 = undefined;
-    if (realpath(z.ptr, &resolved) == null) {
-        if (std.c._errno().* == c.ENOENT) return error.PathNotFound;
-        return error.PathNotAccessible;
-    }
-    const result = std.mem.sliceTo(&resolved, 0);
-    if (!inside(root, result)) return error.PathOutsideRoot;
-    if (result.len > out.len) return error.NameTooLong;
-    @memcpy(out[0..result.len], result);
-    return out[0..result.len];
-}
-
-pub fn rejectSymlinks(root: []const u8, candidate: []const u8) !void {
-    var joined: [c.PATH_MAX]u8 = undefined;
-    const path = if (candidate.len > 0 and candidate[0] == '/')
-        candidate
-    else
-        try std.fmt.bufPrint(&joined, "{s}/{s}", .{ root, candidate });
-    if (!inside(root, path)) return error.PathOutsideRoot;
-    var current: [c.PATH_MAX]u8 = undefined;
-    @memcpy(current[0..root.len], root);
-    var used = root.len;
-    var parts = std.mem.splitScalar(u8, path[root.len..], '/');
+    const rel = if (candidate[0] == '/') blk: {
+        if (!inside(root, candidate)) return error.PathOutsideRoot;
+        if (std.mem.eql(u8, root, candidate)) return error.RefuseRootRemoval;
+        break :blk candidate[root.len + 1 ..];
+    } else candidate;
+    var has_component = false;
+    var parts = std.mem.splitScalar(u8, rel, '/');
     while (parts.next()) |part| {
         if (part.len == 0) continue;
-        if (used + 1 + part.len >= current.len) return error.NameTooLong;
-        current[used] = '/';
-        used += 1;
-        @memcpy(current[used .. used + part.len], part);
-        used += part.len;
-        var zbuf: [c.PATH_MAX + 1]u8 = undefined;
-        const z = try toZ(current[0..used], &zbuf);
-        var stat: c.struct_stat = undefined;
-        if (c.lstat(z.ptr, &stat) != 0) {
-            if (std.c._errno().* == c.ENOENT) return error.PathNotFound;
-            return error.PathNotAccessible;
-        }
-        if ((stat.st_mode & c.S_IFMT) == c.S_IFLNK) return error.SymbolicLinkRejected;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.PathOutsideRoot;
+        has_component = true;
     }
+    if (!has_component) return error.InvalidPath;
+    return rel;
 }
 
 pub fn inside(root: []const u8, candidate: []const u8) bool {
@@ -95,4 +66,15 @@ test "path containment uses component boundaries" {
     try std.testing.expect(inside("/downloads", "/downloads"));
     try std.testing.expect(!inside("/downloads", "/downloads-other/item"));
     try std.testing.expect(!inside("/downloads", "/tmp/item"));
+}
+
+test "relativeToRoot normalizes paths and rejects traversal" {
+    try std.testing.expectEqualStrings("item/file.bin", try relativeToRoot("/downloads", "/downloads/item/file.bin"));
+    try std.testing.expectEqualStrings("item/file.bin", try relativeToRoot("/downloads", "item/file.bin"));
+    try std.testing.expectError(error.RefuseRootRemoval, relativeToRoot("/downloads", "/downloads"));
+    try std.testing.expectError(error.PathOutsideRoot, relativeToRoot("/downloads", "/other/file.bin"));
+    try std.testing.expectError(error.PathOutsideRoot, relativeToRoot("/downloads", "../escape"));
+    try std.testing.expectError(error.PathOutsideRoot, relativeToRoot("/downloads", "a/./b"));
+    try std.testing.expectError(error.InvalidPath, relativeToRoot("/downloads", ""));
+    try std.testing.expectError(error.InvalidPath, relativeToRoot("/downloads", "/downloads///"));
 }

@@ -54,6 +54,10 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+pub fn initParser() void {
+    c.xmlInitParser();
+}
+
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Document {
     return parseWithDiagnostic(allocator, bytes, null);
 }
@@ -64,13 +68,6 @@ pub const Diagnostic = struct {
 };
 
 pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic) ParseError!Document {
-    if (containsOutsideMarkup(bytes, "<!entity")) {
-        return error.InternalEntityRejected;
-    }
-    if (containsEntityReference(bytes)) {
-        return error.EntityReferenceRejected;
-    }
-
     const options = c.XML_PARSE_NONET | c.XML_PARSE_NOERROR | c.XML_PARSE_NOWARNING;
     const reader = c.xmlReaderForMemory(
         @ptrCast(bytes.ptr),
@@ -117,6 +114,7 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         if (rc == 0) break;
         if (rc < 0) {
             setDiag(diag, reader);
+            if (containsOutsideMarkup(bytes, "<!entity")) return error.InternalEntityRejected;
             if (containsEntityReference(bytes)) return error.EntityReferenceRejected;
             return error.NzbParseFailed;
         }
@@ -131,9 +129,15 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         }
         if (node_type == c.XML_READER_TYPE_DOCUMENT_TYPE) {
             const value = xmlText(c.xmlTextReaderConstValue(reader));
-            if (std.ascii.indexOfIgnoreCase(value, "<!entity") != null) {
+            if (std.ascii.indexOfIgnoreCase(value, "<!entity") != null or
+                containsOutsideMarkup(bytes, "<!entity"))
+            {
                 setDiag(diag, reader);
                 return error.InternalEntityRejected;
+            }
+            if (containsEntityReference(bytes)) {
+                setDiag(diag, reader);
+                return error.EntityReferenceRejected;
             }
             continue;
         }

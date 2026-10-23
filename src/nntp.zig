@@ -72,6 +72,7 @@ pub const Session = struct {
     stream_reader: ?std.Io.net.Stream.Reader = null,
     stream_writer: ?std.Io.net.Stream.Writer = null,
     tls: ?std.crypto.tls.Client = null,
+    body_deadline: ?i64 = null,
     read_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     write_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
     tls_read_buffer: [std.crypto.tls.Client.min_buffer_len]u8 = undefined,
@@ -105,7 +106,12 @@ pub const Session = struct {
         try self.sendParts("BODY <", message_id, ">\r\n");
         const status = try self.readStatus();
         switch (status.classifyBody()) {
-            .ok => return,
+            .ok => {
+                const seconds = try self.operationTimeoutSeconds();
+                const now = std.Io.Clock.real.now(self.io).toSeconds();
+                self.body_deadline = std.math.add(i64, now, seconds) catch null;
+                return;
+            },
             .missing_article => return error.MissingArticle,
             .provider_transient => return error.NntpTransientResponse,
             .auth_required => return error.PermanentNntpResponse,
@@ -115,7 +121,25 @@ pub const Session = struct {
     }
 
     pub fn readBodyLine(self: *Session, buffer: []u8) !BodyLine {
-        _ = try self.operationTimeoutSeconds();
+        if (self.control) |control| {
+            if (control.isTimedOut()) return error.Timeout;
+            if (control.isCanceled()) return error.Canceled;
+        }
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        if (self.control) |control| {
+            if (now >= control.deadline_seconds) {
+                control.timeout();
+                return error.Timeout;
+            }
+        }
+        if (self.body_deadline) |deadline| {
+            if (now >= deadline) {
+                self.abort();
+                return error.NntpOperationTimeout;
+            }
+        } else {
+            _ = try self.operationTimeoutSeconds();
+        }
         var len: usize = 0;
         var prev_was_cr = false;
         while (true) {
@@ -134,7 +158,10 @@ pub const Session = struct {
             }
         }
         const raw = buffer[0..len];
-        if (std.mem.eql(u8, raw, ".")) return .end;
+        if (std.mem.eql(u8, raw, ".")) {
+            self.body_deadline = null;
+            return .end;
+        }
         if (std.mem.startsWith(u8, raw, "..")) return .{ .line = raw[1..] };
         return .{ .line = raw };
     }
@@ -160,26 +187,24 @@ pub const Session = struct {
         self.stream = null;
         self.stream_reader = null;
         self.stream_writer = null;
+        self.body_deadline = null;
         self.registered = false;
     }
 
     fn connectTransport(self: *Session) !void {
         if (self.endpoint_count == 0) try self.resolveEndpoints();
+        const timeout_seconds = try self.operationTimeoutSeconds();
         var attempts: usize = 0;
-        var last_error: ?std.Io.net.IpAddress.ConnectError = null;
+        var last_error: ?anyerror = null;
         const stream = while (attempts < self.endpoint_count) : (attempts += 1) {
             const index = self.endpoint_index % self.endpoint_count;
             self.endpoint_index +%= 1;
-            break self.endpoints[index].connect(self.io, .{
-                .mode = .stream,
-                .timeout = .none,
-            }) catch |err| {
+            break connectEndpointWithTimeout(&self.endpoints[index], timeout_seconds) catch |err| {
                 last_error = err;
                 continue;
             };
         } else return last_error orelse error.UnknownHostName;
         self.stream = stream;
-        try self.applySocketTimeout();
         if (self.control) |control| {
             control.register(stream) catch |err| {
                 self.stream = null;
@@ -198,10 +223,35 @@ pub const Session = struct {
             error.Timeout, error.Canceled => return err,
             else => return error.NntpOperationTimeout,
         };
-        var tv: std.os.linux.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
+        try setFdTimeouts(stream.socket.handle, seconds);
+    }
+
+    fn setFdTimeouts(fd: std.posix.fd_t, seconds: i64) !void {
+        var tv: std.posix.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
         const tv_bytes: [*]const u8 = @ptrCast(&tv);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
+    }
+
+    fn connectEndpointWithTimeout(endpoint: *const std.Io.net.IpAddress, timeout_seconds: i64) !std.Io.net.Stream {
+        const family = std.Io.Threaded.posixAddressFamily(endpoint);
+        const rc = std.posix.system.socket(family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        if (std.posix.errno(rc) != .SUCCESS) return error.NntpTransportFailure;
+        const fd: std.posix.fd_t = @intCast(rc);
+        errdefer _ = std.posix.system.close(fd);
+        try setFdTimeouts(fd, timeout_seconds);
+        var storage: std.Io.Threaded.PosixAddress = undefined;
+        var addr_len = std.Io.Threaded.addressToPosix(endpoint, &storage);
+        while (true) {
+            switch (std.posix.errno(std.posix.system.connect(fd, &storage.any, addr_len))) {
+                .SUCCESS => break,
+                .INTR => continue,
+                .AGAIN, .INPROGRESS, .TIMEDOUT => return error.NntpOperationTimeout,
+                else => return error.ConnectionRefused,
+            }
+        }
+        _ = std.posix.system.getsockname(fd, &storage.any, &addr_len);
+        return .{ .socket = .{ .handle = fd, .address = std.Io.Threaded.addressFromPosix(&storage) } };
     }
 
     fn resolveEndpoints(self: *Session) !void {
