@@ -143,7 +143,11 @@ pub const Session = struct {
         var len: usize = 0;
         var prev_was_cr = false;
         while (true) {
-            const byte = self.reader().takeByte() catch |err| return self.normalizeTransportError(err);
+            const byte = self.reader().takeByte() catch |err| {
+                const normalized = self.normalizeTransportError(err);
+                if (normalized == error.NntpOperationTimeout) self.abort();
+                return normalized;
+            };
             if (byte == '\n') {
                 if (!prev_was_cr) return error.InvalidNntpFraming;
                 break;
@@ -329,23 +333,16 @@ pub const Session = struct {
     const Status = Response;
 
     fn readStatus(self: *Session) !Status {
-        const line = try self.readLine(self.allocator, 8 * 1024);
-        defer self.allocator.free(line);
-        return parseStatusLine(line);
-    }
-
-    fn readLine(self: *Session, allocator: std.mem.Allocator, max: usize) ![]u8 {
-        var result: ?[]u8 = null;
-        try self.runWithDeadline(readLineStage, .{ self, allocator, max, &result });
+        var result: ?Status = null;
+        try self.runWithDeadline(readStatusStage, .{ self, &result });
         return result orelse error.NntpReadFailed;
     }
 
-    fn readLineStage(self: *Session, allocator: std.mem.Allocator, max: usize, result: *?[]u8) !void {
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
+    fn readStatusStage(self: *Session, result: *?Status) !void {
+        var buffer: [8 * 1024]u8 = undefined;
+        var len: usize = 0;
         var prev_was_cr = false;
         while (true) {
-            if (out.writer.end >= max) return error.NntpLineTooLong;
             const byte = self.reader().takeByte() catch |err| return self.normalizeTransportError(err);
             if (byte == '\n') {
                 if (!prev_was_cr) return error.InvalidNntpFraming;
@@ -355,10 +352,12 @@ pub const Session = struct {
             if (byte == '\r') {
                 prev_was_cr = true;
             } else {
-                try out.writer.writeByte(byte);
+                if (len >= buffer.len) return error.NntpLineTooLong;
+                buffer[len] = byte;
+                len += 1;
             }
         }
-        result.* = try allocator.dupe(u8, out.writer.buffered());
+        result.* = try parseStatusLine(buffer[0..len]);
     }
 
     fn runWithDeadline(self: *Session, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) !void {
@@ -383,8 +382,10 @@ pub const Session = struct {
                 timed_out = true;
                 if (self.stream) |stream| stream.shutdown(self.io, .both) catch {};
                 if (self.control) |control| {
-                    if (std.Io.Clock.real.now(self.io).toSeconds() >= control.deadline_seconds)
+                    if (std.Io.Clock.real.now(self.io).toSeconds() >= control.deadline_seconds) {
                         control.timeout();
+                        return error.Timeout;
+                    }
                 }
                 return error.NntpOperationTimeout;
             },
@@ -400,7 +401,12 @@ pub const Session = struct {
         const configured_deadline = std.math.add(i64, now, self.timeout_seconds) catch return error.NntpOperationTimeout;
         const deadline = if (self.control) |control| @min(configured_deadline, control.deadline_seconds) else configured_deadline;
         if (now >= deadline) {
-            if (self.control) |control| control.timeout();
+            if (self.control) |control| {
+                if (now >= control.deadline_seconds) {
+                    control.timeout();
+                    return error.Timeout;
+                }
+            }
             return error.NntpOperationTimeout;
         }
         return deadline - now;
@@ -411,12 +417,17 @@ pub const Session = struct {
             if (control.isTimedOut()) return error.Timeout;
             if (control.isCanceled()) return error.Canceled;
         }
-        if (err == error.ReadFailed or err == error.WriteFailed or err == error.EndOfStream) {
-            if (self.stream_reader) |stream_reader| if (stream_reader.err) |stream_err| return stream_err;
-            if (self.stream_writer) |stream_writer| if (stream_writer.err) |stream_err| return stream_err;
-            return error.NntpTransportFailure;
-        }
-        return err;
+        const raw = blk: {
+            if (err == error.ReadFailed or err == error.WriteFailed or err == error.EndOfStream) {
+                if (self.stream_reader) |stream_reader| if (stream_reader.err) |stream_err| break :blk stream_err;
+                if (self.stream_writer) |stream_writer| if (stream_writer.err) |stream_err| break :blk stream_err;
+                return error.NntpTransportFailure;
+            }
+            break :blk err;
+        };
+        if (raw == error.WouldBlock or raw == error.ConnectionTimedOut) return error.NntpOperationTimeout;
+        if (raw == error.BrokenPipe or raw == error.SocketNotConnected) return error.NntpTransportFailure;
+        return raw;
     }
 
     fn reader(self: *Session) *std.Io.Reader {
@@ -456,9 +467,12 @@ pub fn isRetryableProviderFailure(err: anyerror) bool {
     return err == error.NntpOperationTimeout or
         err == error.NntpTransportFailure or
         err == error.NntpTransientResponse or
-        err == error.Timeout or
         err == error.ConnectionRefused or
         err == error.ConnectionResetByPeer or
+        err == error.ConnectionTimedOut or
+        err == error.WouldBlock or
+        err == error.BrokenPipe or
+        err == error.SocketNotConnected or
         err == error.NetworkUnreachable or
         err == error.HostUnreachable or
         err == error.NetworkDown or
@@ -492,7 +506,18 @@ pub fn makeSession(
 
 test "classifies dropped connections as retryable transport failures" {
     try std.testing.expect(isRetryableProviderFailure(error.NntpTransportFailure));
+    try std.testing.expect(isRetryableProviderFailure(error.NntpOperationTimeout));
+    try std.testing.expect(isRetryableProviderFailure(error.WouldBlock));
+    try std.testing.expect(isRetryableProviderFailure(error.ConnectionTimedOut));
+    try std.testing.expect(!isRetryableProviderFailure(error.Timeout));
     try std.testing.expect(!isRetryableProviderFailure(error.MissingArticle));
+
+    var store: CaStore = .{};
+    var session = makeSession(std.testing.allocator, std.testing.io, "example.test", 563, "u", "p", &store, 1, null);
+    try std.testing.expectEqual(error.NntpOperationTimeout, session.normalizeTransportError(error.WouldBlock));
+    try std.testing.expectEqual(error.NntpOperationTimeout, session.normalizeTransportError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.NntpTransportFailure, session.normalizeTransportError(error.BrokenPipe));
+    try std.testing.expectEqual(error.NntpTransportFailure, session.normalizeTransportError(error.SocketNotConnected));
 }
 
 test "parses valid status lines" {

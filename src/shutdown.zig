@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("config.zig");
 
 pub var requested: std.atomic.Value(bool) = .init(false);
 pub var wake_worker: std.atomic.Value(bool) = .init(false);
@@ -34,7 +35,7 @@ pub const DownloadControl = struct {
     canceled: std.atomic.Value(bool) = .init(false),
     timed_out: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
-    streams: [16]?std.Io.net.Stream = @splat(null),
+    streams: [config.max_nntp_connections]?std.Io.net.Stream = @splat(null),
 
     pub fn init(io: std.Io, deadline_seconds: i64) DownloadControl {
         return .{ .io = io, .deadline_seconds = deadline_seconds };

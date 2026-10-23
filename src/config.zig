@@ -55,6 +55,7 @@ const Defaults = struct {
     const uploads_per_minute = "20";
 };
 
+pub const max_nntp_connections = 16;
 const max_upload_bytes = 64 * 1024 * 1024;
 const max_retention_seconds = 365 * 86400;
 
@@ -86,7 +87,7 @@ fn loadFromMap(allocator: std.mem.Allocator, env: *const std.process.Environ.Map
     const trusted_proxy_cidrs = value(env, "TRUSTED_PROXY_CIDRS", Defaults.trusted_proxy_cidrs);
     try validateCidrs(trusted_proxy_cidrs);
     const nntp_connections = try positiveInt(u32, value(env, "NNTP_CONNECTIONS", Defaults.nntp_connections));
-    if (nntp_connections > 16) return error.InvalidNntpConnections;
+    if (nntp_connections > max_nntp_connections) return error.InvalidNntpConnections;
     const nntp_port = try positiveInt(u16, value(env, "NNTP_PORT", Defaults.nntp_port));
     const port = try positiveInt(u16, value(env, "PORT", Defaults.port));
     const retention_seconds = try retentionDuration(value(env, "RETENTION_TTL", Defaults.retention_ttl));
