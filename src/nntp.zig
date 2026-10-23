@@ -100,6 +100,7 @@ pub const Session = struct {
             return error.InvalidMessageId;
         try validateMessageId(message_id);
         if (self.tls == null) try self.connect();
+        try self.applySocketTimeout();
 
         try self.sendParts("BODY <", message_id, ">\r\n");
         const status = try self.readStatus();
@@ -113,18 +114,28 @@ pub const Session = struct {
         }
     }
 
-    pub fn readBodyLine(self: *Session, allocator: std.mem.Allocator) !BodyLine {
-        const raw = try self.readLine(allocator, 64 * 1024 + 2);
-        errdefer allocator.free(raw);
-        if (std.mem.eql(u8, raw, ".")) {
-            allocator.free(raw);
-            return .end;
+    pub fn readBodyLine(self: *Session, buffer: []u8) !BodyLine {
+        _ = try self.operationTimeoutSeconds();
+        var len: usize = 0;
+        var prev_was_cr = false;
+        while (true) {
+            const byte = self.reader().takeByte() catch |err| return self.normalizeTransportError(err);
+            if (byte == '\n') {
+                if (!prev_was_cr) return error.InvalidNntpFraming;
+                break;
+            }
+            if (prev_was_cr) return error.InvalidNntpFraming;
+            if (byte == '\r') {
+                prev_was_cr = true;
+            } else {
+                if (len >= buffer.len) return error.NntpLineTooLong;
+                buffer[len] = byte;
+                len += 1;
+            }
         }
-        if (std.mem.startsWith(u8, raw, "..")) {
-            const unstuffed = try allocator.dupe(u8, raw[1..]);
-            allocator.free(raw);
-            return .{ .line = unstuffed };
-        }
+        const raw = buffer[0..len];
+        if (std.mem.eql(u8, raw, ".")) return .end;
+        if (std.mem.startsWith(u8, raw, "..")) return .{ .line = raw[1..] };
         return .{ .line = raw };
     }
 
@@ -168,11 +179,7 @@ pub const Session = struct {
             };
         } else return last_error orelse error.UnknownHostName;
         self.stream = stream;
-        const seconds = self.operationTimeoutSeconds() catch return error.NntpOperationTimeout;
-        var tv: std.os.linux.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
-        const tv_bytes: [*]const u8 = @ptrCast(&tv);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
-        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
+        try self.applySocketTimeout();
         if (self.control) |control| {
             control.register(stream) catch |err| {
                 self.stream = null;
@@ -183,6 +190,18 @@ pub const Session = struct {
         }
         self.stream_reader = stream.reader(self.io, &self.read_buffer);
         self.stream_writer = stream.writer(self.io, &self.write_buffer);
+    }
+
+    fn applySocketTimeout(self: *Session) !void {
+        const stream = self.stream orelse return;
+        const seconds = self.operationTimeoutSeconds() catch |err| switch (err) {
+            error.Timeout, error.Canceled => return err,
+            else => return error.NntpOperationTimeout,
+        };
+        var tv: std.os.linux.timeval = .{ .sec = @intCast(seconds), .usec = 0 };
+        const tv_bytes: [*]const u8 = @ptrCast(&tv);
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
+        try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
     }
 
     fn resolveEndpoints(self: *Session) !void {
@@ -272,7 +291,7 @@ pub const Session = struct {
 
     fn readLineStage(self: *Session, allocator: std.mem.Allocator, max: usize, result: *?[]u8) !void {
         var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
+        defer out.deinit();
         var prev_was_cr = false;
         while (true) {
             if (out.writer.end >= max) return error.NntpLineTooLong;
@@ -300,13 +319,18 @@ pub const Session = struct {
         const seconds = try self.operationTimeoutSeconds();
         var outcomes: [2]Outcome = undefined;
         var select = std.Io.Select(Outcome).init(self.io, &outcomes);
-        defer select.cancelDiscard();
+        var timed_out = false;
+        defer {
+            select.cancelDiscard();
+            if (timed_out) self.deinit();
+        }
         try select.concurrent(.operation, function, args);
         try select.concurrent(.timeout, waitForDeadline, .{ self.io, seconds });
         switch (try select.await()) {
             .operation => |result| result catch |err| return self.normalizeTransportError(err),
             .timeout => {
-                self.abort();
+                timed_out = true;
+                if (self.stream) |stream| stream.shutdown(self.io, .both) catch {};
                 if (self.control) |control| {
                     if (std.Io.Clock.real.now(self.io).toSeconds() >= control.deadline_seconds)
                         control.timeout();

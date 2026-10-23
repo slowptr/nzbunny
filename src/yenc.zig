@@ -92,6 +92,7 @@ pub const Decoder = struct {
             return;
         }
         if (!self.in_data or self.meta == null) return;
+        if (self.meta.?.part != 0 and !self.saw_ypart) return error.MissingYpart;
         try self.decodeData(line);
         self.saw_data = true;
     }
@@ -103,6 +104,8 @@ pub const Decoder = struct {
 
     fn decodeData(self: *Decoder, line: []const u8) !void {
         var meta = self.meta.?;
+        var chunk: [256]u8 = undefined;
+        var chunk_len: usize = 0;
         var i: usize = 0;
         while (i < line.len) {
             var byte = line[i];
@@ -113,10 +116,19 @@ pub const Decoder = struct {
                 i += 1;
             }
             byte -%= 42;
-            try self.output.writeByte(byte);
-            self.crc.update(&.{byte});
             meta.decoded = std.math.add(u64, meta.decoded, 1) catch return error.InvalidYencDecodedSize;
             if (meta.decoded > self.budget) return error.InvalidYencDecodedSize;
+            chunk[chunk_len] = byte;
+            chunk_len += 1;
+            if (chunk_len == chunk.len) {
+                try self.output.writeAll(chunk[0..chunk_len]);
+                self.crc.update(chunk[0..chunk_len]);
+                chunk_len = 0;
+            }
+        }
+        if (chunk_len > 0) {
+            try self.output.writeAll(chunk[0..chunk_len]);
+            self.crc.update(chunk[0..chunk_len]);
         }
         self.meta = meta;
     }
@@ -149,7 +161,7 @@ fn parseYbegin(allocator: std.mem.Allocator, line: []const u8) !Part {
     };
 }
 
-fn inclusiveRangeLength(begin: u64, end: u64) !u64 {
+pub fn inclusiveRangeLength(begin: u64, end: u64) !u64 {
     if (begin == 0 or end < begin) return error.InvalidYencRange;
     return std.math.add(u64, end - begin, 1) catch error.InvalidYencRange;
 }
@@ -337,6 +349,15 @@ test "rejects ypart for single-part yenc" {
     defer decoder.deinit();
     try decoder.consumeLine("=ybegin line=128 size=3 name=a.bin");
     try std.testing.expectError(error.YpartInSinglepart, decoder.consumeLine("=ypart begin=1 end=3"));
+}
+
+test "rejects multipart data before ypart" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var decoder = Decoder.init(std.testing.allocator, &out.writer, std.math.maxInt(u64));
+    defer decoder.deinit();
+    try decoder.consumeLine("=ybegin part=1 total=2 line=128 size=3 name=a.bin");
+    try std.testing.expectError(error.MissingYpart, decoder.consumeLine("\x8b"));
 }
 
 test "per-part budget rejects oversized decoded body" {

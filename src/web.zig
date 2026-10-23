@@ -1,5 +1,6 @@
 const std = @import("std");
-const Config = @import("config.zig").Config;
+const config = @import("config.zig");
+const Config = config.Config;
 const Database = @import("database.zig").Database;
 const Job = @import("database.zig").Job;
 const shutdown = @import("shutdown.zig");
@@ -107,7 +108,7 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
         .io = io,
         .db = db,
         .cfg = cfg,
-        .root = try allocator.dupe(u8, root),
+        .root = root,
         .root_dir = root_dir,
         .ca_store = ca_store,
         .connections = .{ .permits = cfg.max_connections },
@@ -119,24 +120,30 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
     group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store });
     var watcher_group: std.Io.Group = .init;
     defer watcher_group.cancel(io);
-    watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener }) catch {};
+    watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener, &context.connections }) catch {};
     while (!shutdown.requested.load(.acquire)) {
         try context.connections.wait(io);
+        if (shutdown.requested.load(.acquire)) {
+            context.connections.post(io);
+            break;
+        }
         const stream = listener.accept(io) catch |err| {
             context.connections.post(io);
             if (shutdown.requested.load(.acquire)) break;
-            return err;
+            std.log.warn("Accept failed: {t}", .{err});
+            continue;
         };
         group.async(io, accept, .{ &context, stream });
     }
     group.await(io) catch {};
 }
 
-fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server) std.Io.Cancelable!void {
+fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server, connections: *std.Io.Semaphore) std.Io.Cancelable!void {
     while (!shutdown.requested.load(.acquire))
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
     const stream: std.Io.net.Stream = .{ .socket = listener.socket };
     stream.shutdown(io, .both) catch {};
+    connections.post(io);
 }
 
 fn accept(context: *Context, stream: std.Io.net.Stream) void {
@@ -289,6 +296,7 @@ fn upload(
         error.WrongFileType => return respondText(request, .bad_request, "Select one .nzb file."),
         else => return respondText(request, .bad_request, "The multipart upload is not valid."),
     };
+    defer allocator.free(part.filename);
     const filename = try normalizeFilename(allocator, part.filename);
     const id = (context.db.createFileIfCapacity(
         context.io,
@@ -300,6 +308,7 @@ fn upload(
     ) catch return respondText(request, .internal_server_error, "The job could not be saved.")) orelse
         return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
     defer context.db.allocator.free(id);
+    shutdown.notifyWorker();
     const location = try std.fmt.allocPrint(allocator, "/job/{s}", .{id});
     return request.respond("", .{
         .status = .see_other,
@@ -468,7 +477,6 @@ fn download(
     return response.end();
 }
 
-const MultipartPart = struct { filename: []const u8, content: []const u8 };
 const StreamedMultipartPart = struct { filename: []const u8, size: u64 };
 
 fn streamMultipart(
@@ -496,7 +504,10 @@ fn streamMultipart(
     const header_bytes = headers.writer.buffered()[0 .. headers.writer.end - 4];
     const raw_filename = try parsePartHeaders(header_bytes);
     const filename = try allocator.dupe(u8, raw_filename);
+    errdefer allocator.free(filename);
 
+    var next_marker_buffer: [78]u8 = undefined;
+    const next_marker = try std.fmt.bufPrint(&next_marker_buffer, "\r\n--{s}\r\n", .{boundary});
     var closing_buffer: [80]u8 = undefined;
     const closing = try std.fmt.bufPrint(&closing_buffer, "\r\n--{s}--\r\n", .{boundary});
     const chunk = try allocator.alloc(u8, 64 * 1024 + closing.len);
@@ -508,6 +519,8 @@ fn streamMultipart(
     while (true) {
         const count = reader.readSliceShort(chunk[pending..]) catch return error.InvalidMultipart;
         const available = pending + count;
+        if (std.mem.findPosLinear(u8, chunk[0..available], 0, next_marker) != null)
+            return error.InvalidMultipart;
         if (std.mem.findPosLinear(u8, chunk[0..available], 0, closing)) |pos| {
             size = std.math.add(u64, size, pos) catch return error.FileTooLarge;
             if (size > max) return error.FileTooLarge;
@@ -550,7 +563,7 @@ fn parsePartHeaders(headers: []const u8) ![]const u8 {
     }
     const name = filename orelse return error.InvalidMultipart;
     if (name.len == 0 or std.mem.findAny(u8, name, "/\\\r\n\x00") != null) return error.UnsafeFilename;
-    if (!endsWithIgnoreCase(name, ".nzb")) return error.WrongFileType;
+    if (!std.ascii.endsWithIgnoreCase(name, ".nzb")) return error.WrongFileType;
     return name;
 }
 
@@ -558,35 +571,12 @@ pub fn parseBoundary(content_type: []const u8) ![]const u8 {
     if (!std.ascii.startsWithIgnoreCase(content_type, "multipart/form-data;")) return error.InvalidBoundary;
     const marker = "boundary=";
     const pos = std.mem.findPosLinear(u8, content_type, 0, marker) orelse return error.InvalidBoundary;
-    var value = std.mem.trim(u8, content_type[pos + marker.len ..], " \t");
+    const after = content_type[pos + marker.len ..];
+    const end = std.mem.findScalar(u8, after, ';') orelse after.len;
+    var value = std.mem.trim(u8, after[0..end], " \t");
     if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
     if (value.len == 0 or value.len > 70 or std.mem.findAny(u8, value, "\r\n") != null) return error.InvalidBoundary;
     return value;
-}
-
-pub fn parseMultipart(body: []const u8, boundary: []const u8, max: u64) !MultipartPart {
-    var marker_buffer: [76]u8 = undefined;
-    const marker = try std.fmt.bufPrint(&marker_buffer, "--{s}", .{boundary});
-    if (!std.mem.startsWith(u8, body, marker)) return error.InvalidMultipart;
-    const head_start = marker.len + 2;
-    if (body.len <= head_start or !std.mem.eql(u8, body[marker.len..head_start], "\r\n")) return error.InvalidMultipart;
-    const head_end = std.mem.findPosLinear(u8, body, head_start, "\r\n\r\n") orelse return error.InvalidMultipart;
-    const headers = body[head_start..head_end];
-    if (std.mem.findPosLinear(u8, headers, 0, "\r\n\r\n") != null) return error.InvalidMultipart;
-    const name = try parsePartHeaders(headers);
-    const data_start = head_end + 4;
-    var closing_buffer: [80]u8 = undefined;
-    const closing = try std.fmt.bufPrint(&closing_buffer, "\r\n--{s}--\r\n", .{boundary});
-    if (!std.mem.endsWith(u8, body, closing)) return error.InvalidMultipart;
-    const data_end = body.len - closing.len;
-    if (data_end < data_start) return error.InvalidMultipart;
-    const content = body[data_start..data_end];
-    var next_marker_buffer: [80]u8 = undefined;
-    const next_marker = try std.fmt.bufPrint(&next_marker_buffer, "\r\n--{s}\r\n", .{boundary});
-    if (std.mem.findPosLinear(u8, content, 0, next_marker) != null) return error.InvalidMultipart;
-    if (content.len == 0) return error.EmptyFile;
-    if (content.len > max) return error.FileTooLarge;
-    return .{ .filename = name, .content = content };
 }
 
 fn normalizeFilename(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -595,7 +585,7 @@ fn normalizeFilename(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 
         if (byte < 0x20 or byte == 0x7f) return error.UnsafeFilename;
         output[i] = if (std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == '_') byte else '_';
     }
-    if (output.len == 4 and endsWithIgnoreCase(output, ".nzb")) return error.UnsafeFilename;
+    if (output.len == 4 and std.ascii.endsWithIgnoreCase(output, ".nzb")) return error.UnsafeFilename;
     return output;
 }
 
@@ -667,18 +657,14 @@ pub fn trustedPeer(peer_text: []const u8, cidrs: []const u8) bool {
 fn trustedAddress(peer: std.Io.net.IpAddress, cidrs: []const u8) bool {
     var values = std.mem.splitScalar(u8, cidrs, ',');
     while (values.next()) |raw| {
-        const value = std.mem.trim(u8, raw, " \t");
-        if (value.len == 0) continue;
-        const slash = std.mem.findScalar(u8, value, '/') orelse continue;
-        const network = std.Io.net.IpAddress.parse(value[0..slash], 0) catch continue;
-        const prefix = std.fmt.parseInt(u8, value[slash + 1 ..], 10) catch continue;
+        const cidr = config.parseCidr(raw) catch continue;
         const matches = switch (peer) {
-            .ip4 => |peer4| switch (network) {
-                .ip4 => |network4| prefixMatch(&peer4.bytes, &network4.bytes, prefix),
+            .ip4 => |peer4| switch (cidr.address) {
+                .ip4 => |network4| prefixMatch(&peer4.bytes, &network4.bytes, cidr.prefix),
                 else => false,
             },
-            .ip6 => |peer6| switch (network) {
-                .ip6 => |network6| prefixMatch(&peer6.bytes, &network6.bytes, prefix),
+            .ip6 => |peer6| switch (cidr.address) {
+                .ip6 => |network6| prefixMatch(&peer6.bytes, &network6.bytes, cidr.prefix),
                 else => false,
             },
         };
@@ -719,11 +705,6 @@ fn validHex(value: []const u8, length: usize) bool {
     return true;
 }
 
-fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
-    if (value.len < suffix.len) return false;
-    return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
-}
-
 fn downloadName(job: Job) []const u8 {
     const path = if (std.mem.endsWith(u8, job.artifact_path, ".zip"))
         job.artifact_path
@@ -746,23 +727,52 @@ fn safeDownloadName(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
 }
 
 test "strict multipart accepts one non-empty nzb" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
     const body =
         "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"ok.nzb\"\r\n" ++
         "Content-Type: application/octet-stream\r\n\r\n<nzb/>\r\n--abc--\r\n";
-    const part = try parseMultipart(body, "abc", 1024);
-    try std.testing.expectEqualStrings("ok.nzb", part.filename);
-    try std.testing.expectEqualStrings("<nzb/>", part.content);
-    try std.testing.expectError(error.FileTooLarge, parseMultipart(body, "abc", 2));
+    {
+        var file = try tmp.dir.createFile(io, "upload1.tmp", .{ .read = true });
+        defer file.close(io);
+        var reader = std.Io.Reader.fixed(body);
+        const part = try streamMultipart(std.testing.allocator, &reader, "abc", file, io, 1024);
+        defer std.testing.allocator.free(part.filename);
+        try std.testing.expectEqualStrings("ok.nzb", part.filename);
+        try std.testing.expectEqual(@as(u64, 6), part.size);
+    }
+    {
+        var file = try tmp.dir.createFile(io, "upload2.tmp", .{ .read = true });
+        defer file.close(io);
+        var reader = std.Io.Reader.fixed(body);
+        try std.testing.expectError(error.FileTooLarge, streamMultipart(std.testing.allocator, &reader, "abc", file, io, 2));
+    }
 }
 
 test "multipart rejects unsafe metadata and extra parts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
     const unsafe =
         "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"../bad.nzb\"\r\n\r\nx\r\n--abc--\r\n";
-    try std.testing.expectError(error.UnsafeFilename, parseMultipart(unsafe, "abc", 100));
+    {
+        var file = try tmp.dir.createFile(io, "unsafe.tmp", .{ .read = true });
+        defer file.close(io);
+        var reader = std.Io.Reader.fixed(unsafe);
+        try std.testing.expectError(error.UnsafeFilename, streamMultipart(std.testing.allocator, &reader, "abc", file, io, 100));
+    }
     const extra =
         "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"ok.nzb\"\r\n\r\nx\r\n" ++
         "--abc\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\ny\r\n--abc--\r\n";
-    try std.testing.expectError(error.InvalidMultipart, parseMultipart(extra, "abc", 100));
+    {
+        var file = try tmp.dir.createFile(io, "extra.tmp", .{ .read = true });
+        defer file.close(io);
+        var reader = std.Io.Reader.fixed(extra);
+        try std.testing.expectError(error.InvalidMultipart, streamMultipart(std.testing.allocator, &reader, "abc", file, io, 100));
+    }
+    try std.testing.expectEqualStrings("abc", try parseBoundary("multipart/form-data; boundary=\"abc\"; charset=utf-8"));
+    try std.testing.expectEqualStrings("abc", try parseBoundary("multipart/form-data; boundary=abc; charset=utf-8"));
 }
 
 test "HTML escaping covers active characters" {

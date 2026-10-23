@@ -1,6 +1,11 @@
 const std = @import("std");
 
 pub var requested: std.atomic.Value(bool) = .init(false);
+pub var wake_worker: std.atomic.Value(bool) = .init(false);
+
+pub fn notifyWorker() void {
+    wake_worker.store(true, .release);
+}
 
 pub fn installSignalHandlers() void {
     const action: std.posix.Sigaction = .{
@@ -19,7 +24,7 @@ fn handleSignal(_: std.posix.SIG) callconv(.c) void {
 pub fn waitForRequest(io: std.Io, seconds: i64) std.Io.Cancelable!void {
     const now = std.Io.Clock.real.now(io).toSeconds();
     const deadline = std.math.add(i64, now, seconds) catch std.math.maxInt(i64);
-    while (!requested.load(.acquire) and std.Io.Clock.real.now(io).toSeconds() < deadline)
+    while (!requested.load(.acquire) and !wake_worker.swap(false, .acq_rel) and std.Io.Clock.real.now(io).toSeconds() < deadline)
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
 }
 
@@ -95,16 +100,6 @@ pub const DownloadControl = struct {
                 return;
             }
             std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch return error.Canceled;
-        }
-    }
-
-    pub fn watch(self: *DownloadControl) std.Io.Cancelable!void {
-        while (!self.isCanceled()) {
-            if (std.Io.Clock.real.now(self.io).toSeconds() >= self.deadline_seconds) {
-                self.timeout();
-                return;
-            }
-            try std.Io.sleep(self.io, .fromMilliseconds(100), .awake);
         }
     }
 };

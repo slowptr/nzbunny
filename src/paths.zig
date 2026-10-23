@@ -83,7 +83,7 @@ pub fn inside(root: []const u8, candidate: []const u8) bool {
         (candidate.len > root.len and std.mem.startsWith(u8, candidate, root) and candidate[root.len] == '/');
 }
 
-fn toZ(text: []const u8, out: []u8) ![:0]u8 {
+pub fn toZ(text: []const u8, out: []u8) ![:0]u8 {
     if (text.len >= out.len) return error.NameTooLong;
     @memcpy(out[0..text.len], text);
     out[text.len] = 0;

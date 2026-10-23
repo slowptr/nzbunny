@@ -547,12 +547,16 @@ def main():
             repair_data = b"PAR2 repair metadata"
             comic_data = b"CBR payload bytes"
             repair_msg = "repair@nzbunny.test"
+            repair_msg2 = "repair_seg2@nzbunny.test"
             comic_msg = "comic@nzbunny.test"
             server.articles.clear()
-            server.articles[repair_msg] = yenc_encode("comic.vol00+01.par2", len(repair_data), 1, 1, 1, len(repair_data), repair_data)
+            with server.lock:
+                server.body_requests.clear()
+            server.articles[repair_msg] = yenc_encode("comic.vol00+01.par2", len(repair_data) * 2, 1, 2, 1, len(repair_data), repair_data)
+            server.articles[repair_msg2] = yenc_encode("comic.vol00+01.par2", len(repair_data) * 2, 2, 2, len(repair_data) + 1, len(repair_data) * 2, repair_data)
             server.articles[comic_msg] = yenc_encode("comic.cbr", len(comic_data), 1, 1, 1, len(comic_data), comic_data)
             mixed_nzb = build_nzb([
-                [(1, len(repair_data) + 200, repair_msg)],
+                [(1, len(repair_data) + 200, repair_msg), (2, len(repair_data) + 200, repair_msg2)],
                 [(1, len(comic_data) + 200, comic_msg)],
             ])
             code, loc = http_post_file("http://127.0.0.1:13370/", "mixed.nzb", mixed_nzb)
@@ -569,6 +573,8 @@ def main():
                     break
                 time.sleep(0.2)
             assert mixed_token, "NZB with PAR2 repair files did not complete"
+            with server.lock:
+                assert repair_msg2 not in server.body_requests, "Undamaged download should not fetch PAR2 segment 2+"
             code, mixed_content, _ = http_get(f"http://127.0.0.1:13370/d/{mixed_token}")
             assert code == 200
             assert mixed_content == comic_data
@@ -625,6 +631,8 @@ def main():
             code, repaired_content, _ = http_get(f"http://127.0.0.1:13370/d/{repair_token}")
             assert code == 200
             assert repaired_content == repairable_data
+            assert not os.path.exists(os.path.join(download_dir, ".nzbunny-downloads", repair_id)), "Staging download dir should be removed after finalization"
+            assert not os.path.exists(os.path.join(download_dir, ".nzbunny-work", repair_id)), "Staging work dir should be removed after finalization"
             server.missing_articles.remove(missing_msg)
         except Exception:
             proc.kill()

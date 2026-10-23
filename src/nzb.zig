@@ -71,7 +71,7 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         return error.EntityReferenceRejected;
     }
 
-    const options = c.XML_PARSE_NONET;
+    const options = c.XML_PARSE_NONET | c.XML_PARSE_NOERROR | c.XML_PARSE_NOWARNING;
     const reader = c.xmlReaderForMemory(
         @ptrCast(bytes.ptr),
         @intCast(bytes.len),

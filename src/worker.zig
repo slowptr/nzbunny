@@ -6,6 +6,7 @@ const Status = @import("database.zig").Status;
 const artifact = @import("artifact.zig");
 const download = @import("download.zig");
 const nntp = @import("nntp.zig");
+const nzb = @import("nzb.zig");
 const shutdown = @import("shutdown.zig");
 
 pub var provider_ready: std.atomic.Value(bool) = .init(false);
@@ -25,7 +26,6 @@ const max_concurrent_finalizers = 2;
 const max_concurrent_cleanup = 8;
 const max_finalize_attempts = 5;
 const lease_duration_seconds: i64 = 60;
-const lease_renew_seconds: i64 = 45;
 
 const Finalizers = struct {
     allocator: std.mem.Allocator,
@@ -50,7 +50,7 @@ const Finalizers = struct {
         if (self.active.count() >= max_concurrent_finalizers) return;
         if (self.active.contains(job.id)) return;
         const now = std.Io.Clock.real.now(self.io).toSeconds();
-        const token = (try self.db.tryClaimFinalizing(self.io, job.id, now, lease_duration_seconds, self.io)) orelse return;
+        const token = (try self.db.tryClaimFinalizing(self.io, job.id, now, lease_duration_seconds)) orelse return;
         errdefer self.allocator.free(token);
         const owned_id = try self.allocator.dupe(u8, job.id);
         errdefer self.allocator.free(owned_id);
@@ -138,7 +138,7 @@ pub fn run(
         if (now - last_cleanup >= cfg.cleanup_seconds) {
             cleanup(allocator, io, db, cfg, root, now) catch |err|
                 std.log.err("The cleanup cycle failed: {t}", .{err});
-            db.maintain() catch |err|
+            db.maintain(io) catch |err|
                 std.log.err("SQLite maintenance failed: {t}", .{err});
             last_cleanup = now;
         }
@@ -156,9 +156,7 @@ fn cycle(
     finalizers: *Finalizers,
     now: i64,
 ) !void {
-    if (!provider_ready.load(.acquire)) {
-        probeProvider(allocator, io, cfg, ca_store) catch return;
-    }
+    _ = shutdown.wake_worker.swap(false, .acq_rel);
     const jobs = try db.listWork(io);
     defer {
         for (jobs) |job| job.deinit(db.allocator);
@@ -166,16 +164,24 @@ fn cycle(
     }
     var active_processing = false;
     var pending: ?*const Job = null;
+    var pending_count: usize = 0;
     for (jobs) |*job| switch (job.status) {
         .processing => active_processing = true,
         .finalizing => try finalizers.schedule(job.*),
         .pending => {
             if (pending == null) pending = job;
+            pending_count += 1;
         },
         else => {},
     };
+    if (!provider_ready.load(.acquire)) {
+        probeProvider(allocator, io, cfg, ca_store) catch return;
+    }
     if (active_processing or pending == null or !provider_ready.load(.acquire)) return;
-    try processPending(allocator, io, db, cfg, root, ca_store, pending.?.*, now);
+    try processPending(allocator, io, db, cfg, root, ca_store, finalizers, pending.?.*, now);
+    if (pending_count > 1 and provider_ready.load(.acquire)) {
+        shutdown.notifyWorker();
+    }
 }
 
 fn processPending(
@@ -185,18 +191,19 @@ fn processPending(
     cfg: Config,
     root: []const u8,
     ca_store: *nntp.CaStore,
+    finalizers: *Finalizers,
     job_ref: Job,
     now: i64,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
     const job = (try db.getWithContent(io, job_ref.id)) orelse return;
     defer job.deinit(db.allocator);
     if (job.status != .pending) return;
-    _ = @import("nzb.zig").parse(arena.allocator(), job.content) catch |err| {
+    std.log.info("job {s} parsing NZB metadata ({d} bytes)", .{ job.id, job.content.len });
+    const document = nzb.parse(allocator, job.content) catch |err| {
         try db.fail(io, job.id, "The NZB file is not supported by the embedded downloader.", now);
         return err;
     };
+    defer document.deinit(allocator);
     if (!try db.beginProcessing(io, job.id, now)) return;
     active_progress.start(io, 0);
     active_progress.setPhase(io, .parsing);
@@ -205,14 +212,17 @@ fn processPending(
     std.log.info("job {s} started: {s}", .{ job.id, job.filename });
     const started = std.Io.Clock.real.now(io).toSeconds();
     const deadline = std.math.add(i64, started, cfg.download_timeout_seconds) catch return error.Timeout;
-    var control = @import("shutdown.zig").DownloadControl.init(io, deadline);
-    const result = download.run(arena.allocator(), io, root, job.id, job.content, cfg, ca_store, &control, &active_progress) catch |err| {
+    var control = shutdown.DownloadControl.init(io, deadline);
+    const result = download.run(allocator, io, root, job.id, document, cfg, ca_store, &control, &active_progress) catch |err| {
         const root_dir = std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false }) catch null;
         if (root_dir) |dir| {
             defer dir.close(io);
             cleanupWorkDirs(io, dir, job.id) catch {};
         }
-        if (nntp.isRetryableProviderFailure(err)) provider_ready.store(false, .release);
+        if (nntp.isRetryableProviderFailure(err)) {
+            provider_ready.store(false, .release);
+            shutdown.wake_worker.store(false, .release);
+        }
         const message = if (err == error.Canceled)
             "The download was interrupted by shutdown."
         else if (err == error.Timeout)
@@ -225,8 +235,14 @@ fn processPending(
         std.log.err("job {s} download failed: {s} ({t})", .{ job.id, message, err });
         return;
     };
-    _ = try db.beginFinalizing(io, job.id, result.relative_path, std.Io.Clock.real.now(io).toSeconds());
-    std.log.info("job {s} download complete; finalization queued", .{job.id});
+    defer allocator.free(result.relative_path);
+    if (try db.beginFinalizing(io, job.id, result.relative_path, std.Io.Clock.real.now(io).toSeconds())) {
+        std.log.info("job {s} download complete; finalization queued", .{job.id});
+        if (db.get(io, job.id) catch null) |finalizing_job| {
+            defer finalizing_job.deinit(db.allocator);
+            finalizers.schedule(finalizing_job) catch {};
+        }
+    }
 }
 
 fn probeProvider(
@@ -255,18 +271,20 @@ fn probeProvider(
 fn runFinalize(owner: *Finalizers, job_id: []const u8, lease_token: []const u8, download_path: []const u8, attempt: u32) void {
     defer owner.allocator.free(lease_token);
     defer owner.allocator.free(download_path);
-    var arena = std.heap.ArenaAllocator.init(owner.allocator);
-    defer arena.deinit();
-    const now = std.Io.Clock.real.now(owner.io).toSeconds();
     std.log.info("job {s} finalization started (attempt {d}/{d})", .{ job_id, attempt, max_finalize_attempts });
-    finalize(arena.allocator(), owner, job_id, download_path, lease_token, attempt, now) catch |err| {
+    finalize(owner.allocator, owner, job_id, download_path, lease_token) catch |err| {
+        const failed_at = std.Io.Clock.real.now(owner.io).toSeconds();
         std.log.err("Job {s} finalization failed (attempt {d}/{d}): {t}", .{ job_id, attempt, max_finalize_attempts, err });
         if (attempt >= max_finalize_attempts) {
-            owner.db.failFinalizing(owner.io, job_id, lease_token, "The output artifact could not be prepared after multiple attempts.", now) catch |db_err|
+            owner.db.failFinalizing(owner.io, job_id, lease_token, "The output artifact could not be prepared after multiple attempts.", failed_at) catch |db_err|
                 std.log.err("Job {s} failure state could not be saved: {t}", .{ job_id, db_err });
+            if (std.Io.Dir.openDirAbsolute(owner.io, owner.root, .{ .follow_symlinks = false }) catch null) |dir| {
+                defer dir.close(owner.io);
+                cleanupWorkDirs(owner.io, dir, job_id) catch {};
+            }
         } else {
             const backoff = @as(i64, 1) << @min(attempt, 4);
-            owner.db.releaseFinalizing(owner.io, job_id, lease_token, now + backoff, now) catch {};
+            owner.db.releaseFinalizing(owner.io, job_id, lease_token, failed_at + backoff, failed_at) catch {};
         }
     };
     owner.mutex.lockUncancelable(owner.io);
@@ -280,14 +298,12 @@ fn finalize(
     id: []const u8,
     download_path: []const u8,
     lease_token: []const u8,
-    attempt: u32,
-    now: i64,
 ) !void {
-    _ = attempt;
     const before = std.Io.Clock.real.now(owner.io).toSeconds();
     const before_until = std.math.add(i64, before, lease_duration_seconds) catch return error.LeaseRenewalFailed;
     if (!(try owner.db.renewLease(owner.io, id, lease_token, before_until, before))) return error.LeaseRenewalFailed;
     const result = try artifact.prepare(allocator, owner.root, id, download_path, owner.cfg.max_artifact_bytes, lease_token);
+    defer allocator.free(result.relative_path);
     const after = std.Io.Clock.real.now(owner.io).toSeconds();
     const after_until = std.math.add(i64, after, lease_duration_seconds) catch return error.LeaseRenewalFailed;
     if (!(try owner.db.renewLease(owner.io, id, lease_token, after_until, after))) return error.LeaseRenewalFailed;
@@ -297,11 +313,15 @@ fn finalize(
         owner.io.random(&random);
         var token: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&token, "{x}", .{random}) catch unreachable;
-        const saved = owner.db.completeWithToken(owner.io, id, lease_token, result.relative_path, result.size, &token, now + owner.cfg.retention_seconds, now) catch |err| switch (err) {
+        const saved = owner.db.completeWithToken(owner.io, id, lease_token, result.relative_path, result.size, &token, after + owner.cfg.retention_seconds, after) catch |err| switch (err) {
             error.DuplicateToken => continue,
             else => return err,
         };
         if (saved) {
+            if (std.Io.Dir.openDirAbsolute(owner.io, owner.root, .{ .follow_symlinks = false }) catch null) |dir| {
+                defer dir.close(owner.io);
+                cleanupWorkDirs(owner.io, dir, id) catch {};
+            }
             std.log.info("job {s} complete: artifact ready ({d} bytes)", .{ id, result.size });
             return;
         }

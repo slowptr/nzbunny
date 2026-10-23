@@ -105,23 +105,31 @@ fn validateNntpValue(text: []const u8) !void {
     }
 }
 
+pub const Cidr = struct {
+    address: std.Io.net.IpAddress,
+    prefix: u8,
+};
+
+pub fn parseCidr(raw: []const u8) !Cidr {
+    const value_text_trimmed = std.mem.trim(u8, raw, " \t");
+    if (value_text_trimmed.len == 0) return error.InvalidTrustedProxyCidr;
+    const slash = std.mem.findScalar(u8, value_text_trimmed, '/') orelse return error.InvalidTrustedProxyCidr;
+    const address = std.Io.net.IpAddress.parse(value_text_trimmed[0..slash], 0) catch
+        return error.InvalidTrustedProxyCidr;
+    const prefix = std.fmt.parseInt(u8, value_text_trimmed[slash + 1 ..], 10) catch
+        return error.InvalidTrustedProxyCidr;
+    switch (address) {
+        .ip4 => if (prefix > 32) return error.InvalidTrustedProxyCidr,
+        .ip6 => if (prefix > 128) return error.InvalidTrustedProxyCidr,
+    }
+    return .{ .address = address, .prefix = prefix };
+}
+
 fn validateCidrs(value_text: []const u8) !void {
+    if (value_text.len == 0) return;
     var values = std.mem.splitScalar(u8, value_text, ',');
     while (values.next()) |raw| {
-        const value_text_trimmed = std.mem.trim(u8, raw, " \t");
-        if (value_text_trimmed.len == 0) {
-            if (value_text.len == 0) continue;
-            return error.InvalidTrustedProxyCidr;
-        }
-        const slash = std.mem.findScalar(u8, value_text_trimmed, '/') orelse return error.InvalidTrustedProxyCidr;
-        const address = std.Io.net.IpAddress.parse(value_text_trimmed[0..slash], 0) catch
-            return error.InvalidTrustedProxyCidr;
-        const prefix = std.fmt.parseInt(u8, value_text_trimmed[slash + 1 ..], 10) catch
-            return error.InvalidTrustedProxyCidr;
-        switch (address) {
-            .ip4 => if (prefix > 32) return error.InvalidTrustedProxyCidr,
-            .ip6 => if (prefix > 128) return error.InvalidTrustedProxyCidr,
-        }
+        _ = try parseCidr(raw);
     }
 }
 

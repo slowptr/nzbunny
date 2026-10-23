@@ -33,15 +33,14 @@ fn boundedWriteCallback(
     const buf: [*]const u8 = @ptrCast(buffer.?);
     var written: usize = 0;
     while (written < length) {
-        const rc = std.os.linux.write(ctx.fd, buf + written, length - written);
-        const signed: isize = @bitCast(rc);
-        if (signed < 0) {
-            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
+        const write_count = c.write(ctx.fd, buf + written, length - written);
+        if (write_count < 0) {
+            if (std.c._errno().* == c.EINTR) continue;
             return -1;
         }
-        if (signed == 0) return -1;
-        written += @intCast(signed);
-        ctx.written += @as(u64, @intCast(signed));
+        if (write_count == 0) return -1;
+        written += @intCast(write_count);
+        ctx.written += @as(u64, @intCast(write_count));
     }
     return @intCast(written);
 }
@@ -233,7 +232,7 @@ fn walkFd(
         limits.entries += 1;
         if (limits.entries > max_entries) return error.TooManyArtifactEntries;
         var name_z: [c.PATH_MAX + 1]u8 = undefined;
-        const z = try toZ(name, &name_z);
+        const z = try paths.toZ(name, &name_z);
         const opened = openChild(base, z) catch |err| switch (err) {
             error.SymbolicLinkRejected => return error.SymbolicLinkRejected,
             else => return error.ArtifactSourceNotAccessible,
@@ -315,7 +314,7 @@ fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buf
     const entry = c.archive_entry_new() orelse return error.ArchiveEntryFailed;
     defer c.archive_entry_free(entry);
     var name_z: [c.PATH_MAX + 1]u8 = undefined;
-    c.archive_entry_set_pathname(entry, (try toZ(name, &name_z)).ptr);
+    c.archive_entry_set_pathname(entry, (try paths.toZ(name, &name_z)).ptr);
     c.archive_entry_set_filetype(entry, c.S_IFREG);
     c.archive_entry_set_perm(entry, 0o600);
     c.archive_entry_set_size(entry, @intCast(size));
@@ -363,10 +362,10 @@ fn removeRelative(root_fd: c_int, rel: []const u8) !void {
         const parent_fd = try openDirPath(root_fd, rel[0..slash]);
         defer _ = c.close(parent_fd);
         var name_z: [c.PATH_MAX + 1]u8 = undefined;
-        try removeUnder(parent_fd, try toZ(name, &name_z), 0);
+        try removeUnder(parent_fd, try paths.toZ(name, &name_z), 0);
     } else {
         var name_z: [c.PATH_MAX + 1]u8 = undefined;
-        try removeUnder(root_fd, try toZ(rel, &name_z), 0);
+        try removeUnder(root_fd, try paths.toZ(rel, &name_z), 0);
     }
 }
 
@@ -380,7 +379,7 @@ fn openDirPath(start_fd: c_int, rel: []const u8) !c_int {
     while (it.next()) |comp| {
         if (comp.len == 0) continue;
         var zbuf: [c.PATH_MAX + 1]u8 = undefined;
-        const z = try toZ(comp, &zbuf);
+        const z = try paths.toZ(comp, &zbuf);
         const next = std.posix.openat(current, z, .{
             .ACCMODE = .RDONLY,
             .DIRECTORY = true,
@@ -407,10 +406,10 @@ fn openRelative(root_fd: c_int, rel: []const u8) !Opened {
         const parent_fd = try openDirPath(root_fd, rel[0..slash]);
         defer _ = c.close(parent_fd);
         var name_z: [c.PATH_MAX + 1]u8 = undefined;
-        return openChild(parent_fd, try toZ(name, &name_z));
+        return openChild(parent_fd, try paths.toZ(name, &name_z));
     }
     var name_z: [c.PATH_MAX + 1]u8 = undefined;
-    return openChild(root_fd, try toZ(rel, &name_z));
+    return openChild(root_fd, try paths.toZ(rel, &name_z));
 }
 
 fn removeUnder(parent_fd: c_int, name: [:0]const u8, depth: usize) RemoveError!void {
@@ -459,7 +458,7 @@ fn emptyDirFd(dir_fd: c_int, depth: usize) RemoveError!void {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         var name_z: [c.PATH_MAX + 1]u8 = undefined;
-        try removeUnder(base, try toZ(name, &name_z), depth + 1);
+        try removeUnder(base, try paths.toZ(name, &name_z), depth + 1);
     }
 }
 
@@ -483,13 +482,6 @@ fn existingRegularAt(directory_fd: c_int, name: [:0]const u8, max: u64) !u64 {
 fn removeFileAt(directory_fd: c_int, name: [:0]const u8) !void {
     if (c.unlinkat(directory_fd, name.ptr, 0) == 0 or std.c._errno().* == c.ENOENT) return;
     return error.TemporaryArtifactCleanupFailed;
-}
-
-fn toZ(text: []const u8, out: []u8) ![:0]u8 {
-    if (text.len >= out.len) return error.NameTooLong;
-    @memcpy(out[0..text.len], text);
-    out[text.len] = 0;
-    return out[0..text.len :0];
 }
 
 test "cleanup accepts an already missing artifact" {
@@ -520,7 +512,7 @@ test "artifact directory cannot be a symlink" {
     const link = try std.fmt.bufPrint(&link_buffer, "{s}/.nzbunny-artifacts", .{download});
     var outside_z: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     var link_z: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
-    if (c.symlink((try toZ(outside, &outside_z)).ptr, (try toZ(link, &link_z)).ptr) != 0)
+    if (c.symlink((try paths.toZ(outside, &outside_z)).ptr, (try paths.toZ(link, &link_z)).ptr) != 0)
         return error.TestSymlinkFailed;
 
     try std.testing.expectError(
@@ -574,7 +566,7 @@ test "a symlink inside the source tree is not followed" {
     const link = try std.fmt.bufPrint(&link_buffer, "{s}/downloads/source/escape.txt", .{base});
     var secret_z: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
     var link_z: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
-    if (c.symlink((try toZ(secret, &secret_z)).ptr, (try toZ(link, &link_z)).ptr) != 0)
+    if (c.symlink((try paths.toZ(secret, &secret_z)).ptr, (try paths.toZ(link, &link_z)).ptr) != 0)
         return error.TestSymlinkFailed;
     var download_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const download = try std.fmt.bufPrint(&download_buffer, "{s}/downloads", .{base});
