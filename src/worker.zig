@@ -92,6 +92,8 @@ pub fn startup(
         std.log.err("Stale lease reclaim failed: {t}", .{err});
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
     defer root_dir.close(io);
+    root_dir.deleteTree(io, ".nzbunny-work") catch {};
+    artifact.sweepOrphanTemps(root);
     for (interrupted) |job| {
         cleanupWorkDirs(io, root_dir, job.id) catch |err|
             std.log.err("Job {s} interrupted cleanup failed: {t}", .{ job.id, err });

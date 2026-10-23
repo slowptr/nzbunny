@@ -466,10 +466,19 @@ def main():
                     conn.close()
                 raise AssertionError(f"Job did not reach COMPLETE: {state}")
 
+            head_req = urllib.request.Request(f"http://127.0.0.1:13370/d/{token}", method="HEAD")
+            with urllib.request.urlopen(head_req, timeout=5) as head_resp:
+                assert head_resp.status == 200
+                assert head_resp.read() == b""
+                assert int(head_resp.headers.get("content-length")) == len(direct_data)
+                assert head_resp.headers.get("referrer-policy") == "no-referrer"
+                assert head_resp.headers.get("x-content-type-options") == "nosniff"
+
             code, content, headers = http_get(f"http://127.0.0.1:13370/d/{token}")
             assert code == 200
             assert content == direct_data
             assert 'attachment; filename="test_direct.bin"' in headers.get("content-disposition")
+            assert headers.get("referrer-policy") == "no-referrer"
         finally:
             proc.terminate()
             stdout, stderr = proc.communicate()

@@ -89,12 +89,6 @@ pub const Database = struct {
         return c.sqlite3_step(stmt) == c.SQLITE_ROW;
     }
 
-    pub fn create(self: *Database, io: std.Io, filename: []const u8, content: []const u8, now: i64) ![]const u8 {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return self.createLocked(self.handle, io, filename, content, now);
-    }
-
     pub fn createFileIfCapacity(
         self: *Database,
         io: std.Io,
@@ -129,7 +123,7 @@ pub const Database = struct {
         size: u64,
         now: i64,
     ) ![]const u8 {
-        const id = try self.insertJob(db, io, filename, null, size, now);
+        const id = try self.insertJob(db, io, filename, size, now);
         errdefer self.allocator.free(id);
         var blob: ?*c.sqlite3_blob = null;
         if (c.sqlite3_blob_open(db, "main", "jobs", "content", c.sqlite3_last_insert_rowid(db), 1, &blob) != c.SQLITE_OK)
@@ -154,7 +148,6 @@ pub const Database = struct {
         db: *c.sqlite3,
         io: std.Io,
         filename: []const u8,
-        content: ?[]const u8,
         content_size: u64,
         now: i64,
     ) ![]const u8 {
@@ -171,40 +164,10 @@ pub const Database = struct {
         defer _ = c.sqlite3_finalize(stmt);
         bindText(stmt, 1, id);
         bindText(stmt, 2, filename);
-        if (content) |bytes|
-            _ = c.sqlite3_bind_blob(stmt, 3, bytes.ptr, @intCast(bytes.len), null)
-        else if (c.sqlite3_bind_zeroblob64(stmt, 3, content_size) != c.SQLITE_OK)
+        if (c.sqlite3_bind_zeroblob64(stmt, 3, content_size) != c.SQLITE_OK)
             return error.DatabaseWriteFailed;
         _ = c.sqlite3_bind_int64(stmt, 4, now);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
-        return id;
-    }
-
-    fn createLocked(self: *Database, db: *c.sqlite3, io: std.Io, filename: []const u8, content: []const u8, now: i64) ![]const u8 {
-        return self.insertJob(db, io, filename, content, content.len, now);
-    }
-
-    pub fn createIfCapacity(
-        self: *Database,
-        io: std.Io,
-        filename: []const u8,
-        content: []const u8,
-        now: i64,
-        max_active: u32,
-    ) !?[]const u8 {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const db = self.handle;
-        try exec(db, "BEGIN IMMEDIATE;");
-        errdefer exec(db, "ROLLBACK;") catch |err|
-            std.log.err("SQLite admission rollback failed: {t}", .{err});
-        if (try activeCount(db) >= max_active) {
-            try exec(db, "COMMIT;");
-            return null;
-        }
-        const id = try self.createLocked(db, io, filename, content, now);
-        errdefer self.allocator.free(id);
-        try exec(db, "COMMIT;");
         return id;
     }
 
@@ -309,24 +272,6 @@ pub const Database = struct {
         _ = c.sqlite3_bind_int64(stmt, 2, now);
         bindText(stmt, 3, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
-        return c.sqlite3_changes(self.handle) == 1;
-    }
-
-    pub fn complete(self: *Database, io: std.Io, id: []const u8, artifact_path: []const u8, size: u64, token: []const u8, expires: i64, now: i64) !bool {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const stmt = try prepare(self.handle, "UPDATE jobs SET status='COMPLETE',artifact_path=?1,artifact_size=?2,download_token=?3," ++
-            "expires_at=?4,updated_at=?5 WHERE id=?6 AND status='FINALIZING'");
-        defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, artifact_path);
-        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(size));
-        bindText(stmt, 3, token);
-        _ = c.sqlite3_bind_int64(stmt, 4, expires);
-        _ = c.sqlite3_bind_int64(stmt, 5, now);
-        bindText(stmt, 6, id);
-        const result = c.sqlite3_step(stmt);
-        if (result == c.SQLITE_CONSTRAINT) return error.DuplicateToken;
-        if (result != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(self.handle) == 1;
     }
 
@@ -580,6 +525,8 @@ fn initialize(db: *c.sqlite3) !void {
         \\  finalize_lease_token TEXT
         \\);
         \\CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
+        \\CREATE INDEX IF NOT EXISTS jobs_status_created_idx ON jobs(status, created_at);
+        \\CREATE INDEX IF NOT EXISTS jobs_status_updated_idx ON jobs(status, updated_at);
         \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
         \\COMMIT;
     );
@@ -632,6 +579,8 @@ fn migrateV1ToV2(db: *c.sqlite3) !void {
         \\DELETE FROM nzbunny_schema;
         \\INSERT INTO nzbunny_schema(version) VALUES (2);
         \\CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
+        \\CREATE INDEX IF NOT EXISTS jobs_status_created_idx ON jobs(status, created_at);
+        \\CREATE INDEX IF NOT EXISTS jobs_status_updated_idx ON jobs(status, updated_at);
         \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
         \\COMMIT;
     );
@@ -644,6 +593,8 @@ fn migrateV2ToV3(db: *c.sqlite3) !void {
         \\ALTER TABLE jobs ADD COLUMN finalize_next_at INTEGER;
         \\ALTER TABLE jobs ADD COLUMN finalize_lease_until INTEGER;
         \\ALTER TABLE jobs ADD COLUMN finalize_lease_token TEXT;
+        \\CREATE INDEX IF NOT EXISTS jobs_status_created_idx ON jobs(status, created_at);
+        \\CREATE INDEX IF NOT EXISTS jobs_status_updated_idx ON jobs(status, updated_at);
         \\UPDATE nzbunny_schema SET version = 3;
         \\COMMIT;
     );
@@ -688,6 +639,7 @@ fn scan(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !Job {
     const status = parseStatus(borrowedText(stmt, 3)) orelse return error.InvalidStoredStatus;
     const artifact_size = c.sqlite3_column_int64(stmt, 6);
     if (artifact_size < 0) return error.InvalidStoredArtifactSize;
+    const finalize_attempts = std.math.cast(u32, c.sqlite3_column_int64(stmt, 12)) orelse return error.InvalidStoredStatus;
     var job: Job = .{
         .id = "",
         .filename = "",
@@ -701,7 +653,7 @@ fn scan(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt) !Job {
         .created_at = c.sqlite3_column_int64(stmt, 9),
         .updated_at = c.sqlite3_column_int64(stmt, 10),
         .expires_at = if (c.sqlite3_column_type(stmt, 11) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 11),
-        .finalize_attempts = @intCast(c.sqlite3_column_int64(stmt, 12)),
+        .finalize_attempts = finalize_attempts,
         .finalize_next_at = if (c.sqlite3_column_type(stmt, 13) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 13),
         .finalize_lease_until = if (c.sqlite3_column_type(stmt, 14) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 14),
         .finalize_lease_token = "",
@@ -773,22 +725,26 @@ test "SQLite job transitions use compare and set" {
     var db = try Database.open(arena.allocator(), db_path);
     defer db.close();
     const io = std.testing.io;
-    const id = try db.create(io, "sample.nzb", "<nzb/>", 100);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sample.nzb", .data = "<nzb/>" });
+    var sample_file = try tmp.dir.openFile(io, "sample.nzb", .{});
+    defer sample_file.close(io);
+    const id = (try db.createFileIfCapacity(io, "sample.nzb", sample_file, 6, 100, 1)).?;
     const pending = (try db.get(io, id)).?;
     try std.testing.expectEqual(Status.pending, pending.status);
     try std.testing.expectEqual(@as(usize, 0), pending.content.len);
     const pending_with_content = (try db.getWithContent(io, id)).?;
     try std.testing.expectEqualStrings("<nzb/>", pending_with_content.content);
-    try std.testing.expect((try db.createIfCapacity(io, "second.nzb", "<nzb/>", 100, 1)) == null);
+    try std.testing.expect((try db.createFileIfCapacity(io, "second.nzb", sample_file, 6, 100, 1)) == null);
     try std.testing.expect(try db.beginProcessing(io, id, 101));
     try std.testing.expect(!try db.beginProcessing(io, id, 102));
     try std.testing.expect(try db.beginFinalizing(io, id, "output", 104));
+    const lease_token = (try db.tryClaimFinalizing(io, id, 104, 60)).?;
     const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    try std.testing.expect(try db.complete(io, id, "artifact.zip", 42, token, 200, 105));
+    try std.testing.expect(try db.completeWithToken(io, id, lease_token, "artifact.zip", 42, token, 200, 105));
     const complete_job = (try db.getByToken(io, token)).?;
     try std.testing.expectEqual(Status.complete, complete_job.status);
     try std.testing.expectEqual(@as(u64, 42), complete_job.artifact_size);
-    try std.testing.expect(!try db.complete(io, id, "other.zip", 1, token, 200, 106));
+    try std.testing.expect(!try db.completeWithToken(io, id, lease_token, "other.zip", 1, token, 200, 106));
 }
 
 test "schema version 1 migration converts in-flight jobs and preserves completed jobs" {

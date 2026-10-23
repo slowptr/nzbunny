@@ -161,31 +161,31 @@ fn accept(context: *Context, stream: std.Io.net.Stream) void {
     var conn_writer = stream.writer(context.io, &send_buffer);
     var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
     while (server.reader.state == .ready) {
-        var header_timeout: std.Io.Group = .init;
-        header_timeout.concurrent(context.io, shutdownAfter, .{
-            stream,
-            context.io,
-            context.cfg.http_header_seconds,
-        }) catch return;
-        var request = server.receiveHead() catch {
-            header_timeout.cancel(context.io);
-            return;
+        var request = blk: {
+            var header_timeout: std.Io.Group = .init;
+            defer header_timeout.cancel(context.io);
+            header_timeout.concurrent(context.io, shutdownAfter, .{
+                stream,
+                context.io,
+                context.cfg.http_header_seconds,
+            }) catch return;
+            break :blk server.receiveHead() catch return;
         };
-        header_timeout.cancel(context.io);
         var arena = std.heap.ArenaAllocator.init(context.allocator);
         defer arena.deinit();
-        var request_timeout: std.Io.Group = .init;
-        request_timeout.concurrent(context.io, shutdownAfter, .{
-            stream,
-            context.io,
-            context.cfg.http_request_seconds,
-        }) catch return;
-        route(&request, context, peer_address, peer, arena.allocator()) catch |err| {
-            request_timeout.cancel(context.io);
-            std.log.err("Request failed: {t}", .{err});
-            return;
-        };
-        request_timeout.cancel(context.io);
+        {
+            var request_timeout: std.Io.Group = .init;
+            defer request_timeout.cancel(context.io);
+            request_timeout.concurrent(context.io, shutdownAfter, .{
+                stream,
+                context.io,
+                context.cfg.http_request_seconds,
+            }) catch return;
+            route(&request, context, peer_address, peer, arena.allocator()) catch |err| {
+                std.log.err("Request failed: {t}", .{err});
+                return;
+            };
+        }
     }
 }
 
@@ -217,6 +217,8 @@ fn route(
             .GET, .HEAD => request.respond(index_html, .{ .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/html; charset=utf-8" },
                 .{ .name = "cache-control", .value = "no-store" },
+                .{ .name = "x-content-type-options", .value = "nosniff" },
+                .{ .name = "referrer-policy", .value = "no-referrer" },
             } }),
             .POST => upload(request, context, peer_address, peer, allocator),
             else => methodNotAllowed(request),
@@ -267,10 +269,11 @@ fn upload(
     const boundary = parseBoundary(content_type) catch
         return respondText(request, .bad_request, "The multipart boundary is not valid.");
 
+    context.root_dir.createDirPath(context.io, ".nzbunny-work") catch {};
     var random: [16]u8 = undefined;
     context.io.random(&random);
-    var temp_name_buffer: [64]u8 = undefined;
-    const temp_name = std.fmt.bufPrint(&temp_name_buffer, ".nzbunny-upload-{x}.tmp", .{random}) catch unreachable;
+    var temp_name_buffer: [80]u8 = undefined;
+    const temp_name = std.fmt.bufPrint(&temp_name_buffer, ".nzbunny-work/.nzbunny-upload-{x}.tmp", .{random}) catch unreachable;
     const temp_file = context.root_dir.createFile(context.io, temp_name, .{
         .read = true,
         .exclusive = true,
@@ -397,6 +400,8 @@ fn jobPage(
     return request.respond(page.writer.buffered(), .{ .extra_headers = &.{
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         .{ .name = "cache-control", .value = "no-store" },
+        .{ .name = "x-content-type-options", .value = "nosniff" },
+        .{ .name = "referrer-policy", .value = "no-referrer" },
     } });
 }
 
@@ -468,8 +473,13 @@ fn download(
             .{ .name = "content-disposition", .value = disposition },
             .{ .name = "cache-control", .value = "private, no-store" },
             .{ .name = "x-content-type-options", .value = "nosniff" },
+            .{ .name = "referrer-policy", .value = "no-referrer" },
         } },
     });
+    if (response.isEliding()) {
+        response.state = .{ .content_length = 0 };
+        return response.end();
+    }
     var file_buffer: [64 * 1024]u8 = undefined;
     var file_reader = std.Io.File.Reader.initSize(file, context.io, &file_buffer, stat.size);
     const sent = try response.writer.sendFileAll(&file_reader, .limited(stat.size));
@@ -692,6 +702,8 @@ fn respondText(request: *std.http.Server.Request, status: std.http.Status, messa
     return request.respond(message, .{ .status = status, .extra_headers = &.{
         .{ .name = "content-type", .value = "text/plain; charset=utf-8" },
         .{ .name = "cache-control", .value = "no-store" },
+        .{ .name = "x-content-type-options", .value = "nosniff" },
+        .{ .name = "referrer-policy", .value = "no-referrer" },
     } });
 }
 

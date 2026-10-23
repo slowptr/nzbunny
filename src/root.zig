@@ -15,11 +15,11 @@ pub const web = @import("web.zig");
 pub fn run(init: std.process.Init) !void {
     shutdown.requested.store(false, .release);
     shutdown.installSignalHandlers();
-    const allocator = init.arena.allocator();
-    const cfg = config.load(allocator, init.io, init.minimal.environ) catch |err| {
+    const cfg = config.load(init.gpa, init.io, init.minimal.environ) catch |err| {
         std.log.err("Configuration is not valid: {t}", .{err});
         return err;
     };
+    defer cfg.deinit(init.gpa);
     var db = try database.Database.open(init.gpa, cfg.db_path);
     defer db.close();
 

@@ -23,6 +23,16 @@ pub const Config = struct {
     max_active_jobs: u32,
     max_connections: u32,
     uploads_per_minute: u32,
+
+    pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
+        allocator.free(self.nntp_host);
+        allocator.free(self.nntp_user);
+        allocator.free(self.nntp_pass);
+        allocator.free(self.nntp_ca_file);
+        allocator.free(self.download_dir);
+        allocator.free(self.db_path);
+        allocator.free(self.trusted_proxy_cidrs);
+    }
 };
 
 const Defaults = struct {
@@ -50,16 +60,20 @@ const max_retention_seconds = 365 * 86400;
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) !Config {
     var env = try environ.createMap(allocator);
+    defer env.deinit();
     loadDotEnv(allocator, io, &env) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
+    return loadFromMap(allocator, &env);
+}
 
-    const nntp_host = value(&env, "NNTP_HOST", "");
-    const nntp_user = value(&env, "NNTP_USER", "");
-    const nntp_pass = value(&env, "NNTP_PASS", "");
-    const nntp_ca_file = value(&env, "NNTP_CA_FILE", "");
-    const download_dir = value(&env, "DOWNLOAD_DIR", "");
+fn loadFromMap(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
+    const nntp_host = value(env, "NNTP_HOST", "");
+    const nntp_user = value(env, "NNTP_USER", "");
+    const nntp_pass = value(env, "NNTP_PASS", "");
+    const nntp_ca_file = value(env, "NNTP_CA_FILE", "");
+    const download_dir = value(env, "DOWNLOAD_DIR", "");
     if (nntp_host.len == 0) return error.MissingNntpHost;
     if (nntp_user.len == 0) return error.MissingNntpUser;
     if (nntp_pass.len == 0) return error.MissingNntpPassword;
@@ -69,33 +83,63 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Envir
     try validateNntpValue(nntp_pass);
     try validateNntpValue(nntp_ca_file);
 
-    const trusted_proxy_cidrs = value(&env, "TRUSTED_PROXY_CIDRS", Defaults.trusted_proxy_cidrs);
+    const trusted_proxy_cidrs = value(env, "TRUSTED_PROXY_CIDRS", Defaults.trusted_proxy_cidrs);
     try validateCidrs(trusted_proxy_cidrs);
-    const nntp_connections = try positiveInt(u32, value(&env, "NNTP_CONNECTIONS", Defaults.nntp_connections));
+    const nntp_connections = try positiveInt(u32, value(env, "NNTP_CONNECTIONS", Defaults.nntp_connections));
     if (nntp_connections > 16) return error.InvalidNntpConnections;
+    const nntp_port = try positiveInt(u16, value(env, "NNTP_PORT", Defaults.nntp_port));
+    const port = try positiveInt(u16, value(env, "PORT", Defaults.port));
+    const retention_seconds = try retentionDuration(value(env, "RETENTION_TTL", Defaults.retention_ttl));
+    const cleanup_seconds = try shortDuration(value(env, "CLEANUP_INTERVAL", Defaults.cleanup_interval));
+    const poll_seconds = try shortDuration(value(env, "POLL_INTERVAL", Defaults.poll_interval));
+    const nntp_timeout_seconds = try shortDuration(value(env, "NNTP_TIMEOUT", Defaults.nntp_timeout));
+    const download_timeout_seconds = try shortDuration(value(env, "DOWNLOAD_TIMEOUT", Defaults.download_timeout));
+    const http_header_seconds = try shortDuration(value(env, "HTTP_HEADER_TIMEOUT", Defaults.http_header_timeout));
+    const http_request_seconds = try shortDuration(value(env, "HTTP_REQUEST_TIMEOUT", Defaults.http_request_timeout));
+    const max_artifact_bytes_val = try positiveInt(u64, value(env, "MAX_ARTIFACT_BYTES", Defaults.max_artifact_bytes));
+    const max_upload_bytes_val = try uploadBytes(value(env, "MAX_UPLOAD_BYTES", Defaults.max_upload_bytes));
+    const max_active_jobs = try positiveInt(u32, value(env, "MAX_ACTIVE_JOBS", Defaults.max_active_jobs));
+    const max_connections = try positiveInt(u32, value(env, "MAX_CONNECTIONS", Defaults.max_connections));
+    const uploads_per_minute = try positiveInt(u32, value(env, "UPLOADS_PER_MINUTE", Defaults.uploads_per_minute));
+
+    const owned_host = try allocator.dupe(u8, nntp_host);
+    errdefer allocator.free(owned_host);
+    const owned_user = try allocator.dupe(u8, nntp_user);
+    errdefer allocator.free(owned_user);
+    const owned_pass = try allocator.dupe(u8, nntp_pass);
+    errdefer allocator.free(owned_pass);
+    const owned_ca = try allocator.dupe(u8, nntp_ca_file);
+    errdefer allocator.free(owned_ca);
+    const owned_dir = try allocator.dupe(u8, download_dir);
+    errdefer allocator.free(owned_dir);
+    const owned_db = try allocator.dupe(u8, value(env, "DB_PATH", Defaults.db_path));
+    errdefer allocator.free(owned_db);
+    const owned_cidrs = try allocator.dupe(u8, trusted_proxy_cidrs);
+    errdefer allocator.free(owned_cidrs);
+
     return .{
-        .nntp_host = nntp_host,
-        .nntp_user = nntp_user,
-        .nntp_pass = nntp_pass,
-        .nntp_ca_file = nntp_ca_file,
-        .download_dir = download_dir,
-        .db_path = value(&env, "DB_PATH", Defaults.db_path),
-        .trusted_proxy_cidrs = trusted_proxy_cidrs,
-        .nntp_port = try positiveInt(u16, value(&env, "NNTP_PORT", Defaults.nntp_port)),
+        .nntp_host = owned_host,
+        .nntp_user = owned_user,
+        .nntp_pass = owned_pass,
+        .nntp_ca_file = owned_ca,
+        .download_dir = owned_dir,
+        .db_path = owned_db,
+        .trusted_proxy_cidrs = owned_cidrs,
+        .nntp_port = nntp_port,
         .nntp_connections = nntp_connections,
-        .port = try positiveInt(u16, value(&env, "PORT", Defaults.port)),
-        .retention_seconds = try retentionDuration(value(&env, "RETENTION_TTL", Defaults.retention_ttl)),
-        .cleanup_seconds = try shortDuration(value(&env, "CLEANUP_INTERVAL", Defaults.cleanup_interval)),
-        .poll_seconds = try shortDuration(value(&env, "POLL_INTERVAL", Defaults.poll_interval)),
-        .nntp_timeout_seconds = try shortDuration(value(&env, "NNTP_TIMEOUT", Defaults.nntp_timeout)),
-        .download_timeout_seconds = try shortDuration(value(&env, "DOWNLOAD_TIMEOUT", Defaults.download_timeout)),
-        .http_header_seconds = try shortDuration(value(&env, "HTTP_HEADER_TIMEOUT", Defaults.http_header_timeout)),
-        .http_request_seconds = try shortDuration(value(&env, "HTTP_REQUEST_TIMEOUT", Defaults.http_request_timeout)),
-        .max_artifact_bytes = try positiveInt(u64, value(&env, "MAX_ARTIFACT_BYTES", Defaults.max_artifact_bytes)),
-        .max_upload_bytes = try uploadBytes(value(&env, "MAX_UPLOAD_BYTES", Defaults.max_upload_bytes)),
-        .max_active_jobs = try positiveInt(u32, value(&env, "MAX_ACTIVE_JOBS", Defaults.max_active_jobs)),
-        .max_connections = try positiveInt(u32, value(&env, "MAX_CONNECTIONS", Defaults.max_connections)),
-        .uploads_per_minute = try positiveInt(u32, value(&env, "UPLOADS_PER_MINUTE", Defaults.uploads_per_minute)),
+        .port = port,
+        .retention_seconds = retention_seconds,
+        .cleanup_seconds = cleanup_seconds,
+        .poll_seconds = poll_seconds,
+        .nntp_timeout_seconds = nntp_timeout_seconds,
+        .download_timeout_seconds = download_timeout_seconds,
+        .http_header_seconds = http_header_seconds,
+        .http_request_seconds = http_request_seconds,
+        .max_artifact_bytes = max_artifact_bytes_val,
+        .max_upload_bytes = max_upload_bytes_val,
+        .max_active_jobs = max_active_jobs,
+        .max_connections = max_connections,
+        .uploads_per_minute = uploads_per_minute,
     };
 }
 
@@ -135,6 +179,7 @@ fn validateCidrs(value_text: []const u8) !void {
 
 fn loadDotEnv(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, ".env", allocator, .limited(64 * 1024));
+    defer allocator.free(bytes);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
@@ -206,4 +251,15 @@ test "NNTP configuration rejects unsafe control bytes and connection range" {
     try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("user\tname"));
     try std.testing.expectError(error.InvalidNntpConfigurationValue, validateNntpValue("user\x7fname"));
     try validateNntpValue("provider.example");
+
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("NNTP_HOST", "news.example.com");
+    try map.put("NNTP_USER", "alice");
+    try map.put("NNTP_PASS", "secret");
+    try map.put("DOWNLOAD_DIR", "/downloads");
+    const cfg = try loadFromMap(std.testing.allocator, &map);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("news.example.com", cfg.nntp_host);
+    try std.testing.expectEqual(@as(u16, 563), cfg.nntp_port);
 }

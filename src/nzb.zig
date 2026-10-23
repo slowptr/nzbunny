@@ -96,6 +96,7 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
     var in_file = false;
     var in_segments = false;
     var in_segment = false;
+    var saw_segment_text = false;
     var in_head = false;
     var saw_root = false;
     var segment_number: u32 = 0;
@@ -138,6 +139,7 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
         }
         if (node_type == c.XML_READER_TYPE_ELEMENT) {
             const name = xmlText(c.xmlTextReaderConstLocalName(reader));
+            const is_empty = c.xmlTextReaderIsEmptyElement(reader) == 1;
             const is_structural = std.mem.eql(u8, name, "nzb") or std.mem.eql(u8, name, "file") or
                 std.mem.eql(u8, name, "segments") or std.mem.eql(u8, name, "segment");
             if (!in_head or is_structural) {
@@ -154,15 +156,19 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                 saw_root = true;
             } else if (std.mem.eql(u8, name, "nzb") or
                 (std.mem.eql(u8, name, "file") and in_file) or
-                (std.mem.eql(u8, name, "segments") and !in_file) or
+                (std.mem.eql(u8, name, "segments") and (!in_file or in_segments)) or
                 (std.mem.eql(u8, name, "segment") and (!in_file or !in_segments or in_segment)) or
-                (std.mem.eql(u8, name, "head") and in_head) or
+                (std.mem.eql(u8, name, "head") and (in_head or in_file)) or
                 (std.mem.eql(u8, name, "meta") and !in_head))
             {
                 setDiag(diag, reader);
                 return error.InvalidNzbStructure;
             }
             if (std.mem.eql(u8, name, "file") and !in_head and !in_segment) {
+                if (is_empty) {
+                    setDiag(diag, reader);
+                    return error.EmptyNzbFile;
+                }
                 if (files.items.len >= max_files) {
                     setDiag(diag, reader);
                     return error.TooManyNzbFiles;
@@ -179,11 +185,14 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                     setDiag(diag, reader);
                     return error.InvalidNzbStructure;
                 }
+                if (is_empty) {
+                    setDiag(diag, reader);
+                    return error.EmptyNzbFile;
+                }
                 in_segments = true;
             } else if (std.mem.eql(u8, name, "head")) {
-                in_head = true;
+                if (!is_empty) in_head = true;
             } else if (std.mem.eql(u8, name, "segment") and in_file and in_segments) {
-                in_segment = true;
                 segment_number = (attrInt(u32, reader, "number") catch |err| {
                     setDiag(diag, reader);
                     return err;
@@ -206,10 +215,21 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                     setDiag(diag, reader);
                     return error.InvalidSegmentBytes;
                 }
+                if (is_empty) {
+                    setDiag(diag, reader);
+                    return error.InvalidMessageId;
+                }
+                in_segment = true;
+                saw_segment_text = false;
             }
             continue;
         }
         if (node_type == c.XML_READER_TYPE_TEXT and in_segment) {
+            if (saw_segment_text) {
+                setDiag(diag, reader);
+                return error.InvalidNzbStructure;
+            }
+            saw_segment_text = true;
             const value = std.mem.trim(u8, xmlText(c.xmlTextReaderConstValue(reader)), " \t\r\n");
             const message_id = normalizeMessageId(allocator, value) catch |err| {
                 setDiag(diag, reader);
@@ -238,7 +258,12 @@ pub fn parseWithDiagnostic(allocator: std.mem.Allocator, bytes: []const u8, diag
                     setDiag(diag, reader);
                     return error.InvalidNzbStructure;
                 }
+                if (!saw_segment_text) {
+                    setDiag(diag, reader);
+                    return error.InvalidMessageId;
+                }
                 in_segment = false;
+                saw_segment_text = false;
             } else if (std.mem.eql(u8, name, "segments")) {
                 if (!in_segments or in_segment) {
                     setDiag(diag, reader);
@@ -566,4 +591,23 @@ test "foreign-namespaced structural element inside head is still rejected" {
         \\</nzb>
     ;
     try std.testing.expectError(error.UnsupportedNzbNamespace, parse(std.testing.allocator, text));
+}
+
+test "handles self-closing head and rejects empty segments" {
+    const self_closing_head =
+        \\<nzb><head/><file><segments><segment bytes="1" number="1">a@b</segment></segments></file></nzb>
+    ;
+    var doc = try parse(std.testing.allocator, self_closing_head);
+    defer doc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), doc.files.len);
+
+    const empty_segment =
+        \\<nzb><file><segments><segment bytes="1" number="1"></segment></segments></file></nzb>
+    ;
+    try std.testing.expectError(error.InvalidMessageId, parse(std.testing.allocator, empty_segment));
+
+    const self_closing_segment =
+        \\<nzb><file><segments><segment bytes="1" number="1"/></segments></file></nzb>
+    ;
+    try std.testing.expectError(error.InvalidMessageId, parse(std.testing.allocator, self_closing_segment));
 }

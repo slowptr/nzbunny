@@ -151,11 +151,12 @@ pub fn run(
             try remaining.append(allocator, .{ .file_index = file_index, .segment_index = segment_index });
         }
     }
+    const has_repair_files = included_count < manifest.len;
     progress.setTotal(payload_segments);
     if (remaining.items.len > 0) {
         progress.setPhase(io, .downloading);
         std.log.info("download phase: fetching {d} remaining segments", .{remaining.items.len});
-        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress);
+        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress, has_repair_files);
     }
 
     var damaged = false;
@@ -164,6 +165,7 @@ pub fn run(
         break;
     };
     if (damaged) {
+        if (!has_repair_files) return error.InsufficientPar2Data;
         remaining.clearRetainingCapacity();
         for (document.files, 0..) |file, file_index| {
             if (included[file_index]) continue;
@@ -175,8 +177,9 @@ pub fn run(
             progress.setTotal(total_segments);
             progress.setPhase(io, .downloading);
             std.log.info("download phase: fetching {d} PAR2 repair segments", .{remaining.items.len});
-            try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress);
+            try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, control, progress, true);
         }
+        if (!hasCompleteRepairFile(manifest, included)) return error.InsufficientPar2Data;
     }
 
     progress.setPhase(io, .assembling);
@@ -258,6 +261,7 @@ const SharedCtx = struct {
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
     progress: *Progress,
+    allow_repairable_errors: bool = false,
     mutex: std.Io.Mutex = .init,
     first_error: ?anyerror = null,
     canceled: std.atomic.Value(bool) = .init(false),
@@ -340,6 +344,7 @@ fn downloadPhase(
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
     progress: *Progress,
+    allow_repairable_errors: bool,
 ) !void {
     var ctx = SharedCtx{
         .allocator = allocator,
@@ -352,6 +357,7 @@ fn downloadPhase(
         .ca_store = ca_store,
         .control = control,
         .progress = progress,
+        .allow_repairable_errors = allow_repairable_errors,
     };
     var next: std.atomic.Value(usize) = .init(0);
     const worker_count = @min(items.len, cfg.nntp_connections);
@@ -362,6 +368,16 @@ fn downloadPhase(
     }
     try group.await(io);
     if (ctx.first_error) |err| return err;
+}
+
+fn isRepairableSegmentError(err: anyerror) bool {
+    return err == error.MissingArticle or
+        err == error.YencCrcMismatch or
+        err == error.InconsistentSegmentSize or
+        err == error.InvalidYencDecodedSize or
+        err == error.EmptyYencData or
+        err == error.MissingYend or
+        err == error.MissingYpart;
 }
 
 fn downloadWorker(ctx: *SharedCtx, items: []const WorkItem, next: *std.atomic.Value(usize)) void {
@@ -387,8 +403,8 @@ fn downloadWorker(ctx: *SharedCtx, items: []const WorkItem, next: *std.atomic.Va
         if (idx >= items.len) break;
         const item = items[idx];
         fetchItemWithSession(ctx, &session, &connected, item.file_index, item.segment_index, false) catch |err| {
-            if (err == error.MissingArticle) {
-                std.log.warn("file {d} segment {d} is unavailable on all provider endpoints", .{ item.file_index + 1, item.segment_index + 1 });
+            if (ctx.allow_repairable_errors and isRepairableSegmentError(err)) {
+                std.log.warn("file {d} segment {d} is unavailable or damaged ({t})", .{ item.file_index + 1, item.segment_index + 1, err });
                 ctx.progress.advanced(ctx.io);
                 continue;
             }
@@ -471,6 +487,7 @@ fn fetchItemOnce(
     var tmp_path_buffer: [324]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_path_buffer, "{s}.tmp", .{part_path});
     ctx.root_dir.deleteFile(ctx.io, tmp_path) catch {};
+    errdefer ctx.root_dir.deleteFile(ctx.io, tmp_path) catch {};
     var out_file = try ctx.root_dir.createFile(ctx.io, tmp_path, .{ .read = true, .exclusive = true, .permissions = @enumFromInt(0o600) });
     defer out_file.close(ctx.io);
     var file_buffer: [64 * 1024]u8 = undefined;
@@ -560,6 +577,13 @@ fn validateAggregate(manifest: []FileManifest, included: []const bool, included_
 fn allPartsPresent(parts: []const Part) bool {
     for (parts) |part| if (part.rel_path.len == 0) return false;
     return true;
+}
+
+fn hasCompleteRepairFile(manifest: []const FileManifest, included: []const bool) bool {
+    for (manifest, included) |file, keep| {
+        if (!keep and allPartsPresent(file.parts)) return true;
+    }
+    return false;
 }
 
 fn assembleRepairFiles(
@@ -690,6 +714,7 @@ fn repairWithPar2(
         .exited => |code| if (code == 0) return,
         else => {},
     }
+    try checkCanceled(control);
     const message = std.mem.trim(u8, result.stderr, " \t\r\n");
     if (message.len != 0) std.log.err("PAR2 repair failed: {s}", .{message});
     return error.Par2RepairFailed;
@@ -952,4 +977,26 @@ test "cleanupRepairFiles removes par2 and backup files" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "out/payload.bin.1", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "out/repair.par2", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "out/repair.vol00+01.PAR2", .{}));
+}
+
+test "identifies repairable segment errors and complete repair files" {
+    try std.testing.expect(isRepairableSegmentError(error.MissingArticle));
+    try std.testing.expect(isRepairableSegmentError(error.YencCrcMismatch));
+    try std.testing.expect(isRepairableSegmentError(error.InconsistentSegmentSize));
+    try std.testing.expect(!isRepairableSegmentError(error.NntpOperationTimeout));
+
+    const parts_ok = [_]Part{.{ .begin = 1, .end = 10, .rel_path = "0/0.part" }};
+    const parts_missing = [_]Part{.{ .begin = 0, .end = 0, .rel_path = "" }};
+    const manifest_incomplete = [_]FileManifest{
+        .{ .name = "payload.bin", .size = 10, .parts = @constCast(&parts_ok) },
+        .{ .name = "repair.par2", .size = 10, .parts = @constCast(&parts_missing) },
+    };
+    const included = [_]bool{ true, false };
+    try std.testing.expect(!hasCompleteRepairFile(&manifest_incomplete, &included));
+
+    const manifest_complete = [_]FileManifest{
+        .{ .name = "payload.bin", .size = 10, .parts = @constCast(&parts_ok) },
+        .{ .name = "repair.par2", .size = 10, .parts = @constCast(&parts_ok) },
+    };
+    try std.testing.expect(hasCompleteRepairFile(&manifest_complete, &included));
 }

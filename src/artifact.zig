@@ -355,6 +355,43 @@ pub fn removeValidated(root: []const u8, candidate: []const u8) !void {
     try removeRelative(root_fd, resolved[root.len + 1 ..]);
 }
 
+pub fn sweepOrphanTemps(root: []const u8) void {
+    const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{
+        .DIRECTORY = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0) catch return;
+    defer _ = c.close(root_fd);
+    sweepMatchingInDir(root_fd, "", ".nzbunny-upload-", ".tmp");
+    sweepMatchingInDir(root_fd, ".nzbunny-artifacts", "", ".tmp");
+    sweepMatchingInDir(root_fd, ".nzbunny-downloads", ".tmp-", "");
+}
+
+fn sweepMatchingInDir(root_fd: c_int, rel_dir: []const u8, prefix: []const u8, suffix: []const u8) void {
+    const dir_fd = if (rel_dir.len == 0)
+        c.dup(root_fd)
+    else
+        openDirPath(root_fd, rel_dir) catch return;
+    if (dir_fd < 0) return;
+    const dir = c.fdopendir(dir_fd) orelse {
+        _ = c.close(dir_fd);
+        return;
+    };
+    defer _ = c.closedir(dir);
+    const base = c.dirfd(dir);
+    while (true) {
+        std.c._errno().* = 0;
+        const entry = c.readdir(dir) orelse break;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (prefix.len != 0 and !std.mem.startsWith(u8, name, prefix)) continue;
+        if (suffix.len != 0 and !std.mem.endsWith(u8, name, suffix)) continue;
+        var name_z: [c.PATH_MAX + 1]u8 = undefined;
+        const z = paths.toZ(name, &name_z) catch continue;
+        removeUnder(base, z, 0) catch {};
+    }
+}
+
 fn removeRelative(root_fd: c_int, rel: []const u8) !void {
     if (std.mem.lastIndexOfScalar(u8, rel, '/')) |slash| {
         const name = rel[slash + 1 ..];
@@ -574,4 +611,33 @@ test "a symlink inside the source tree is not followed" {
         error.SymbolicLinkRejected,
         prepare(std.testing.allocator, download, "0123456789abcdef0123456789abcdef", "source", 1024, ""),
     );
+}
+
+test "sweepOrphanTemps removes only temporary staging files and directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "downloads/.nzbunny-artifacts");
+    try tmp.dir.createDirPath(io, "downloads/.nzbunny-downloads/.tmp-job1");
+    try tmp.dir.createDirPath(io, "downloads/.nzbunny-downloads/job2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-upload-123.tmp", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-artifacts/job1.zip.tmp", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-artifacts/job2.zip", .data = "keep" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-downloads/.tmp-job1/part.bin", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "downloads/.nzbunny-downloads/job2/keep.bin", .data = "keep" });
+
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    var download_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const download = try std.fmt.bufPrint(&download_buffer, "{s}/downloads", .{root_buffer[0..root_len]});
+
+    sweepOrphanTemps(download);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-upload-123.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-artifacts/job1.zip.tmp", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/.nzbunny-downloads/.tmp-job1/part.bin", .{}));
+    var keep_art = try tmp.dir.openFile(io, "downloads/.nzbunny-artifacts/job2.zip", .{});
+    keep_art.close(io);
+    var keep_dl = try tmp.dir.openFile(io, "downloads/.nzbunny-downloads/job2/keep.bin", .{});
+    keep_dl.close(io);
 }

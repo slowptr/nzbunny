@@ -205,6 +205,7 @@ pub const Session = struct {
     }
 
     fn resolveEndpoints(self: *Session) !void {
+        errdefer self.endpoint_count = 0;
         const host: std.Io.net.HostName = .{ .bytes = self.host };
         var results_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
         var results: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&results_buffer);
