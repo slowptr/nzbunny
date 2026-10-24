@@ -95,6 +95,30 @@ pub const Database = struct {
         return (try activeCount(self.handle)) < max_active;
     }
 
+    pub fn createIfCapacity(
+        self: *Database,
+        io: std.Io,
+        filename: []const u8,
+        content: []const u8,
+        now: i64,
+        max_active: u32,
+    ) !?[]const u8 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const db = self.handle;
+        try exec(db, "BEGIN IMMEDIATE;");
+        errdefer exec(db, "ROLLBACK;") catch |err|
+            std.log.err("SQLite admission rollback failed: {t}", .{err});
+        if (try activeCount(db) >= max_active) {
+            try exec(db, "COMMIT;");
+            return null;
+        }
+        const id = try self.insertJob(db, io, filename, content, now);
+        errdefer self.allocator.free(id);
+        try exec(db, "COMMIT;");
+        return id;
+    }
+
     pub fn createFileIfCapacity(
         self: *Database,
         io: std.Io,
@@ -113,21 +137,7 @@ pub const Database = struct {
             if (count == 0) return error.UploadFileChanged;
             offset += count;
         }
-
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        const db = self.handle;
-        try exec(db, "BEGIN IMMEDIATE;");
-        errdefer exec(db, "ROLLBACK;") catch |err|
-            std.log.err("SQLite admission rollback failed: {t}", .{err});
-        if (try activeCount(db) >= max_active) {
-            try exec(db, "COMMIT;");
-            return null;
-        }
-        const id = try self.insertJob(db, io, filename, content, now);
-        errdefer self.allocator.free(id);
-        try exec(db, "COMMIT;");
-        return id;
+        return self.createIfCapacity(io, filename, content, now, max_active);
     }
 
     fn insertJob(
@@ -435,6 +445,16 @@ pub const Database = struct {
         try bindText(stmt, 3, statusName(expected));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
         return c.sqlite3_changes(self.handle) == 1;
+    }
+
+    pub fn purgeFailed(self: *Database, io: std.Io, id: []const u8, before: i64) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const stmt = try prepare(self.handle, "DELETE FROM jobs WHERE id=?1 AND status='FAILED' AND updated_at<=?2");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, id);
+        try bindInt64(stmt, 2, before);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DatabaseWriteFailed;
     }
 
     pub fn purgeExpired(self: *Database, io: std.Io, id: []const u8, before: i64) !void {

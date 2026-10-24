@@ -160,7 +160,7 @@ fn accept(context: *Context, stream: std.Io.net.Stream) void {
     var conn_reader = stream.reader(context.io, &receive_buffer);
     var conn_writer = stream.writer(context.io, &send_buffer);
     var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
-    while (server.reader.state == .ready) {
+    while (server.reader.state == .ready and !shutdown.requested.load(.acquire)) {
         var request = blk: {
             var header_timeout: std.Io.Group = .init;
             defer header_timeout.cancel(context.io);
@@ -273,28 +273,12 @@ fn upload(
     if (!has_capacity)
         return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
 
-    context.root_dir.createDirPath(context.io, ".nzbunny-work") catch {};
-    var random: [16]u8 = undefined;
-    context.io.random(&random);
-    var temp_name_buffer: [80]u8 = undefined;
-    const temp_name = std.fmt.bufPrint(&temp_name_buffer, ".nzbunny-work/.nzbunny-upload-{x}.tmp", .{random}) catch unreachable;
-    const temp_file = context.root_dir.createFile(context.io, temp_name, .{
-        .read = true,
-        .exclusive = true,
-        .permissions = @enumFromInt(0o600),
-    }) catch return respondText(request, .internal_server_error, "The upload could not be staged.");
-    defer temp_file.close(context.io);
-    defer context.root_dir.deleteFile(context.io, temp_name) catch |err|
-        std.log.err("Temporary upload cleanup failed for {s}: {t}", .{ temp_name, err });
-
     var body_buffer: [8192]u8 = undefined;
     const reader = try request.readerExpectContinue(&body_buffer);
     const part = streamMultipart(
         allocator,
         reader,
         boundary,
-        temp_file,
-        context.io,
         context.cfg.max_upload_bytes,
     ) catch |err| switch (err) {
         error.FileTooLarge => return respondText(request, .payload_too_large, "The NZB file is too large."),
@@ -303,13 +287,12 @@ fn upload(
         error.WrongFileType => return respondText(request, .bad_request, "Select one .nzb file."),
         else => return respondText(request, .bad_request, "The multipart upload is not valid."),
     };
-    defer allocator.free(part.filename);
+    defer part.deinit(allocator);
     const filename = try normalizeFilename(allocator, part.filename);
-    const id = (context.db.createFileIfCapacity(
+    const id = (context.db.createIfCapacity(
         context.io,
         filename,
-        temp_file,
-        part.size,
+        part.content,
         now,
         context.cfg.max_active_jobs,
     ) catch return respondText(request, .internal_server_error, "The job could not be saved.")) orelse
@@ -494,14 +477,20 @@ fn download(
     return response.end();
 }
 
-const StreamedMultipartPart = struct { filename: []const u8, size: u64 };
+const StreamedMultipartPart = struct {
+    filename: []const u8,
+    content: []const u8,
+
+    fn deinit(self: StreamedMultipartPart, allocator: std.mem.Allocator) void {
+        allocator.free(self.filename);
+        allocator.free(self.content);
+    }
+};
 
 fn streamMultipart(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     boundary: []const u8,
-    file: std.Io.File,
-    io: std.Io,
     max: u64,
 ) !StreamedMultipartPart {
     var opening_buffer: [76]u8 = undefined;
@@ -531,8 +520,8 @@ fn streamMultipart(
     defer allocator.free(chunk);
     var pending: usize = 0;
     var size: u64 = 0;
-    var file_buffer: [8192]u8 = undefined;
-    var file_writer = file.writer(io, &file_buffer);
+    var content_out = std.Io.Writer.Allocating.init(allocator);
+    defer content_out.deinit();
     while (true) {
         const count = reader.readSliceShort(chunk[pending..]) catch return error.InvalidMultipart;
         const available = pending + count;
@@ -541,21 +530,23 @@ fn streamMultipart(
         if (std.mem.findPosLinear(u8, chunk[0..available], 0, closing)) |pos| {
             size = std.math.add(u64, size, pos) catch return error.FileTooLarge;
             if (size > max) return error.FileTooLarge;
-            try file_writer.interface.writeAll(chunk[0..pos]);
+            try content_out.writer.writeAll(chunk[0..pos]);
             if (pos + closing.len != available) return error.InvalidMultipart;
             var extra: [1]u8 = undefined;
             if ((reader.readSliceShort(&extra) catch return error.InvalidMultipart) != 0)
                 return error.InvalidMultipart;
-            try file_writer.interface.flush();
             if (size == 0) return error.EmptyFile;
-            return .{ .filename = filename, .size = size };
+            return .{
+                .filename = filename,
+                .content = try allocator.dupe(u8, content_out.writer.buffered()),
+            };
         }
         if (count == 0) return error.InvalidMultipart;
         if (available > closing.len) {
             const write_len = available - closing.len;
             size = std.math.add(u64, size, write_len) catch return error.FileTooLarge;
             if (size > max) return error.FileTooLarge;
-            try file_writer.interface.writeAll(chunk[0..write_len]);
+            try content_out.writer.writeAll(chunk[0..write_len]);
             std.mem.copyForwards(u8, chunk[0..closing.len], chunk[write_len..available]);
             pending = closing.len;
         } else {
@@ -761,49 +752,35 @@ fn safeDownloadName(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
 }
 
 test "strict multipart accepts one non-empty nzb" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
     const body =
         "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"ok.nzb\"\r\n" ++
         "Content-Type: application/octet-stream\r\n\r\n<nzb/>\r\n--abc--\r\n";
     {
-        var file = try tmp.dir.createFile(io, "upload1.tmp", .{ .read = true });
-        defer file.close(io);
         var reader = std.Io.Reader.fixed(body);
-        const part = try streamMultipart(std.testing.allocator, &reader, "abc", file, io, 1024);
-        defer std.testing.allocator.free(part.filename);
+        const part = try streamMultipart(std.testing.allocator, &reader, "abc", 1024);
+        defer part.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("ok.nzb", part.filename);
-        try std.testing.expectEqual(@as(u64, 6), part.size);
+        try std.testing.expectEqualStrings("<nzb/>", part.content);
     }
     {
-        var file = try tmp.dir.createFile(io, "upload2.tmp", .{ .read = true });
-        defer file.close(io);
         var reader = std.Io.Reader.fixed(body);
-        try std.testing.expectError(error.FileTooLarge, streamMultipart(std.testing.allocator, &reader, "abc", file, io, 2));
+        try std.testing.expectError(error.FileTooLarge, streamMultipart(std.testing.allocator, &reader, "abc", 2));
     }
 }
 
 test "multipart rejects unsafe metadata and extra parts" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const io = std.testing.io;
     const unsafe =
         "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"../bad.nzb\"\r\n\r\nx\r\n--abc--\r\n";
     {
-        var file = try tmp.dir.createFile(io, "unsafe.tmp", .{ .read = true });
-        defer file.close(io);
         var reader = std.Io.Reader.fixed(unsafe);
-        try std.testing.expectError(error.UnsafeFilename, streamMultipart(std.testing.allocator, &reader, "abc", file, io, 100));
+        try std.testing.expectError(error.UnsafeFilename, streamMultipart(std.testing.allocator, &reader, "abc", 100));
     }
     const extra =
         "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"ok.nzb\"\r\n\r\nx\r\n" ++
         "--abc\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\ny\r\n--abc--\r\n";
     {
-        var file = try tmp.dir.createFile(io, "extra.tmp", .{ .read = true });
-        defer file.close(io);
         var reader = std.Io.Reader.fixed(extra);
-        try std.testing.expectError(error.InvalidMultipart, streamMultipart(std.testing.allocator, &reader, "abc", file, io, 100));
+        try std.testing.expectError(error.InvalidMultipart, streamMultipart(std.testing.allocator, &reader, "abc", 100));
     }
     try std.testing.expectEqualStrings("abc", try parseBoundary("multipart/form-data; boundary=\"abc\"; charset=utf-8"));
     try std.testing.expectEqualStrings("abc", try parseBoundary("multipart/form-data; boundary=abc; charset=utf-8"));

@@ -40,6 +40,8 @@ const Finalizers = struct {
     fn deinit(self: *Finalizers) void {
         self.group.cancel(self.io);
         self.group.await(self.io) catch {};
+        var it = self.active.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
         self.active.deinit(self.allocator);
     }
 
@@ -72,6 +74,7 @@ const CleanupTask = struct {
     root: []const u8,
     job: *const Job,
     now: i64,
+    failed_before: i64,
 };
 
 pub fn startup(
@@ -201,9 +204,12 @@ fn processPending(
     defer job.deinit(db.allocator);
     if (job.status != .pending) return;
     std.log.info("job {s} parsing NZB metadata ({d} bytes)", .{ job.id, job.content.len });
-    const document = nzb.parse(allocator, job.content) catch |err| {
-        try db.fail(io, job.id, "The NZB file is not supported by the embedded downloader.", now);
-        return err;
+    var diag: nzb.Diagnostic = .{};
+    const document = nzb.parseWithDiagnostic(allocator, job.content, &diag) catch |err| {
+        const message = "The NZB file is not supported by the embedded downloader.";
+        try db.fail(io, job.id, message, now);
+        std.log.warn("job {s} NZB parse failed at line {d}, column {d}: {t}", .{ job.id, diag.line, diag.column, err });
+        return;
     };
     defer document.deinit(allocator);
     if (!try db.beginProcessing(io, job.id, now)) return;
@@ -332,7 +338,7 @@ fn finalize(
             std.log.info("job {s} complete: artifact ready ({d} bytes)", .{ id, result.size });
             return;
         }
-        return;
+        return error.LeaseRenewalFailed;
     }
     return error.DownloadTokenCollision;
 }
@@ -345,10 +351,11 @@ fn cleanup(
     root: []const u8,
     now: i64,
 ) !void {
+    const failed_before = now - cfg.retention_seconds;
     const jobs = try db.listCleanup(
         io,
         now,
-        now - cfg.retention_seconds,
+        failed_before,
         now - 1800,
     );
     defer {
@@ -360,7 +367,7 @@ fn cleanup(
         const end = @min(offset + max_concurrent_cleanup, jobs.len);
         var group: std.Io.Group = .init;
         for (jobs[offset..end]) |*job| {
-            const task = CleanupTask{ .allocator = allocator, .io = io, .db = db, .root = root, .job = job, .now = now };
+            const task = CleanupTask{ .allocator = allocator, .io = io, .db = db, .root = root, .job = job, .now = now, .failed_before = failed_before };
             group.concurrent(io, processCleanup, .{task}) catch processCleanup(task);
         }
         try group.await(io);
@@ -386,6 +393,7 @@ fn cleanupJob(task: CleanupTask, job: Job) !void {
         try artifact.removeValidated(task.root, job.download_path);
     if (job.artifact_path.len != 0 and !std.mem.eql(u8, job.artifact_path, job.download_path))
         try artifact.removeValidated(task.root, job.artifact_path);
+    if (job.status == .failed) return task.db.purgeFailed(task.io, job.id, task.failed_before);
     _ = try task.db.markExpired(task.io, job.id, job.status, task.now);
 }
 
@@ -404,4 +412,43 @@ fn cleanupWorkDirs(io: std.Io, root_dir: std.Io.Dir, job_id: []const u8) !void {
 test "provider readiness starts false" {
     provider_ready.store(false, .release);
     try std.testing.expect(!provider_ready.load(.acquire));
+}
+
+test "malformed NZB fails job without aborting worker cycle and failed cleanup purges directly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/worker_test.db", .{root});
+    defer std.testing.allocator.free(db_path);
+
+    var db = try Database.open(std.testing.allocator, db_path);
+    defer db.close();
+
+    const bad_id = (try db.createIfCapacity(io, "bad.nzb", "<not-an-nzb/>", 100, 10)).?;
+    defer std.testing.allocator.free(bad_id);
+    const bad_job = (try db.get(io, bad_id)).?;
+    defer bad_job.deinit(std.testing.allocator);
+
+    var cfg = std.mem.zeroes(Config);
+    cfg.retention_seconds = 60;
+    var store: nntp.CaStore = .{};
+    var finalizers = Finalizers{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .db = &db,
+        .cfg = cfg,
+        .root = root,
+    };
+    defer finalizers.deinit();
+
+    try processPending(std.testing.allocator, io, &db, cfg, root, &store, &finalizers, bad_job, 105);
+    const failed_job = (try db.get(io, bad_id)).?;
+    defer failed_job.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Status.failed, failed_job.status);
+
+    try cleanup(std.testing.allocator, io, &db, cfg, root, 200);
+    try std.testing.expect((try db.get(io, bad_id)) == null);
 }
