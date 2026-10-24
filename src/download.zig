@@ -368,47 +368,46 @@ fn hasAnyKnownPar2(manifest: []const FileManifest, files: []const nzb.File) bool
 }
 
 fn resolvePreflightFailures(ctx: *SharedCtx, session: *nntp.Session) !void {
-    var has_failures = false;
+    var first_err: ?anyerror = null;
     for (ctx.manifest) |file| {
-        if (file.preflight_err != null) {
-            has_failures = true;
+        if (file.preflight_err) |err| {
+            first_err = err;
             break;
         }
     }
-    if (!has_failures) return;
+    const initial_err = first_err orelse return;
 
     var has_par2 = hasAnyKnownPar2(ctx.manifest, ctx.files);
     for (ctx.manifest, 0..) |*file, file_index| {
-        const preflight_err = file.preflight_err orelse continue;
-        const nzb_file = ctx.files[file_index];
-        if (subjectFileName(nzb_file.subject)) |subj| {
+        if (file.preflight_err == null) continue;
+        if (subjectFileName(ctx.files[file_index].subject)) |subj| {
             if (isRepairName(subj)) {
                 if (file.name.len == 0) file.name = try ctx.allocator.dupe(u8, subj);
                 has_par2 = true;
-                continue;
             }
         }
+    }
+    if (!has_par2) return initial_err;
+
+    for (ctx.manifest, 0..) |*file, file_index| {
+        if (file.preflight_err == null) continue;
+        if (file.name.len != 0 and isRepairName(file.name)) continue;
+        const nzb_file = ctx.files[file_index];
         if (nzb_file.segments.len > 1) {
-            const limit = if (has_par2) nzb_file.segments.len else @min(nzb_file.segments.len, 2);
-            for (1..limit) |seg_idx| {
+            for (1..nzb_file.segments.len) |seg_idx| {
                 if (fetchItemWithSession(ctx, session, file_index, seg_idx, true)) |_| {
-                    if (isRepairName(file.name)) has_par2 = true;
                     break;
                 } else |err| {
                     if (!isRepairableSegmentError(err)) return err;
                 }
             }
         }
-        if (!has_par2) return preflight_err;
     }
 
     for (ctx.manifest) |file| {
         if (file.preflight_err) |err| {
-            if (file.name.len == 0) {
-                if (has_par2) continue;
-                return err;
-            }
-            if (!isRepairName(file.name) and !has_par2) return err;
+            if (file.name.len != 0 and isRepairName(file.name)) continue;
+            if (file.name.len == 0 or file.size == 0) return err;
         }
     }
 }
@@ -592,6 +591,11 @@ fn fetchItemOnce(
         return err;
     };
 
+    const rel_copy = try ctx.allocator.dupe(u8, part_path);
+    errdefer ctx.allocator.free(rel_copy);
+    var name_copy: ?[]u8 = null;
+    errdefer if (name_copy) |n| ctx.allocator.free(n);
+
     {
         ctx.mutex.lockUncancelable(ctx.io);
         defer ctx.mutex.unlock(ctx.io);
@@ -599,23 +603,33 @@ fn fetchItemOnce(
             std.log.err("file {d} segment {d} size changed: expected {d}, received {d}", .{ file_index + 1, segment_index + 1, ctx.manifest[file_index].size, meta.size });
             return error.InconsistentYencMetadata;
         }
-        try ctx.root_dir.rename(tmp_path, ctx.root_dir, part_path, ctx.io);
         if (is_preflight or ctx.manifest[file_index].size == 0) {
             const name = subjectFileName(ctx.files[file_index].subject) orelse meta.name;
-            if (ctx.manifest[file_index].name.len != 0) ctx.allocator.free(ctx.manifest[file_index].name);
-            ctx.manifest[file_index].name = try ctx.allocator.dupe(u8, name);
-            ctx.manifest[file_index].size = meta.size;
-            std.log.info("file {d} metadata: {s}, {d} bytes, {d} segments", .{ file_index + 1, name, meta.size, ctx.files[file_index].segments.len });
+            name_copy = try ctx.allocator.dupe(u8, name);
         }
     }
-    if (ctx.manifest[file_index].parts[segment_index].rel_path.len != 0)
-        ctx.allocator.free(ctx.manifest[file_index].parts[segment_index].rel_path);
-    ctx.manifest[file_index].parts[segment_index] = .{
-        .begin = meta.begin,
-        .end = meta.end,
-        .rel_path = try ctx.allocator.dupe(u8, part_path),
-        .crc32 = meta.crc32,
-    };
+
+    try ctx.root_dir.rename(tmp_path, ctx.root_dir, part_path, ctx.io);
+
+    {
+        ctx.mutex.lockUncancelable(ctx.io);
+        defer ctx.mutex.unlock(ctx.io);
+        if (name_copy) |owned_name| {
+            if (ctx.manifest[file_index].name.len != 0) ctx.allocator.free(ctx.manifest[file_index].name);
+            ctx.manifest[file_index].name = owned_name;
+            ctx.manifest[file_index].size = meta.size;
+            name_copy = null;
+            std.log.info("file {d} metadata: {s}, {d} bytes, {d} segments", .{ file_index + 1, owned_name, meta.size, ctx.files[file_index].segments.len });
+        }
+        if (ctx.manifest[file_index].parts[segment_index].rel_path.len != 0)
+            ctx.allocator.free(ctx.manifest[file_index].parts[segment_index].rel_path);
+        ctx.manifest[file_index].parts[segment_index] = .{
+            .begin = meta.begin,
+            .end = meta.end,
+            .rel_path = rel_copy,
+            .crc32 = meta.crc32,
+        };
+    }
 }
 
 fn validateDecodedPartSize(meta: yenc.Part) !void {
@@ -682,6 +696,17 @@ fn assembleRepairFiles(
     return repair_name orelse error.InsufficientPar2Data;
 }
 
+fn sortPresentParts(parts: []Part) void {
+    std.mem.sort(Part, parts, {}, struct {
+        fn lessThan(_: void, a: Part, b: Part) bool {
+            const a_present = a.rel_path.len != 0;
+            const b_present = b.rel_path.len != 0;
+            if (a_present != b_present) return a_present;
+            return a.begin < b.begin;
+        }
+    }.lessThan);
+}
+
 fn assembleDamagedFile(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -691,6 +716,7 @@ fn assembleDamagedFile(
     control: *shutdown.DownloadControl,
     progress: *Progress,
 ) !void {
+    sortPresentParts(output.parts);
     const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
     defer allocator.free(final_path);
     var out = try root_dir.createFile(io, final_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
@@ -785,11 +811,18 @@ fn repairWithPar2(
     return error.Par2RepairFailed;
 }
 
-fn expectedFileCrc(parts: []const Part) ?u32 {
+fn expectedFileCrc(parts: []const Part) !?u32 {
+    var expected: ?u32 = null;
     for (parts) |part| {
-        if (part.crc32) |crc| return crc;
+        if (part.crc32) |crc| {
+            if (expected) |prev| {
+                if (prev != crc) return error.InconsistentYencMetadata;
+            } else {
+                expected = crc;
+            }
+        }
     }
-    return null;
+    return expected;
 }
 
 fn validateRepairedFile(
@@ -804,7 +837,7 @@ fn validateRepairedFile(
     var file = try root_dir.openFile(io, path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
     defer file.close(io);
     if (try file.length(io) != output.size) return error.Par2RepairFailed;
-    const expected = expectedFileCrc(output.parts);
+    const expected = try expectedFileCrc(output.parts);
     if (!allPartsPresent(output.parts) and expected == null) {
         const bak_path = try std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, output.name });
         defer allocator.free(bak_path);
@@ -849,7 +882,7 @@ fn assembleFile(
     var out_buffer: [64 * 1024]u8 = undefined;
     var writer = out.writer(io, &out_buffer);
     var reader_buf: [64 * 1024]u8 = undefined;
-    const expected_crc = expectedFileCrc(output.parts);
+    const expected_crc = try expectedFileCrc(output.parts);
     var file_crc: std.hash.Crc32 = .init();
     for (output.parts) |part| {
         try checkCanceled(control);
@@ -1102,4 +1135,59 @@ test "validateRepairedFile requires backup proof when damaged payload lacks full
         bak.close(io);
     }
     try validateRepairedFile(std.testing.allocator, io, tmp.dir, "out", output);
+}
+
+test "resolvePreflightFailures rejects completely missing payload file even when par2 exists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var store: nntp.CaStore = .{};
+    var control = shutdown.DownloadControl.init(io, std.math.maxInt(i64));
+    var progress: Progress = .{};
+    var session = nntp.makeSession(std.testing.allocator, io, "example.test", 563, "u", "p", &store, 1, &control);
+
+    var seg1 = [_]nzb.Segment{.{ .number = 1, .declared_bytes = 10, .message_id = "m1@example.test" }};
+    var seg2 = [_]nzb.Segment{.{ .number = 1, .declared_bytes = 10, .message_id = "m2@example.test" }};
+    var seg3 = [_]nzb.Segment{.{ .number = 1, .declared_bytes = 10, .message_id = "m3@example.test" }};
+    const files = [_]nzb.File{
+        .{ .subject = "part1.bin", .segments = &seg1 },
+        .{ .subject = "part2.bin", .segments = &seg2 },
+        .{ .subject = "repair.par2", .segments = &seg3 },
+    };
+    var manifest = [_]FileManifest{
+        .{ .name = "part1.bin", .size = 10 },
+        .{ .name = "", .size = 0, .preflight_err = error.MissingArticle },
+        .{ .name = "repair.par2", .size = 10 },
+    };
+    var ctx = SharedCtx{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .root_dir = tmp.dir,
+        .work_root = "work",
+        .files = &files,
+        .manifest = &manifest,
+        .cfg = std.mem.zeroes(Config),
+        .ca_store = &store,
+        .control = &control,
+        .progress = &progress,
+    };
+    try std.testing.expectError(error.MissingArticle, resolvePreflightFailures(&ctx, &session));
+}
+
+test "expectedFileCrc detects conflicting full-file crcs and sortPresentParts orders ranges" {
+    const conflict_parts = [_]Part{
+        .{ .begin = 1, .end = 5, .rel_path = "0/0.part", .crc32 = 0x11111111 },
+        .{ .begin = 6, .end = 10, .rel_path = "0/1.part", .crc32 = 0x22222222 },
+    };
+    try std.testing.expectError(error.InconsistentYencMetadata, expectedFileCrc(&conflict_parts));
+
+    var unsorted = [_]Part{
+        .{ .begin = 0, .end = 0, .rel_path = "" },
+        .{ .begin = 11, .end = 20, .rel_path = "0/2.part" },
+        .{ .begin = 1, .end = 10, .rel_path = "0/1.part" },
+    };
+    sortPresentParts(&unsorted);
+    try std.testing.expectEqual(@as(u64, 1), unsorted[0].begin);
+    try std.testing.expectEqual(@as(u64, 11), unsorted[1].begin);
+    try std.testing.expectEqualStrings("", unsorted[2].rel_path);
 }
