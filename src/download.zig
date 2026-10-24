@@ -6,7 +6,7 @@ const yenc = @import("yenc.zig");
 
 const Budget = @import("budget.zig").Budget;
 
-const Config = @import("config.zig").Config;
+const Config = @import("config.zig");
 
 pub const Result = struct {
     relative_path: []const u8,
@@ -22,7 +22,7 @@ pub fn run(
     root: []const u8,
     job_id: []const u8,
     document: nzb.Document,
-    cfg: anytype,
+    cfg: Config.Download,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
     progress: *Progress,
@@ -39,6 +39,11 @@ pub fn run(
     defer root_dir.close(io);
     try ensureDir(io, root_dir, ".nzbunny-work");
     try ensureDir(io, root_dir, ".nzbunny-downloads");
+    // The managed parent itself may have been created in this job. Its entry
+    // must survive before a durable FINALIZING row can refer to output below it.
+    var root_file = try root_dir.openFile(io, ".", .{ .allow_directory = true, .follow_symlinks = false });
+    defer root_file.close(io);
+    try root_file.sync(io);
     const work_root = try std.fmt.allocPrint(allocator, ".nzbunny-work/{s}", .{job_id});
     defer allocator.free(work_root);
     const output_root = try std.fmt.allocPrint(allocator, ".nzbunny-downloads/{s}", .{job_id});
@@ -191,14 +196,14 @@ pub fn run(
     }
 
     var tmp_dir_file = try root_dir.openFile(io, tmp_output_root, .{ .allow_directory = true, .follow_symlinks = false });
+    defer tmp_dir_file.close(io);
     try tmp_dir_file.sync(io);
-    tmp_dir_file.close(io);
 
     try root_dir.rename(tmp_output_root, root_dir, output_root, io);
 
     var downloads_dir_file = try root_dir.openFile(io, ".nzbunny-downloads", .{ .allow_directory = true, .follow_symlinks = false });
+    defer downloads_dir_file.close(io);
     try downloads_dir_file.sync(io);
-    downloads_dir_file.close(io);
 
     try removeTree(io, root_dir, work_root);
 
@@ -238,7 +243,7 @@ const SharedCtx = struct {
     work_root: []const u8,
     files: []const nzb.File,
     manifest: []FileManifest,
-    cfg: Config,
+    cfg: Config.Download,
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
     progress: *Progress,
@@ -256,7 +261,7 @@ fn preflightPhase(
     work_root: []const u8,
     manifest: []FileManifest,
     files: []const nzb.File,
-    cfg: anytype,
+    cfg: Config.Download,
     ca_store: *nntp.CaStore,
     sessions: []nntp.Session,
     control: *shutdown.DownloadControl,
@@ -373,7 +378,7 @@ fn downloadPhase(
     manifest: []FileManifest,
     items: []const WorkItem,
     files: []const nzb.File,
-    cfg: anytype,
+    cfg: Config.Download,
     ca_store: *nntp.CaStore,
     sessions: []nntp.Session,
     control: *shutdown.DownloadControl,
@@ -595,7 +600,7 @@ fn validateDecodedPartSize(meta: yenc.Part) !void {
         return error.InconsistentSegmentSize;
 }
 
-fn validateAggregate(manifest: []FileManifest, included: []const bool, included_count: usize, cfg: anytype) !void {
+fn validateAggregate(manifest: []FileManifest, included: []const bool, included_count: usize, cfg: Config.Download) !void {
     for (manifest, included) |file, keep| if (keep and file.name.len == 0) return error.PreflightIncomplete;
     try rejectDuplicateNames(manifest, included);
     try rejectUnsupportedSet(manifest, included, included_count);
@@ -858,7 +863,7 @@ test "resolvePreflightFailures rejects completely missing payload file even when
         .work_root = "work",
         .files = &files,
         .manifest = &manifest,
-        .cfg = std.mem.zeroes(Config),
+        .cfg = std.mem.zeroes(Config.Download),
         .ca_store = &store,
         .control = &control,
         .progress = &progress,

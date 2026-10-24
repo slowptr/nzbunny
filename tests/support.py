@@ -12,6 +12,7 @@ import urllib.parse
 import subprocess
 import socket
 import threading
+from contextlib import closing
 from pathlib import Path
 
 REMOVED = (
@@ -437,3 +438,112 @@ class ManagedProcess(subprocess.Popen):
             log.flush()
             contents.append(os.pread(log.fileno(), 1024 * 1024, 0).decode())
         return "\n".join(contents)
+
+
+def service_environment(certs, downloads, database, port, **settings):
+    env = dict(os.environ, NNTP_HOST="127.0.0.1", NNTP_USER="test", NNTP_PASS="test",
+               NNTP_CA_FILE=certs["ca_crt"], DOWNLOAD_DIR=str(downloads),
+               DB_PATH=str(database), PORT=str(port))
+    env.update(settings)
+    return env
+
+
+def eventually(condition, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = condition()
+        if result:
+            return result
+        time.sleep(0.05)
+    raise AssertionError("Condition did not become true before its deadline")
+
+
+class Service:
+    def __init__(self, certs, executable, ready=True, **settings):
+        self.executable = executable
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.downloads = self.root / "downloads"
+        self.downloads.mkdir()
+        self.db = self.root / "jobs.db"
+        self.server = FakeNNTPServer(certs, greeting_code=201, two_step_auth=True)
+        self.server.start()
+        self.port = free_port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.env = service_environment(certs, self.downloads, self.db, self.port, NNTP_PORT=str(self.server.port),
+                        NNTP_USER="test", NNTP_PASS="test", NNTP_CA_FILE=certs["ca_crt"],
+                        NNTP_CONNECTIONS="1", NNTP_TIMEOUT="2s", DOWNLOAD_TIMEOUT="30s",
+                        POLL_INTERVAL="1s", CLEANUP_INTERVAL="1s", RETENTION_TTL="10s",
+                        HTTP_HEADER_TIMEOUT="30s", HTTP_REQUEST_TIMEOUT="30s", SHUTDOWN_TIMEOUT="3s",
+                        MAX_ARTIFACT_BYTES="1048576", MAX_WORK_BYTES="4194304",
+                        MAX_STORAGE_BYTES="33554432", MIN_FREE_BYTES="1048576",
+                        MAX_UPLOAD_BYTES="65536", MAX_UPLOAD_MEMORY_BYTES="1048576",
+                        MAX_ACTIVE_JOBS="32", MAX_CONNECTIONS="16", UPLOADS_PER_MINUTE="100")
+        self.env.update(settings)
+        self.proc = None
+        self.ready = ready
+
+    def __enter__(self):
+        try:
+            self.start(self.ready)
+        except Exception:
+            self.__exit__(*sys.exc_info())
+            raise
+        return self
+
+    def launch(self):
+        self.proc = ManagedProcess([str(self.executable)], env=self.env, cwd=self.root)
+
+    def start(self, ready=True):
+        self.launch()
+        wait_for_server(self.url + ("/readyz" if ready else "/healthz"), self.proc)
+
+    def stop(self):
+        started = time.monotonic()
+        self.proc.terminate()
+        self.proc.communicate(timeout=4)
+        return time.monotonic() - started
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.stop()
+            if exc_type and self.proc:
+                print(self.proc.logs(), file=sys.stderr)
+        finally:
+            if self.proc:
+                self.proc.communicate(timeout=4)
+            self.server.stop()
+            self.temp.cleanup()
+
+    def sql(self, query, params=()):
+        with closing(sqlite3.connect(self.db, timeout=2)) as db, db:
+            return db.execute(query, params).fetchall()
+
+    def article(self, message, name="test.bin", data=b"verified payload"):
+        self.server.articles[message] = yenc_encode(name, len(data), 1, 1, 1, len(data), data)
+        return [(1, len(data), message)]
+
+    def upload(self, files):
+        code, location = http_post_file(self.url + "/", "test.nzb", build_nzb(files))
+        assert code == 303, code
+        return location.rsplit("/", 1)[-1]
+
+    def status(self, job):
+        rows = self.sql("SELECT status FROM jobs WHERE id=?", (job,))
+        return rows[0][0] if rows else None
+
+    def completed(self, job):
+        eventually(lambda: self.status(job) == "COMPLETE")
+        row = self.sql("SELECT artifact_path,download_token FROM jobs WHERE id=?", (job,))[0]
+        return self.downloads / row[0], row[1]
+
+    def seed_finalizing(self, job="f" * 32, attempts=0):
+        source = self.downloads / ".nzbunny-downloads" / job
+        source.mkdir(parents=True)
+        (source / "test.bin").write_bytes(b"recoverable publication")
+        now = int(time.time())
+        self.sql("""INSERT INTO jobs(id,filename,status,download_path,created_at,updated_at,finalize_attempts)
+                    VALUES (?, 'test.nzb', 'FINALIZING', ?, ?, ?, ?)""",
+                 (job, f".nzbunny-downloads/{job}/test.bin", now, now, attempts))
+        return job

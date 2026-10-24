@@ -13,8 +13,15 @@ pub const shutdown = @import("shutdown.zig");
 pub const repair = @import("repair.zig");
 pub const runtime = @import("runtime.zig");
 pub const ownership = @import("ownership.zig");
+pub const finalizer = @import("finalizer.zig");
+pub const failure = @import("failure.zig");
 pub const budget = @import("budget.zig");
 pub const storage = @import("storage.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const http = @import("http.zig");
+pub const pages = @import("pages.zig");
+pub const multipart = @import("multipart.zig");
+pub const rate_limit = @import("rate_limit.zig");
 pub const web = @import("web.zig");
 
 pub fn run(init: std.process.Init) !void {

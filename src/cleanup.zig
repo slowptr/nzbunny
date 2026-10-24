@@ -13,6 +13,7 @@ const CleanupTask = struct {
     job: *const Job,
     now: i64,
     failed_before: i64,
+    failures: *std.atomic.Value(u64),
 };
 
 pub fn run(
@@ -22,7 +23,8 @@ pub fn run(
     cfg: Config,
     root: []const u8,
     now: i64,
-) !void {
+) !u64 {
+    var failures: std.atomic.Value(u64) = .init(0);
     const failed_before = now - cfg.retention_seconds;
     const jobs = try db.listCleanup(
         io,
@@ -39,19 +41,22 @@ pub fn run(
         const end = @min(offset + max_concurrent_cleanup, jobs.len);
         var group: std.Io.Group = .init;
         for (jobs[offset..end]) |*job| {
-            const task = CleanupTask{ .allocator = allocator, .io = io, .db = db, .root = root, .job = job, .now = now, .failed_before = failed_before };
+            const task = CleanupTask{ .allocator = allocator, .io = io, .db = db, .root = root, .job = job, .now = now, .failed_before = failed_before, .failures = &failures };
             group.concurrent(io, processCleanup, .{task}) catch processCleanup(task);
         }
         try group.await(io);
         offset = end;
     }
     try sweepOrphans(io, db, root);
+    return failures.load(.acquire);
 }
 
 fn processCleanup(task: CleanupTask) void {
     const job = task.job.*;
-    cleanupJob(task, job) catch |err|
+    cleanupJob(task, job) catch |err| {
+        _ = task.failures.fetchAdd(1, .monotonic);
         std.log.err("Job {s} cleanup failed: {t}", .{ job.id, err });
+    };
 }
 
 fn cleanupJob(task: CleanupTask, job: Job) !void {

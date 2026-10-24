@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "tests",
+        "docs",
         "readme.txt",
         "Dockerfile",
     },

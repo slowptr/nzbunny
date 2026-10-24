@@ -4,50 +4,14 @@ import sys
 import time
 import tempfile
 import subprocess
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support import yenc_encode, FakeNNTPServer, generate_certs, free_port
+from support import (yenc_encode, FakeNNTPServer, generate_certs, free_port,
+                     http_get, http_post_file, build_nzb)
 
 CONTAINER_PORT = free_port()
 IMAGE = os.environ.get("NZBUNNY_TEST_IMAGE", "nzbunny:test")
-
-def http_get(url):
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        return resp.status, resp.read(), resp.headers
-
-class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-def http_post_file(url, filename, content):
-    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-    body = bytearray()
-    body.extend(f"--{boundary}\r\n".encode("latin1"))
-    body.extend(f'Content-Disposition: form-data; name="nzbfile"; filename="{filename}"\r\n'.encode("latin1"))
-    body.extend(b"Content-Type: application/x-nzb\r\n\r\n")
-    body.extend(content)
-    body.extend(f"\r\n--{boundary}--\r\n".encode("latin1"))
-    req = urllib.request.Request(url, data=bytes(body), headers={
-        "Content-Type": f"multipart/form-data; boundary={boundary}"
-    })
-    opener = urllib.request.build_opener(NoRedirectHandler())
-    try:
-        with opener.open(req, timeout=10) as resp:
-            return resp.getcode(), resp.headers.get("Location")
-    except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("Location")
-
-def build_nzb(file_segments):
-    xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<nzb>']
-    for segments in file_segments:
-        xml.append('<file><segments>')
-        for number, bytes_val, msgid in segments:
-            xml.append(f'<segment bytes="{bytes_val}" number="{number}">{msgid}</segment>')
-        xml.append('</segments></file>')
-    xml.append('</nzb>')
-    return "\n".join(xml).encode("utf-8")
 
 def wait_for_ready(base_url, timeout=15):
     deadline = time.monotonic() + timeout

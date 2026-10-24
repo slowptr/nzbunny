@@ -63,6 +63,10 @@ pub const Database = struct {
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !Database {
         const zpath = try allocator.dupeZ(u8, path);
         defer allocator.free(zpath);
+        // A read-write SQLite connection can checkpoint WAL on close even if
+        // no DDL ran. Inspect existing metadata through a read-only connection
+        // first so rejected versions cannot change the main database at all.
+        if (!std.mem.eql(u8, path, ":memory:")) try preflightSchema(zpath);
         const db = try openHandle(zpath);
         errdefer _ = c.sqlite3_close(db);
         try initialize(db);
@@ -168,7 +172,7 @@ pub const Database = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle, job_projection ++ " " ++
-            "WHERE status IN ('PENDING','PROCESSING','FINALIZING') ORDER BY created_at");
+            "WHERE status IN ('PENDING','PROCESSING','FINALIZING') ORDER BY created_at,rowid");
         defer _ = c.sqlite3_finalize(stmt);
         var result: std.ArrayList(Job) = .empty;
         errdefer {
@@ -241,7 +245,7 @@ pub const Database = struct {
     pub fn beginProcessing(self: *Database, io: std.Io, id: []const u8, now: i64) !bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const stmt = try prepare(self.handle, "UPDATE jobs SET status='PROCESSING',content=NULL,updated_at=?1 WHERE id=?2 AND status='PENDING'");
+        const stmt = try prepare(self.handle, "UPDATE jobs SET status='PROCESSING',updated_at=?1 WHERE id=?2 AND status='PENDING'");
         defer _ = c.sqlite3_finalize(stmt);
         try bindInt64(stmt, 1, now);
         try bindText(stmt, 2, id);
@@ -252,7 +256,7 @@ pub const Database = struct {
     pub fn beginFinalizing(self: *Database, io: std.Io, id: []const u8, download_path: []const u8, now: i64) !bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const stmt = try prepare(self.handle, "UPDATE jobs SET status='FINALIZING',download_path=?1,updated_at=?2 WHERE id=?3 AND status='PROCESSING'");
+        const stmt = try prepare(self.handle, "UPDATE jobs SET status='FINALIZING',content=NULL,download_path=?1,updated_at=?2 WHERE id=?3 AND status='PROCESSING'");
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, download_path);
         try bindInt64(stmt, 2, now);
@@ -274,7 +278,10 @@ pub const Database = struct {
         var random: [16]u8 = undefined;
         io.random(&random);
         _ = std.fmt.bufPrint(&token_buf, "{x}", .{random}) catch unreachable;
-        const lease_until = std.math.add(i64, now, lease_duration) catch now + lease_duration;
+        const lease_until = std.math.add(i64, now, lease_duration) catch return error.InvalidLeaseDuration;
+        // All fallible allocations precede the persistent ownership transfer.
+        const owned_token = try self.allocator.dupe(u8, &token_buf);
+        errdefer self.allocator.free(owned_token);
         const stmt = try prepare(self.handle,
             \\UPDATE jobs SET finalize_attempts=finalize_attempts+1,
             \\finalize_lease_until=?1, finalize_lease_token=?2,
@@ -289,16 +296,19 @@ pub const Database = struct {
         try bindInt64(stmt, 3, now);
         try bindText(stmt, 4, id);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return databaseError(self.handle);
-        if (c.sqlite3_changes(self.handle) == 0) return null;
-        return try self.allocator.dupe(u8, token_buf[0..]);
+        if (c.sqlite3_changes(self.handle) == 0) {
+            self.allocator.free(owned_token);
+            return null;
+        }
+        return owned_token;
     }
 
-    pub fn releaseFinalizing(self: *Database, io: std.Io, id: []const u8, token: []const u8, retry_after: i64, now: i64) !void {
+    pub fn releaseFinalizing(self: *Database, io: std.Io, id: []const u8, token: []const u8, retry_after: i64, now: i64, refund_attempt: bool) !void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle,
             \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL,
-            \\finalize_next_at=?1, updated_at=?2
+            \\finalize_next_at=?1, updated_at=?2, finalize_attempts=max(0,finalize_attempts-?5)
             \\WHERE id=?3 AND status='FINALIZING' AND finalize_lease_token=?4
         );
         defer _ = c.sqlite3_finalize(stmt);
@@ -306,6 +316,7 @@ pub const Database = struct {
         try bindInt64(stmt, 2, now);
         try bindText(stmt, 3, id);
         try bindText(stmt, 4, token);
+        try bindInt64(stmt, 5, @intFromBool(refund_attempt));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return databaseError(self.handle);
     }
 
@@ -375,7 +386,7 @@ pub const Database = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const stmt = try prepare(self.handle,
-            \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL, updated_at=?1
+            \\UPDATE jobs SET finalize_lease_until=NULL, finalize_lease_token=NULL, updated_at=?1, finalize_attempts=max(0,finalize_attempts-1)
             \\WHERE status='FINALIZING' AND finalize_lease_until IS NOT NULL
         );
         defer _ = c.sqlite3_finalize(stmt);
@@ -383,15 +394,46 @@ pub const Database = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return databaseError(self.handle);
     }
 
-    pub fn fail(self: *Database, io: std.Io, id: []const u8, reason: []const u8, now: i64) !void {
+    pub fn fail(self: *Database, io: std.Io, id: []const u8, expected: Status, reason: []const u8, now: i64) !bool {
+        if (expected != .pending and expected != .processing) return error.InvalidFailureTransition;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const stmt = try prepare(self.handle, "UPDATE jobs SET status='FAILED',fail_reason=?1,content=NULL,updated_at=?2 WHERE id=?3 AND status NOT IN ('COMPLETE','EXPIRED')");
+        const stmt = try prepare(self.handle, "UPDATE jobs SET status='FAILED',fail_reason=?1,content=NULL,updated_at=?2 WHERE id=?3 AND status=?4");
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, reason);
         try bindInt64(stmt, 2, now);
         try bindText(stmt, 3, id);
+        try bindText(stmt, 4, statusName(expected));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return databaseError(self.handle);
+        return c.sqlite3_changes(self.handle) == 1;
+    }
+
+    pub fn retryProcessing(self: *Database, io: std.Io, id: []const u8, now: i64) !bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const stmt = try prepare(self.handle, "UPDATE jobs SET status='PENDING',updated_at=?1 WHERE id=?2 AND status='PROCESSING' AND content IS NOT NULL");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindInt64(stmt, 1, now);
+        try bindText(stmt, 2, id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return databaseError(self.handle);
+        return c.sqlite3_changes(self.handle) == 1;
+    }
+
+    pub const QueueSnapshot = struct { pending: i64, processing: i64, finalizing: i64, oldest_pending: ?i64 };
+
+    pub fn queueSnapshot(self: *Database, io: std.Io) !QueueSnapshot {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const stmt = try prepare(self.handle, "SELECT coalesce(sum(status='PENDING'),0),coalesce(sum(status='PROCESSING'),0)," ++
+            "coalesce(sum(status='FINALIZING'),0),min(CASE WHEN status='PENDING' THEN created_at END) FROM jobs");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return databaseError(self.handle);
+        return .{
+            .pending = c.sqlite3_column_int64(stmt, 0),
+            .processing = c.sqlite3_column_int64(stmt, 1),
+            .finalizing = c.sqlite3_column_int64(stmt, 2),
+            .oldest_pending = if (c.sqlite3_column_type(stmt, 3) == c.SQLITE_NULL) null else c.sqlite3_column_int64(stmt, 3),
+        };
     }
 
     pub fn failProcessingOnStartup(self: *Database, io: std.Io, now: i64) ![]Job {
@@ -469,6 +511,7 @@ fn openHandle(path: [:0]const u8) !*c.sqlite3 {
     const db = handle.?;
     errdefer _ = c.sqlite3_close(db);
     try exec(db,
+        \\PRAGMA synchronous=FULL;
         \\PRAGMA foreign_keys=ON;
         \\PRAGMA trusted_schema=OFF;
         \\PRAGMA busy_timeout=5000;
@@ -485,19 +528,42 @@ fn activeCount(db: *c.sqlite3) !i64 {
     return c.sqlite3_column_int64(stmt, 0);
 }
 
-fn initialize(db: *c.sqlite3) !void {
-    try exec(db,
-        \\PRAGMA journal_mode=WAL;
-        \\PRAGMA foreign_keys=ON;
-        \\PRAGMA trusted_schema=OFF;
-        \\PRAGMA busy_timeout=5000;
-        \\PRAGMA wal_autocheckpoint=256;
-        \\PRAGMA journal_size_limit=16777216;
-    );
+fn preflightSchema(path: [:0]const u8) !void {
+    var handle: ?*c.sqlite3 = null;
+    const result = c.sqlite3_open_v2(path.ptr, &handle, c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX, null);
+    defer if (handle) |db| {
+        _ = c.sqlite3_close(db);
+    };
+    if (result == c.SQLITE_CANTOPEN) return; // normal open reports errors or creates a missing file
+    if (result != c.SQLITE_OK) return error.DatabaseOpenFailed;
+    try exec(handle.?, "PRAGMA trusted_schema=OFF;");
+    _ = try schemaVersion(handle.?);
+}
+
+fn schemaVersion(db: *c.sqlite3) !?i64 {
     const has_jobs = try tableExists(db, "jobs");
     const has_meta = try tableExists(db, "nzbunny_schema");
     if (has_jobs and !has_meta) return error.LegacyGoSchemaDetected;
-    if (!has_jobs and !has_meta) try exec(db, "PRAGMA auto_vacuum=INCREMENTAL;");
+    if (!has_meta) return null;
+    if (!has_jobs) return error.UnsupportedSchemaVersion;
+    const stmt = try prepare(db, "SELECT version FROM nzbunny_schema");
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW or c.sqlite3_column_type(stmt, 0) != c.SQLITE_INTEGER)
+        return error.UnsupportedSchemaVersion;
+    const version = c.sqlite3_column_int64(stmt, 0);
+    if (version < 1 or version > 3 or c.sqlite3_step(stmt) != c.SQLITE_DONE)
+        return error.UnsupportedSchemaVersion;
+    return version;
+}
+
+fn initialize(db: *c.sqlite3) !void {
+    if (try schemaVersion(db)) |version| {
+        if (version == 1) try migrateV1ToV2(db);
+        if (version <= 2) try migrateV2ToV3(db);
+        try exec(db, "PRAGMA journal_mode=WAL;");
+        return;
+    }
+    try exec(db, "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL;");
     try exec(db,
         \\BEGIN IMMEDIATE;
         \\CREATE TABLE IF NOT EXISTS nzbunny_schema (
@@ -529,23 +595,6 @@ fn initialize(db: *c.sqlite3) !void {
         \\CREATE INDEX IF NOT EXISTS jobs_expiry_idx ON jobs(expires_at);
         \\COMMIT;
     );
-    const stmt = try prepare(db, "SELECT version FROM nzbunny_schema LIMIT 1");
-    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) {
-        _ = c.sqlite3_finalize(stmt);
-        return error.UnsupportedSchemaVersion;
-    }
-    const version = c.sqlite3_column_int(stmt, 0);
-    _ = c.sqlite3_finalize(stmt);
-    if (version == 1) {
-        try migrateV1ToV2(db);
-        try migrateV2ToV3(db);
-        return;
-    }
-    if (version == 2) {
-        try migrateV2ToV3(db);
-        return;
-    }
-    if (version != 3) return error.UnsupportedSchemaVersion;
 }
 
 fn migrateV1ToV2(db: *c.sqlite3) !void {
@@ -851,4 +900,103 @@ fn listWorkWithAllocator(allocator: std.mem.Allocator, db: *Database, io: std.Io
     const jobs = try db.listWork(io);
     defer allocator.free(jobs);
     defer for (jobs) |job| job.deinit(allocator);
+}
+
+test "stale transitions cannot change a newer owner's job" {
+    const io = std.testing.io;
+    var db = try Database.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    const id = (try db.createIfCapacity(io, "state.nzb", "<nzb/>", 1, 1)).?;
+    defer std.testing.allocator.free(id);
+    try std.testing.expect(try db.beginProcessing(io, id, 2));
+    try std.testing.expect(!try db.fail(io, id, .pending, "stale parser", 3));
+    try std.testing.expect(try db.retryProcessing(io, id, 3));
+    const retry = (try db.getWithContent(io, id)).?;
+    defer retry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("<nzb/>", retry.content);
+    try std.testing.expect(try db.beginProcessing(io, id, 4));
+    try std.testing.expect(try db.beginFinalizing(io, id, "source", 5));
+    try std.testing.expect(!try db.retryProcessing(io, id, 6));
+    try std.testing.expect(!try db.fail(io, id, .processing, "stale downloader", 6));
+    try std.testing.expectError(error.InvalidFailureTransition, db.fail(io, id, .finalizing, "no token", 6));
+    const old = (try db.tryClaimFinalizing(io, id, 6, 1)).?;
+    defer std.testing.allocator.free(old);
+    const current = (try db.tryClaimFinalizing(io, id, 8, 60)).?;
+    defer std.testing.allocator.free(current);
+    try std.testing.expect(!try db.renewLease(io, id, old, 100, 9));
+    try std.testing.expect(!try db.completeWithToken(io, id, old, "wrong.bin", 1, "wrong", 100, 9));
+    try db.releaseFinalizing(io, id, old, 10, 9, true);
+    try db.failFinalizing(io, id, old, "stale finalizer", 9);
+    const job = (try db.getWithContent(io, id)).?;
+    defer job.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Status.finalizing, job.status);
+    try std.testing.expectEqualStrings(current, job.finalize_lease_token);
+    try std.testing.expectEqual(@as(u32, 2), job.finalize_attempts);
+    try std.testing.expectEqual(@as(usize, 0), job.content.len);
+    try std.testing.expect(try db.completeWithToken(io, id, current, "right.bin", 1, "right", 100, 9));
+}
+
+test "allocation failure cannot consume a finalizing lease or attempt" {
+    const io = std.testing.io;
+    var db = try Database.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    const id = (try db.createIfCapacity(io, "allocation.nzb", "<nzb/>", 1, 1)).?;
+    defer std.testing.allocator.free(id);
+    try std.testing.expect(try db.beginProcessing(io, id, 2));
+    try std.testing.expect(try db.beginFinalizing(io, id, "source", 3));
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    db.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, db.tryClaimFinalizing(io, id, 4, 60));
+    db.allocator = std.testing.allocator;
+    const job = (try db.get(io, id)).?;
+    defer job.deinit(std.testing.allocator);
+    try std.testing.expect(job.finalize_lease_until == null);
+    try std.testing.expectEqual(@as(u32, 0), job.finalize_attempts);
+    const token = (try db.tryClaimFinalizing(io, id, 4, 60)).?;
+    defer std.testing.allocator.free(token);
+    try db.releaseFinalizing(io, id, token, 5, 4, true);
+    const deferred = (try db.get(io, id)).?;
+    defer deferred.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), deferred.finalize_attempts);
+    try std.testing.expect((try db.tryClaimFinalizing(io, id, 4, 60)) == null);
+}
+
+test "unsupported metadata is rejected before schema mutation" {
+    for ([_][]const u8{ "99", "0", "3),(3" }) |version| {
+        var db = try Database.open(std.testing.allocator, ":memory:");
+        defer db.close();
+        try exec(db.handle, "DROP INDEX jobs_expiry_idx; DELETE FROM nzbunny_schema;");
+        const sql = try std.fmt.allocPrintSentinel(std.testing.allocator, "INSERT INTO nzbunny_schema VALUES ({s})", .{version}, 0);
+        defer std.testing.allocator.free(sql);
+        try exec(db.handle, sql);
+        try std.testing.expectError(error.UnsupportedSchemaVersion, initialize(db.handle));
+        const stmt = try prepare(db.handle, "SELECT count(*) FROM sqlite_master WHERE name='jobs_expiry_idx'");
+        defer _ = c.sqlite3_finalize(stmt);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+    }
+}
+
+test "queue snapshots and equal-second FIFO preserve insertion order" {
+    const io = std.testing.io;
+    var db = try Database.open(std.testing.allocator, ":memory:");
+    defer db.close();
+    const empty = try db.queueSnapshot(io);
+    try std.testing.expectEqual(@as(i64, 0), empty.pending);
+    try std.testing.expect(empty.oldest_pending == null);
+    const first = (try db.createIfCapacity(io, "first.nzb", "<nzb/>", 100, 2)).?;
+    defer std.testing.allocator.free(first);
+    const second = (try db.createIfCapacity(io, "second.nzb", "<nzb/>", 100, 2)).?;
+    defer std.testing.allocator.free(second);
+    const jobs = try db.listWork(io);
+    defer db.allocator.free(jobs);
+    defer for (jobs) |job| job.deinit(db.allocator);
+    try std.testing.expectEqualStrings(first, jobs[0].id);
+    try std.testing.expectEqualStrings(second, jobs[1].id);
+    try std.testing.expect(try db.beginProcessing(io, first, 101));
+    const snapshot = try db.queueSnapshot(io);
+    try std.testing.expectEqual(@as(i64, 1), snapshot.pending);
+    try std.testing.expectEqual(@as(i64, 1), snapshot.processing);
+    try std.testing.expectEqual(@as(i64, 0), snapshot.finalizing);
+    try std.testing.expectEqual(@as(?i64, 100), snapshot.oldest_pending);
 }

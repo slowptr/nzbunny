@@ -27,6 +27,24 @@ pub const Storage = struct {
         self.reserved = reserved;
     }
 
+    /// An admission probe, not a reservation held on behalf of a future job.
+    pub fn check(self: *Storage, io: std.Io, bytes: u64) !void {
+        try self.reserve(io, bytes);
+        self.release(io, bytes);
+    }
+
+    pub const Snapshot = struct { managed_bytes: u64, reserved_bytes: u64, available_bytes: u64 };
+
+    pub fn snapshot(self: *Storage, io: std.Io) !Snapshot {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var root = try std.Io.Dir.openDirAbsolute(io, self.root, .{ .iterate = true, .follow_symlinks = false });
+        defer root.close(io);
+        var stats: c.struct_statvfs = undefined;
+        if (c.fstatvfs(root.handle, &stats) != 0) return error.StorageUnavailable;
+        return .{ .managed_bytes = try managedBytes(io, root), .reserved_bytes = self.reserved, .available_bytes = try std.math.mul(u64, stats.f_bavail, stats.f_frsize) };
+    }
+
     pub fn release(self: *Storage, io: std.Io, bytes: u64) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -66,7 +84,11 @@ pub fn directoryBytes(io: std.Io, parent: std.Io.Dir, name: []const u8, depth: u
                 };
                 break :blk stat.size;
             },
-            else => return error.UnsafeStorageEntry,
+            // Never follow symlinks or open special files while accounting.
+            // They hold no managed payload bytes; artifact/download consumers
+            // reject them before use. This lets invalid jobs reach validation
+            // and cleanup instead of blocking all storage admission forever.
+            else => 0,
         };
         total = std.math.add(u64, total, size) catch return error.StorageFull;
     }

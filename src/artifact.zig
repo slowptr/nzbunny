@@ -19,6 +19,7 @@ const WriteCtx = struct {
     written: u64 = 0,
     cap: u64,
     control: ?*shutdown.DownloadControl = null,
+    failure: ?anyerror = null,
 };
 
 fn boundedWriteCallback(
@@ -30,18 +31,36 @@ fn boundedWriteCallback(
     _ = a;
     if (length == 0) return 0;
     const ctx: *WriteCtx = @ptrCast(@alignCast(client_data.?));
-    checkControl(ctx.control) catch return -1;
-    const new_written = std.math.add(u64, ctx.written, @as(u64, length)) catch return -1;
-    if (new_written > ctx.cap) return -1;
+    checkControl(ctx.control) catch |err| {
+        ctx.failure = err;
+        return -1;
+    };
+    const new_written = std.math.add(u64, ctx.written, @as(u64, length)) catch {
+        ctx.failure = error.ArtifactTooLarge;
+        return -1;
+    };
+    if (new_written > ctx.cap) {
+        ctx.failure = error.ArtifactTooLarge;
+        return -1;
+    }
     const buf: [*]const u8 = @ptrCast(buffer.?);
     var written: usize = 0;
     while (written < length) {
         const write_count = c.write(ctx.fd, buf + written, length - written);
         if (write_count < 0) {
             if (std.c._errno().* == c.EINTR) continue;
+            ctx.failure = switch (std.c._errno().*) {
+                c.ENOSPC => error.NoSpaceLeft,
+                c.EDQUOT => error.DiskQuota,
+                c.EIO => error.InputOutput,
+                else => error.ArchiveWriteFailed,
+            };
             return -1;
         }
-        if (write_count == 0) return -1;
+        if (write_count == 0) {
+            ctx.failure = error.ArchiveWriteFailed;
+            return -1;
+        }
         written += @intCast(write_count);
         ctx.written += @as(u64, @intCast(write_count));
     }
@@ -127,6 +146,7 @@ fn prepareImpl(
         0,
     ) catch return error.ArtifactDirectoryUnsafe;
     defer _ = c.close(artifact_fd);
+    if (c.fsync(root_fd) != 0) return error.ArtifactDirectoryFailed;
 
     const source_fd = openRelative(root_fd, rel) catch |err| switch (err) {
         error.SymbolicLinkRejected => return error.SymbolicLinkRejected,
@@ -143,6 +163,7 @@ fn prepareImpl(
     else
         try std.fmt.bufPrintZ(&final_name_buffer, "{s}.bin", .{job_id});
     if (existingRegularAt(artifact_fd, final_name, max_bytes)) |size| {
+        if (c.fsync(artifact_fd) != 0) return error.ArtifactDirectoryFailed;
         return .{
             .relative_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ artifact_name, final_name }),
             .size = size,
@@ -164,6 +185,7 @@ fn prepareImpl(
     if (mode == c.S_IFREG) {
         const source_size: u64 = @intCast(source_fd.stat.st_size);
         if (source_size > max_bytes) return error.ArtifactTooLarge;
+        if (c.fsync(source_fd.fd) != 0) return error.ArchiveWriteFailed;
         if (tryHardlinkRelative(root_fd, rel, artifact_fd, temp_name, source_fd.stat)) {
             if (c.renameat(artifact_fd, temp_name, artifact_fd, final_name) != 0)
                 return error.ArchiveRenameFailed;
@@ -211,9 +233,9 @@ fn prepareImpl(
             if (archive_open) _ = c.archive_write_close(archive);
         }
         var limits = Limits{ .max_bytes = max_bytes, .control = control };
-        try walkFd(archive, source_fd.fd, "", &limits, 0, io_buffer);
+        walkFd(archive, source_fd.fd, "", &limits, 0, io_buffer) catch |err| return write_ctx.failure orelse err;
         const close_rc = c.archive_write_close(archive);
-        if (close_rc != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
+        if (close_rc != c.ARCHIVE_OK) return write_ctx.failure orelse error.ArchiveCloseFailed;
         archive_open = false;
     }
 
@@ -225,8 +247,8 @@ fn prepareImpl(
         return error.ArchiveStatFailed;
     const size: u64 = @intCast(temp_stat.st_size);
     if (size > max_bytes) return error.ArtifactTooLarge;
-    if (c.close(temp_fd) != 0) return error.ArchiveCloseFileFailed;
     temp_open = false;
+    if (c.close(temp_fd) != 0) return error.ArchiveCloseFileFailed;
     if (c.renameat(artifact_fd, temp_name, artifact_fd, final_name) != 0)
         return error.ArchiveRenameFailed;
     if (c.fsync(artifact_fd) != 0) return error.ArtifactDirectoryFailed;
@@ -559,6 +581,7 @@ fn existingRegularAt(directory_fd: c_int, name: [:0]const u8, max: u64) !u64 {
     if ((stat.st_mode & c.S_IFMT) != c.S_IFREG) return error.SpecialFileRejected;
     const size: u64 = @intCast(stat.st_size);
     if (size > max) return error.ArtifactTooLarge;
+    if (c.fsync(fd) != 0) return error.ArchiveWriteFailed;
     return size;
 }
 
@@ -763,4 +786,12 @@ test "shutdown interrupts zip finalization and removes its temporary artifact" {
 fn stopFinalization(io: std.Io, state: *shutdown.State) std.Io.Cancelable!void {
     try std.Io.sleep(io, .fromMilliseconds(10), .awake);
     state.requested.store(true, .release);
+}
+
+test "archive output cap remains a terminal size error rather than an infrastructure retry" {
+    var ctx: WriteCtx = .{ .fd = -1, .cap = 1 };
+    const bytes = "ab";
+    try std.testing.expectEqual(@as(isize, -1), boundedWriteCallback(null, &ctx, bytes.ptr, bytes.len));
+    try std.testing.expectEqual(error.ArtifactTooLarge, ctx.failure.?);
+    try std.testing.expect(!@import("failure.zig").isInfrastructure(ctx.failure.?));
 }

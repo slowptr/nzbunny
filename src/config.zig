@@ -29,6 +29,34 @@ pub const Config = struct {
     max_connections: u32,
     uploads_per_minute: u32,
 
+    pub fn download(self: Config) Download {
+        return .{
+            .nntp_host = self.nntp_host,
+            .nntp_user = self.nntp_user,
+            .nntp_pass = self.nntp_pass,
+            .nntp_port = self.nntp_port,
+            .nntp_connections = self.nntp_connections,
+            .nntp_timeout_seconds = self.nntp_timeout_seconds,
+            .max_artifact_bytes = self.max_artifact_bytes,
+            .max_work_bytes = self.max_work_bytes,
+        };
+    }
+
+    pub fn finalizer(self: Config) Finalizer {
+        return .{ .max_artifact_bytes = self.max_artifact_bytes, .retention_seconds = self.retention_seconds, .download_timeout_seconds = self.download_timeout_seconds };
+    }
+
+    pub fn validate(self: Config) !void {
+        if (self.max_upload_memory_bytes < try uploadCharge(self.max_upload_bytes))
+            return error.UploadMemoryBudgetTooSmall;
+        if (self.max_work_bytes < self.max_artifact_bytes) return error.WorkBudgetTooSmall;
+        if (self.max_storage_bytes < self.max_work_bytes or self.max_storage_bytes < self.max_artifact_bytes)
+            return error.StorageBudgetTooSmall;
+        if (self.max_artifact_bytes > std.math.maxInt(i64)) return error.ArtifactBudgetTooLarge;
+        if (self.db_path.len == 0 or std.mem.findScalar(u8, self.db_path, 0) != null)
+            return error.InvalidDatabasePath;
+    }
+
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.nntp_host);
         allocator.free(self.nntp_user);
@@ -39,6 +67,28 @@ pub const Config = struct {
         allocator.free(self.trusted_proxy_cidrs);
     }
 };
+
+/// Borrowed views: these types never own or free configuration strings.
+pub const Download = struct {
+    nntp_host: []const u8 = "",
+    nntp_user: []const u8 = "",
+    nntp_pass: []const u8 = "",
+    nntp_port: u16 = 563,
+    nntp_connections: u32 = 1,
+    nntp_timeout_seconds: u32 = 30,
+    max_artifact_bytes: u64,
+    max_work_bytes: u64 = 0,
+};
+
+pub const Finalizer = struct {
+    max_artifact_bytes: u64,
+    retention_seconds: i64,
+    download_timeout_seconds: u32,
+};
+
+pub fn uploadCharge(bytes: u64) !u64 {
+    return std.math.add(u64, try std.math.mul(u64, bytes, 4), 256 * 1024);
+}
 
 const Defaults = struct {
     const db_path = "nzbunny.db";
@@ -128,7 +178,7 @@ fn loadFromMap(allocator: std.mem.Allocator, env: *const std.process.Environ.Map
     const owned_cidrs = try allocator.dupe(u8, trusted_proxy_cidrs);
     errdefer allocator.free(owned_cidrs);
 
-    return .{
+    const cfg: Config = .{
         .nntp_host = owned_host,
         .nntp_user = owned_user,
         .nntp_pass = owned_pass,
@@ -157,6 +207,8 @@ fn loadFromMap(allocator: std.mem.Allocator, env: *const std.process.Environ.Map
         .max_connections = max_connections,
         .uploads_per_minute = uploads_per_minute,
     };
+    try cfg.validate();
+    return cfg;
 }
 
 fn validateNntpValue(text: []const u8) !void {
@@ -278,4 +330,23 @@ test "NNTP configuration rejects unsafe control bytes and connection range" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("news.example.com", cfg.nntp_host);
     try std.testing.expectEqual(@as(u16, 563), cfg.nntp_port);
+}
+
+test "configuration rejects budgets that cannot admit configured work" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("NNTP_HOST", "news.example.com");
+    try map.put("NNTP_USER", "test");
+    try map.put("NNTP_PASS", "test");
+    try map.put("DOWNLOAD_DIR", "/downloads");
+    inline for (.{
+        .{ "MAX_UPLOAD_MEMORY_BYTES", "1024", error.UploadMemoryBudgetTooSmall },
+        .{ "MAX_WORK_BYTES", "1024", error.WorkBudgetTooSmall },
+        .{ "MAX_STORAGE_BYTES", "1024", error.StorageBudgetTooSmall },
+        .{ "DB_PATH", "", error.InvalidDatabasePath },
+    }) |item| {
+        try map.put(item[0], item[1]);
+        try std.testing.expectError(item[2], loadFromMap(std.testing.allocator, &map));
+        _ = map.swapRemove(item[0]);
+    }
 }

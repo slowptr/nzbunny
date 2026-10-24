@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from support import (
     FakeNNTPServer, ManagedProcess, build_nzb, free_port, generate_certs,
-    http_get, http_post_file, test_residual_references, wait_for_server, yenc_encode,
+    http_get, http_post_file, test_residual_references, wait_for_server, yenc_encode, service_environment,
 )
 
 def main():
@@ -41,19 +41,9 @@ def main():
         db_path = os.path.join(temp_dir, "nzbunny.db")
         os.makedirs(download_dir, exist_ok=True)
 
-        env = os.environ.copy()
-        env.update({
-            "NNTP_HOST": "127.0.0.1",
-            "NNTP_PORT": str(server.port),
-            "NNTP_USER": "testuser",
-            "NNTP_PASS": "testpass",
-            "NNTP_CA_FILE": certs["ca_crt"],
-            "DOWNLOAD_DIR": download_dir,
-            "DB_PATH": db_path,
-            "PORT": str(port),
-            "NNTP_CONNECTIONS": "4",
-            "POLL_INTERVAL": "1s",
-        })
+        env = service_environment(certs, download_dir, db_path, port,
+                                  NNTP_PORT=str(server.port), NNTP_USER="testuser", NNTP_PASS="testpass",
+                                  NNTP_CONNECTIONS="4", POLL_INTERVAL="1s")
 
         print("[4/16] Testing single direct file E2E download...")
         proc = ManagedProcess([str(executable)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

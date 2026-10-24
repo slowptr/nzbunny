@@ -194,6 +194,8 @@ pub fn validateRepairedFile(
         }
         if (actual.final() != crc) return error.YencCrcMismatch;
     }
+    // PAR2 may have rewritten the inode after assembly synced it.
+    try file.sync(io);
 }
 
 pub fn assembleFile(
@@ -265,4 +267,23 @@ fn checkCanceled(control: *shutdown.DownloadControl) !void {
         control.timeout();
         return error.Timeout;
     }
+}
+
+test "repaired payload must sync successfully before it can be published" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "repaired.bin", .data = "abc" });
+    // Override only the sync operation; the real file is opened and validated.
+    // A rejected sync must propagate instead of treating verified bytes as durable.
+    var vtable = io.vtable.*;
+    vtable.fileSync = struct {
+        fn fail(_: ?*anyopaque, _: std.Io.File) std.Io.File.SyncError!void {
+            return error.InputOutput;
+        }
+    }.fail;
+    const failing_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const manifest: FileManifest = .{ .name = "repaired.bin", .size = 3 };
+    try std.testing.expectError(error.InputOutput, validateRepairedFile(std.testing.allocator, failing_io, tmp.dir, ".", manifest));
+    try validateRepairedFile(std.testing.allocator, io, tmp.dir, ".", manifest);
 }

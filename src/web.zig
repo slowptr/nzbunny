@@ -4,7 +4,6 @@ const Config = config.Config;
 const Database = @import("database.zig").Database;
 const Job = @import("database.zig").Job;
 const shutdown = @import("shutdown.zig");
-const worker = @import("worker.zig");
 const AppState = @import("runtime.zig").AppState;
 const nntp = @import("nntp.zig");
 
@@ -12,229 +11,14 @@ const css = @embedFile("assets/styles.css");
 const javascript = @embedFile("assets/upload.js");
 const logo = @embedFile("assets/nzbunny.png");
 
-const index_html =
-    \\<!DOCTYPE html>
-    \\<html lang="en">
-    \\<head>
-    \\    <meta charset="UTF-8">
-    \\    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    \\    <link rel="stylesheet" href="/public/styles.css">
-    \\    <title>nzbunny</title>
-    \\</head>
-    \\<body>
-    \\    <main>
-    \\      <div class="module-container">
-    \\          <form method="post" action="/" enctype="multipart/form-data">
-    \\              <div class="drop-zone" id="dropZone">
-    \\                <input type="file" id="nzbfile" name="nzbfile" accept=".nzb" required>
-    \\                <h2>Drop a file here</h2>
-    \\                <p>or click to browse</p>
-    \\                <div class="file-list" id="fileList"></div>
-    \\              </div>
-    \\              <button type="submit">Upload</button>
-    \\          </form>
-    \\      </div>
-    \\    </main>
-    \\    <img src="/public/nzbunny.png" alt="nzbunny logo" class="logo">
-    \\    <script src="/public/upload.js"></script>
-    \\</body>
-    \\</html>
-;
-
-const Context = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    db: *Database,
-    cfg: Config,
-    root: []const u8,
-    root_dir: std.Io.Dir,
-    ca_store: *nntp.CaStore,
-    connections: std.Io.Semaphore,
-    limiter: RateLimiter,
-    state: *AppState,
-    streams_mutex: std.Io.Mutex = .init,
-    streams: std.AutoHashMapUnmanaged(std.posix.fd_t, std.Io.net.Stream) = .empty,
-};
-
-const RateEntry = struct {
-    key: u64 = 0,
-    count: u32 = 0,
-    window: i64 = 0,
-    used: bool = false,
-};
-
-const RateShard = struct {
-    entries: [32]RateEntry = @splat(.{}),
-    mutex: std.Io.Mutex = .init,
-};
-
-const RateLimiter = struct {
-    shards: [256]RateShard = @splat(.{}),
-    seed: u64 = 0,
-
-    fn allow(self: *RateLimiter, io: std.Io, key_text: []const u8, limit: u32, now: i64) bool {
-        const key = std.hash.Wyhash.hash(self.seed, key_text);
-        const shard = &self.shards[@as(u8, @truncate(key))];
-        shard.mutex.lockUncancelable(io);
-        defer shard.mutex.unlock(io);
-        var free: ?usize = null;
-        var oldest: usize = 0;
-        for (&shard.entries, 0..) |*entry, i| {
-            if (!entry.used) {
-                free = i;
-                break;
-            }
-            if (entry.key == key) {
-                if (now - entry.window >= 60) {
-                    entry.* = .{ .key = key, .count = 1, .window = now, .used = true };
-                    return true;
-                }
-                if (entry.count >= limit) return false;
-                entry.count += 1;
-                return true;
-            }
-            if (entry.window < shard.entries[oldest].window) oldest = i;
-        }
-        const slot = free orelse oldest;
-        shard.entries[slot] = .{ .key = key, .count = 1, .window = now, .used = true };
-        return true;
-    }
-};
+const http = @import("http.zig");
+const Context = http.Context;
+const multipart = @import("multipart.zig");
+const diagnostics = @import("diagnostics.zig");
+const pages = @import("pages.zig");
 
 pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8, ca_store: *nntp.CaStore, state: *AppState) !void {
-    const address = try std.Io.net.IpAddress.parse("0.0.0.0", cfg.port);
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-    defer state.shutdown.requested.store(true, .release);
-    const root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
-    defer root_dir.close(io);
-    var context = Context{
-        .allocator = allocator,
-        .io = io,
-        .db = db,
-        .cfg = cfg,
-        .root = root,
-        .root_dir = root_dir,
-        .ca_store = ca_store,
-        .connections = .{ .permits = cfg.max_connections },
-        .limiter = .{},
-        .state = state,
-    };
-    defer context.streams.deinit(allocator);
-    io.random(std.mem.asBytes(&context.limiter.seed));
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store, state });
-    var watcher_group: std.Io.Group = .init;
-    defer watcher_group.cancel(io);
-    try watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener, &context });
-    defer {
-        state.shutdown.requested.store(true, .release);
-        closeStreams(&context);
-        group.cancel(io);
-    }
-    while (!state.shutdown.requested.load(.acquire)) {
-        try context.connections.wait(io);
-        if (state.shutdown.requested.load(.acquire)) {
-            context.connections.post(io);
-            break;
-        }
-        const stream = listener.accept(io) catch |err| {
-            context.connections.post(io);
-            if (state.shutdown.requested.load(.acquire)) break;
-            std.log.warn("Accept failed: {t}", .{err});
-            continue;
-        };
-        context.streams_mutex.lockUncancelable(io);
-        if (state.shutdown.requested.load(.acquire)) {
-            context.streams_mutex.unlock(io);
-            stream.close(io);
-            context.connections.post(io);
-            break;
-        }
-        context.streams.put(allocator, stream.socket.handle, stream) catch |err| {
-            context.streams_mutex.unlock(io);
-            stream.close(io);
-            context.connections.post(io);
-            return err;
-        };
-        context.streams_mutex.unlock(io);
-        group.async(io, accept, .{ &context, stream });
-    }
-    group.await(io) catch {};
-}
-
-fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server, context: *Context) std.Io.Cancelable!void {
-    while (!context.state.shutdown.requested.load(.acquire))
-        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
-    const stream: std.Io.net.Stream = .{ .socket = listener.socket };
-    stream.shutdown(io, .both) catch {};
-    closeStreams(context);
-    context.connections.post(io);
-    try std.Io.sleep(io, .fromSeconds(context.cfg.shutdown_seconds), .awake);
-    std.log.err("Shutdown deadline exceeded; unfinished jobs will recover at the next start.", .{});
-    std.process.exit(1);
-}
-
-fn closeStreams(context: *Context) void {
-    context.streams_mutex.lockUncancelable(context.io);
-    defer context.streams_mutex.unlock(context.io);
-    var streams = context.streams.valueIterator();
-    while (streams.next()) |active| active.shutdown(context.io, .both) catch {};
-}
-
-fn accept(context: *Context, stream: std.Io.net.Stream) void {
-    defer context.connections.post(context.io);
-    defer stream.close(context.io);
-    defer {
-        context.streams_mutex.lockUncancelable(context.io);
-        _ = context.streams.remove(stream.socket.handle);
-        context.streams_mutex.unlock(context.io);
-    }
-    var peer_buffer: [64]u8 = undefined;
-    var peer_writer = std.Io.Writer.fixed(&peer_buffer);
-    var peer_address = stream.socket.address;
-    peer_address.setPort(0);
-    peer_address.format(&peer_writer) catch return;
-    const peer = peer_writer.buffered();
-    var receive_buffer: [32 * 1024]u8 = undefined;
-    var send_buffer: [16 * 1024]u8 = undefined;
-    var conn_reader = stream.reader(context.io, &receive_buffer);
-    var conn_writer = stream.writer(context.io, &send_buffer);
-    var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
-    while (server.reader.state == .ready and !context.state.shutdown.requested.load(.acquire)) {
-        var request = blk: {
-            var header_timeout: std.Io.Group = .init;
-            defer header_timeout.cancel(context.io);
-            header_timeout.concurrent(context.io, shutdownAfter, .{
-                stream,
-                context.io,
-                context.cfg.http_header_seconds,
-            }) catch return;
-            break :blk server.receiveHead() catch return;
-        };
-        var arena = std.heap.ArenaAllocator.init(context.allocator);
-        defer arena.deinit();
-        {
-            var request_timeout: std.Io.Group = .init;
-            defer request_timeout.cancel(context.io);
-            request_timeout.concurrent(context.io, shutdownAfter, .{
-                stream,
-                context.io,
-                context.cfg.http_request_seconds,
-            }) catch return;
-            route(&request, context, peer_address, peer, arena.allocator()) catch |err| {
-                std.log.err("Request failed: {t}", .{err});
-                return;
-            };
-        }
-    }
-}
-
-fn shutdownAfter(stream: std.Io.net.Stream, io: std.Io, seconds: u32) std.Io.Cancelable!void {
-    try std.Io.sleep(io, .fromSeconds(seconds), .awake);
-    stream.shutdown(io, .both) catch |err|
-        std.log.debug("Timed out connection shutdown failed: {t}", .{err});
+    return http.serve(allocator, io, db, cfg, root, ca_store, state, route);
 }
 
 fn route(
@@ -251,12 +35,23 @@ fn route(
     }
     if (std.mem.eql(u8, target, "/readyz")) {
         if (request.head.method != .GET and request.head.method != .HEAD) return methodNotAllowed(request);
-        if (context.db.ready(context.io) and context.state.storage_ready.load(.acquire) and context.state.database_ready.load(.acquire) and context.state.providerAvailable(context.io, context.cfg) and !context.state.shutdown.requested.load(.acquire)) return respondText(request, .ok, "ready");
-        return respondText(request, .service_unavailable, "The service is not ready.");
+        const reason = diagnostics.readiness(context.io, context.db, context.cfg, context.state);
+        return respondText(request, if (reason == .ready) .ok else .service_unavailable, @tagName(reason));
+    }
+    if (std.mem.eql(u8, target, "/metrics")) {
+        if (request.head.method != .GET and request.head.method != .HEAD) return methodNotAllowed(request);
+        const body = diagnostics.metrics(allocator, context.io, context.db, context.cfg, context.state) catch
+            return respondText(request, .service_unavailable, "Diagnostics are unavailable.");
+        defer allocator.free(body);
+        return request.respond(body, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/plain; version=0.0.4; charset=utf-8" },
+            .{ .name = "cache-control", .value = "no-store" },
+            .{ .name = "x-content-type-options", .value = "nosniff" },
+        } });
     }
     if (std.mem.eql(u8, target, "/")) {
         return switch (request.head.method) {
-            .GET, .HEAD => request.respond(index_html, .{ .extra_headers = &.{
+            .GET, .HEAD => request.respond(pages.index_html, .{ .extra_headers = &.{
                 .{ .name = "content-type", .value = "text/html; charset=utf-8" },
                 .{ .name = "cache-control", .value = "no-store" },
                 .{ .name = "x-content-type-options", .value = "nosniff" },
@@ -308,7 +103,7 @@ fn upload(
         return respondText(request, .payload_too_large, "The upload is too large.");
     const content_type = request.head.content_type orelse
         return respondText(request, .bad_request, "The multipart content type is required.");
-    const boundary = parseBoundary(content_type) catch
+    const boundary = multipart.parseBoundary(content_type) catch
         return respondText(request, .bad_request, "The multipart boundary is not valid.");
     const has_capacity = context.db.hasCapacity(context.io, context.cfg.max_active_jobs) catch
         return respondText(request, .internal_server_error, "The job could not be saved.");
@@ -317,8 +112,7 @@ fn upload(
 
     // Account for parser growth, the returned content, and fixed buffers before
     // reading any body. Admission is independent of HTTP connection capacity.
-    const upload_charge = std.math.add(u64, std.math.mul(u64, context.cfg.max_upload_bytes, 4) catch
-        return respondText(request, .service_unavailable, "Upload capacity is unavailable."), 256 * 1024) catch
+    const upload_charge = config.uploadCharge(context.cfg.max_upload_bytes) catch
         return respondText(request, .service_unavailable, "Upload capacity is unavailable.");
     context.state.uploads.reserve(upload_charge) catch
         return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
@@ -329,12 +123,13 @@ fn upload(
 
     var body_buffer: [8192]u8 = undefined;
     const reader = try request.readerExpectContinue(&body_buffer);
-    const part = streamMultipart(
+    const part = multipart.parse(
         context.allocator,
         reader,
         boundary,
         context.cfg.max_upload_bytes,
     ) catch |err| switch (err) {
+        error.OutOfMemory => return respondText(request, .service_unavailable, "Upload capacity is unavailable."),
         error.FileTooLarge => return respondText(request, .payload_too_large, "The NZB file is too large."),
         error.EmptyFile => return respondText(request, .bad_request, "Select a non-empty NZB file."),
         error.UnsafeFilename => return respondText(request, .bad_request, "The file name is not safe."),
@@ -342,7 +137,10 @@ fn upload(
         else => return respondText(request, .bad_request, "The multipart upload is not valid."),
     };
     defer part.deinit(context.allocator);
-    const filename = try normalizeFilename(allocator, part.filename);
+    const filename = multipart.normalizeFilename(allocator, part.filename) catch |err| switch (err) {
+        error.UnsafeFilename => return respondText(request, .bad_request, "The file name is not safe."),
+        else => return err,
+    };
     const id = (context.db.createIfCapacity(
         context.io,
         filename,
@@ -370,111 +168,14 @@ fn jobPage(
     if (!validHex(id, 32)) return respondText(request, .not_found, "Not found.");
     const job = (try context.db.get(context.io, id)) orelse return respondText(request, .not_found, "Not found.");
     defer job.deinit(context.db.allocator);
-    var page = std.Io.Writer.Allocating.init(allocator);
-    const w = &page.writer;
-    try w.writeAll(
-        \\<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-        \\<meta name="viewport" content="width=device-width, initial-scale=1.0">
-        \\<link rel="stylesheet" href="/public/styles.css">
-    );
-    const details = describe(job);
-    if (details.refresh) try w.writeAll("<meta http-equiv=\"refresh\" content=\"2\">");
-    try w.writeAll("<title>nzbunny - job ");
-    try htmlEscape(w, job.id);
-    try w.writeAll("</title></head><body><main><div class=\"module-container\"><h2>");
-    try w.writeAll(details.title);
-    try w.writeAll("</h2><p>");
-    try w.writeAll(details.detail);
-    try w.writeAll("</p><div class=\"job-card\"><p><strong>job id:</strong> ");
-    try htmlEscape(w, job.id);
-    try w.writeAll("</p><p><strong>file:</strong> ");
-    try htmlEscape(w, job.filename);
-    try w.writeAll("</p><p><strong>status:</strong> <span class=\"status-");
-    try w.writeAll(job.status.publicName());
-    try w.writeAll("\">");
-    try w.writeAll(job.status.publicName());
-    try w.writeAll("</span></p>");
-    const now = std.Io.Clock.real.now(context.io).toSeconds();
-    if (job.status == .processing) {
-        if (context.state.progressFor(job.id)) |progress| {
-            const percent = if (progress.total == 0) 0 else @min(100, progress.completed * 100 / progress.total);
-            try w.writeAll("<p><strong>phase:</strong> ");
-            try w.writeAll(progressPhaseName(progress.phase));
-            try w.writeAll("</p><div class=\"progress-track\" role=\"progressbar\" aria-label=\"Download progress\" aria-valuemin=\"0\" aria-valuemax=\"100\" aria-valuenow=\"");
-            try w.print("{d}\"><span style=\"width:{d}%\"></span></div>", .{ percent, percent });
-            try w.print("<p class=\"progress-detail\">{d} of {d} segments ({d}%)</p>", .{ progress.completed, progress.total, percent });
-            try activityStatus(w, now, progress.last_activity, 30);
-        } else {
-            try w.writeAll("<p><strong>phase:</strong> starting downloader</p>");
-            try activityStatus(w, now, job.updated_at, 30);
-        }
-    } else if (job.status == .finalizing) {
-        try activityStatus(w, now, job.updated_at, 90);
-    } else if (job.status == .pending) {
-        try w.writeAll("<p><strong>queued for:</strong> ");
-        try formatDuration(w, @max(0, now - job.created_at));
-        try w.writeAll("</p>");
-    }
-    if (job.fail_reason.len != 0) {
-        try w.writeAll("<p><strong>reason:</strong> ");
-        try htmlEscape(w, job.fail_reason);
-        try w.writeAll("</p>");
-    }
-    if (job.status == .complete and job.download_token.len != 0) {
-        try w.writeAll("<p><strong>download:</strong> <a href=\"/d/");
-        try htmlEscape(w, job.download_token);
-        try w.writeAll("\">download artifact</a></p>");
-    }
-    if (job.artifact_size > 0) try w.print("<p><strong>size:</strong> {d} bytes</p>", .{job.artifact_size});
-    if (job.expires_at) |expiry| {
-        try w.writeAll("<p><strong>expires:</strong> ");
-        try formatTimestamp(w, expiry);
-        try w.writeAll("</p>");
-    }
-    try w.writeAll("<p><strong>created:</strong> ");
-    try formatTimestamp(w, job.created_at);
-    try w.writeAll("</p>");
-    try w.writeAll(
-        \\</div></div><div class="module-container"><a href="/">upload another file</a></div>
-        \\<img src="/public/nzbunny.png" alt="nzbunny logo" class="logo"></main></body></html>
-    );
-    return request.respond(page.writer.buffered(), .{ .extra_headers = &.{
+    const page = try pages.render(allocator, job, context.state.progressFor(job.id), std.Io.Clock.real.now(context.io).toSeconds());
+    defer allocator.free(page);
+    return request.respond(page, .{ .extra_headers = &.{
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         .{ .name = "cache-control", .value = "no-store" },
         .{ .name = "x-content-type-options", .value = "nosniff" },
         .{ .name = "referrer-policy", .value = "no-referrer" },
     } });
-}
-
-fn progressPhaseName(phase: @import("download.zig").Phase) []const u8 {
-    return switch (phase) {
-        .idle => "starting downloader",
-        .parsing => "reading NZB metadata",
-        .preparing => "preparing workspace",
-        .preflight => "checking files",
-        .downloading => "downloading segments",
-        .assembling => "assembling files",
-        .repairing => "repairing files",
-    };
-}
-
-fn activityStatus(writer: *std.Io.Writer, now: i64, last_activity: i64, stall_seconds: i64) !void {
-    const age = @max(0, now - last_activity);
-    try writer.writeAll("<p><strong>last activity:</strong> ");
-    try formatDuration(writer, age);
-    try writer.writeAll(" ago</p>");
-    if (age >= stall_seconds) {
-        try writer.writeAll("<p class=\"stall-warning\"><strong>possible stall:</strong> no progress was recorded recently. The downloader timeout is still active.</p>");
-    } else {
-        try writer.writeAll("<p class=\"activity-ok\">activity is current</p>");
-    }
-}
-
-fn formatDuration(writer: *std.Io.Writer, seconds: i64) !void {
-    if (seconds < 60) return writer.print("{d}s", .{seconds});
-    const minutes = @divFloor(seconds, 60);
-    const remaining = @mod(seconds, 60);
-    return writer.print("{d}m {d}s", .{ minutes, remaining });
 }
 
 fn download(
@@ -529,168 +230,6 @@ fn download(
     const sent = try response.writer.sendFileAll(&file_reader, .limited(stat.size));
     if (sent != stat.size) return error.DownloadFileChanged;
     return response.end();
-}
-
-const StreamedMultipartPart = struct {
-    filename: []const u8,
-    content: []const u8,
-
-    fn deinit(self: StreamedMultipartPart, allocator: std.mem.Allocator) void {
-        allocator.free(self.filename);
-        allocator.free(self.content);
-    }
-};
-
-fn streamMultipart(
-    allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
-    boundary: []const u8,
-    max: u64,
-) !StreamedMultipartPart {
-    var opening_buffer: [76]u8 = undefined;
-    const opening = try std.fmt.bufPrint(&opening_buffer, "--{s}\r\n", .{boundary});
-    var actual_opening: [76]u8 = undefined;
-    reader.readSliceAll(actual_opening[0..opening.len]) catch return error.InvalidMultipart;
-    if (!std.mem.eql(u8, opening, actual_opening[0..opening.len])) return error.InvalidMultipart;
-
-    var headers = std.Io.Writer.Allocating.init(allocator);
-    defer headers.deinit();
-    while (true) {
-        if (headers.writer.end >= 16 * 1024) return error.InvalidMultipart;
-        const byte = reader.takeByte() catch return error.InvalidMultipart;
-        try headers.writer.writeByte(byte);
-        if (std.mem.endsWith(u8, headers.writer.buffered(), "\r\n\r\n")) break;
-    }
-    const header_bytes = headers.writer.buffered()[0 .. headers.writer.end - 4];
-    const raw_filename = try parsePartHeaders(header_bytes);
-    const filename = try allocator.dupe(u8, raw_filename);
-    errdefer allocator.free(filename);
-
-    var next_marker_buffer: [78]u8 = undefined;
-    const next_marker = try std.fmt.bufPrint(&next_marker_buffer, "\r\n--{s}\r\n", .{boundary});
-    var closing_buffer: [80]u8 = undefined;
-    const closing = try std.fmt.bufPrint(&closing_buffer, "\r\n--{s}--\r\n", .{boundary});
-    const chunk = try allocator.alloc(u8, 64 * 1024 + closing.len);
-    defer allocator.free(chunk);
-    var pending: usize = 0;
-    var size: u64 = 0;
-    var content_out = std.Io.Writer.Allocating.init(allocator);
-    defer content_out.deinit();
-    while (true) {
-        const count = reader.readSliceShort(chunk[pending..]) catch return error.InvalidMultipart;
-        const available = pending + count;
-        if (std.mem.findPosLinear(u8, chunk[0..available], 0, next_marker) != null)
-            return error.InvalidMultipart;
-        if (std.mem.findPosLinear(u8, chunk[0..available], 0, closing)) |pos| {
-            size = std.math.add(u64, size, pos) catch return error.FileTooLarge;
-            if (size > max) return error.FileTooLarge;
-            try content_out.writer.writeAll(chunk[0..pos]);
-            if (pos + closing.len != available) return error.InvalidMultipart;
-            var extra: [1]u8 = undefined;
-            if ((reader.readSliceShort(&extra) catch return error.InvalidMultipart) != 0)
-                return error.InvalidMultipart;
-            if (size == 0) return error.EmptyFile;
-            return .{
-                .filename = filename,
-                .content = try allocator.dupe(u8, content_out.writer.buffered()),
-            };
-        }
-        if (count == 0) return error.InvalidMultipart;
-        if (available > closing.len) {
-            const write_len = available - closing.len;
-            size = std.math.add(u64, size, write_len) catch return error.FileTooLarge;
-            if (size > max) return error.FileTooLarge;
-            try content_out.writer.writeAll(chunk[0..write_len]);
-            std.mem.copyForwards(u8, chunk[0..closing.len], chunk[write_len..available]);
-            pending = closing.len;
-        } else {
-            pending = available;
-        }
-    }
-}
-
-fn parsePartHeaders(headers: []const u8) ![]const u8 {
-    var filename: ?[]const u8 = null;
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        if (std.ascii.startsWithIgnoreCase(line, "Content-Disposition:")) {
-            if (filename != null or std.mem.findPosLinear(u8, line, 0, "name=\"nzbfile\"") == null or
-                std.mem.findPosLinear(u8, line, 0, "filename*=") != null) return error.InvalidMultipart;
-            const key = "filename=\"";
-            const start = std.mem.findPosLinear(u8, line, 0, key) orelse return error.InvalidMultipart;
-            const rest = line[start + key.len ..];
-            const end = std.mem.findScalar(u8, rest, '"') orelse return error.InvalidMultipart;
-            filename = rest[0..end];
-        }
-    }
-    const name = filename orelse return error.InvalidMultipart;
-    if (name.len == 0 or std.mem.findAny(u8, name, "/\\\r\n\x00") != null) return error.UnsafeFilename;
-    if (!std.ascii.endsWithIgnoreCase(name, ".nzb")) return error.WrongFileType;
-    return name;
-}
-
-pub fn parseBoundary(content_type: []const u8) ![]const u8 {
-    if (!std.ascii.startsWithIgnoreCase(content_type, "multipart/form-data;")) return error.InvalidBoundary;
-    const marker = "boundary=";
-    const pos = std.mem.findPosLinear(u8, content_type, 0, marker) orelse return error.InvalidBoundary;
-    const after = content_type[pos + marker.len ..];
-    const end = std.mem.findScalar(u8, after, ';') orelse after.len;
-    var value = std.mem.trim(u8, after[0..end], " \t");
-    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') value = value[1 .. value.len - 1];
-    if (value.len == 0 or value.len > 70 or std.mem.findAny(u8, value, "\r\n") != null) return error.InvalidBoundary;
-    return value;
-}
-
-fn normalizeFilename(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    var output = try allocator.alloc(u8, raw.len);
-    for (raw, 0..) |byte, i| {
-        if (byte < 0x20 or byte == 0x7f) return error.UnsafeFilename;
-        output[i] = if (std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == '_') byte else '_';
-    }
-    if (output.len == 4 and std.ascii.endsWithIgnoreCase(output, ".nzb")) return error.UnsafeFilename;
-    return output;
-}
-
-pub fn htmlEscape(writer: *std.Io.Writer, value: []const u8) !void {
-    for (value) |byte| switch (byte) {
-        '&' => try writer.writeAll("&amp;"),
-        '<' => try writer.writeAll("&lt;"),
-        '>' => try writer.writeAll("&gt;"),
-        '"' => try writer.writeAll("&quot;"),
-        '\'' => try writer.writeAll("&#39;"),
-        else => try writer.writeByte(byte),
-    };
-}
-
-fn describe(job: Job) struct { title: []const u8, detail: []const u8, refresh: bool } {
-    return switch (job.status) {
-        .pending => .{ .title = "Queued", .detail = "Your NZB is in the queue.", .refresh = true },
-        .processing => .{ .title = "Downloading", .detail = "The embedded downloader processes the job. This page refreshes automatically.", .refresh = true },
-        .finalizing => .{ .title = "Finalizing", .detail = "The file is almost ready. Wait a few seconds.", .refresh = true },
-        .complete => .{ .title = "Ready", .detail = "Your temporary download link is active until it expires.", .refresh = false },
-        .expired => .{ .title = "Expired", .detail = "This temporary download expired and was removed.", .refresh = false },
-        .failed => .{ .title = "Failed", .detail = "The job did not complete.", .refresh = false },
-    };
-}
-
-fn formatTimestamp(writer: *std.Io.Writer, timestamp: i64) !void {
-    if (timestamp < 0) return writer.print("{d} UTC", .{timestamp});
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
-    const epoch_day = epoch_seconds.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_seconds = epoch_seconds.getDaySeconds();
-    const weekdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
-    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    try writer.print("{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
-        weekdays[epoch_day.day % 7],
-        month_day.day_index + 1,
-        months[month_day.month.numeric() - 1],
-        year_day.year,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    });
 }
 
 fn clientAddress(
@@ -805,48 +344,6 @@ fn safeDownloadName(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     return result;
 }
 
-test "strict multipart accepts one non-empty nzb" {
-    const body =
-        "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"ok.nzb\"\r\n" ++
-        "Content-Type: application/octet-stream\r\n\r\n<nzb/>\r\n--abc--\r\n";
-    {
-        var reader = std.Io.Reader.fixed(body);
-        const part = try streamMultipart(std.testing.allocator, &reader, "abc", 1024);
-        defer part.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("ok.nzb", part.filename);
-        try std.testing.expectEqualStrings("<nzb/>", part.content);
-    }
-    {
-        var reader = std.Io.Reader.fixed(body);
-        try std.testing.expectError(error.FileTooLarge, streamMultipart(std.testing.allocator, &reader, "abc", 2));
-    }
-}
-
-test "multipart rejects unsafe metadata and extra parts" {
-    const unsafe =
-        "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"../bad.nzb\"\r\n\r\nx\r\n--abc--\r\n";
-    {
-        var reader = std.Io.Reader.fixed(unsafe);
-        try std.testing.expectError(error.UnsafeFilename, streamMultipart(std.testing.allocator, &reader, "abc", 100));
-    }
-    const extra =
-        "--abc\r\nContent-Disposition: form-data; name=\"nzbfile\"; filename=\"ok.nzb\"\r\n\r\nx\r\n" ++
-        "--abc\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\ny\r\n--abc--\r\n";
-    {
-        var reader = std.Io.Reader.fixed(extra);
-        try std.testing.expectError(error.InvalidMultipart, streamMultipart(std.testing.allocator, &reader, "abc", 100));
-    }
-    try std.testing.expectEqualStrings("abc", try parseBoundary("multipart/form-data; boundary=\"abc\"; charset=utf-8"));
-    try std.testing.expectEqualStrings("abc", try parseBoundary("multipart/form-data; boundary=abc; charset=utf-8"));
-}
-
-test "HTML escaping covers active characters" {
-    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer output.deinit();
-    try htmlEscape(&output.writer, "<a x='\"'>&");
-    try std.testing.expectEqualStrings("&lt;a x=&#39;&quot;&#39;&gt;&amp;", output.writer.buffered());
-}
-
 test "download names cannot inject response headers" {
     const name = try safeDownloadName(std.testing.allocator, "result\r\nx-review: injected.bin");
     defer std.testing.allocator.free(name);
@@ -874,14 +371,4 @@ test "forwarded addresses require a trusted direct peer" {
     try std.testing.expect(trustedPeer("10.1.2.3", "10.0.0.0/8,192.0.2.0/24"));
     try std.testing.expect(!trustedPeer("198.51.100.2", "10.0.0.0/8"));
     try std.testing.expect(trustedPeer("2001:db8::2", "2001:db8::/32"));
-}
-
-test "rate limits are isolated and windows expire" {
-    var limiter: RateLimiter = .{};
-    const io = std.testing.io;
-    try std.testing.expect(limiter.allow(io, "192.0.2.1", 2, 100));
-    try std.testing.expect(limiter.allow(io, "192.0.2.1", 2, 101));
-    try std.testing.expect(!limiter.allow(io, "192.0.2.1", 2, 102));
-    try std.testing.expect(limiter.allow(io, "192.0.2.2", 2, 102));
-    try std.testing.expect(limiter.allow(io, "192.0.2.1", 2, 160));
 }

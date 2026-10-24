@@ -32,7 +32,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 ARG TEST_OPTIMIZE=Debug
-RUN /opt/zig/zig fmt --check build.zig src \
+RUN /opt/zig/zig fmt --check build.zig build.zig.zon src \
     && /opt/zig/zig build test -Doptimize=${TEST_OPTIMIZE} --summary all
 
 FROM toolchain AS build

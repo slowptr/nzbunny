@@ -42,9 +42,17 @@ pub fn build(b: *std.Build) void {
         integration.addFileArg(b.path("tests/integration.py"));
         integration.addArtifactArg(exe);
         test_step.dependOn(&integration.step);
+        const faults = b.addLibrary(.{
+            .name = "nzbunny-test-faults",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+        });
+        faults.root_module.addCSourceFile(.{ .file = b.path("tests/faults.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        faults.root_module.linkSystemLibrary("dl", .{});
         const stability = b.addSystemCommand(&.{"python3"});
         stability.addFileArg(b.path("tests/stability.py"));
         stability.addArtifactArg(exe);
+        stability.addArtifactArg(faults);
         test_step.dependOn(&stability.step);
     }
 }

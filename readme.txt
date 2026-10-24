@@ -152,6 +152,12 @@ ENVIRONMENT
      TRUSTED_PROXY_CIDRS
              Comma-separated trusted reverse proxy CIDR ranges.  Default: empty.
 
+     Configuration rejects budgets that cannot admit configured work:
+     MAX_UPLOAD_MEMORY_BYTES must cover four times MAX_UPLOAD_BYTES plus
+     256 KiB; MAX_WORK_BYTES must cover MAX_ARTIFACT_BYTES; and
+     MAX_STORAGE_BYTES must cover MAX_WORK_BYTES. Existing retained bytes and
+     reservations can still temporarily block work after startup.
+
 HTTP ROUTES
      GET /                       Show the upload page.
      POST /                      Submit an NZB file.
@@ -161,12 +167,18 @@ HTTP ROUTES
      GET /public/*               Serve a static file.
      HEAD /public/*              Check a static file.
      GET /healthz                Process-local health endpoint.
-     GET /readyz                 Readiness endpoint.  Requires SQLite and an
+     GET /readyz                 Readiness endpoint. Requires SQLite and
                                  recent authenticated NNTP provider evidence.
                                  Returns unavailable during known failed
-                                 download-state writes. HTTP starts even when
-                                 the provider is unavailable, so existing
+                                 state writes or insufficient storage headroom.
+                                 The body identifies the degraded component.
+                                 HTTP starts even when the provider is
+                                 unavailable, so existing
                                  artifacts remain accessible.
+
+     GET /metrics                Prometheus metrics: queue depth/age, storage,
+                                 readiness, deferrals, retries, and cleanup.
+                                 Counters reset when the process restarts.
 
 DATA SAFETY
      One process exclusively owns the database and download root. Starting
@@ -176,9 +188,17 @@ DATA SAFETY
 
      On startup, nzbunny fails any job that was PROCESSING during a previous
      process lifetime and removes its work and temporary output directories.
-     Queued jobs remain pending. Finalizing jobs resume artifact preparation.
+     Queued jobs remain pending. Finalizing jobs resume artifact preparation;
+     interrupted finalizer leases refund their attempt. Capacity shortages defer
+     accepted jobs without failing them or consuming finalizer attempts.
+     Transient download filesystem failures retain the NZB and requeue the job.
+     Invalid inputs and exhausted provider retries still fail normally.
      Download-state write failures are retried without losing task ownership.
      Abandoned processing rows are reconciled before the next queued download.
+     Repaired payloads and published artifacts are synced before their paths
+     are committed. Unsupported database versions are inspected read-only and
+     rejected before writable initialization. See docs/architecture.md for the
+     state transitions, resource ownership, publication order, and module map.
      Generated artifacts remain owned by their job even if publication fails
      before its database commit, and cleanup removes them before purging the
      job. Historical unowned artifacts and assembled directories are swept.
@@ -213,7 +233,11 @@ TESTING
 
      Python integration test suite:
            python3 tests/integration.py zig-out/bin/nzbunny
-           python3 tests/stability.py zig-out/bin/nzbunny
+           python3 tests/stability.py zig-out/bin/nzbunny [test-fault-library]
+
+     zig build test builds and passes the separate test-fault library to enable
+     directory-sync ENOSPC/EIO and publication SIGKILL regressions. Direct Python
+     invocation without that library explicitly skips the injection tests.
 
      Reproducible container tests (Zig 0.16.0 and native dependencies included):
            make test-container
