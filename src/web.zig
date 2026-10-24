@@ -5,6 +5,7 @@ const Database = @import("database.zig").Database;
 const Job = @import("database.zig").Job;
 const shutdown = @import("shutdown.zig");
 const worker = @import("worker.zig");
+const AppState = @import("runtime.zig").AppState;
 const nntp = @import("nntp.zig");
 
 const css = @embedFile("assets/styles.css");
@@ -50,6 +51,9 @@ const Context = struct {
     ca_store: *nntp.CaStore,
     connections: std.Io.Semaphore,
     limiter: RateLimiter,
+    state: *AppState,
+    streams_mutex: std.Io.Mutex = .init,
+    streams: std.AutoHashMapUnmanaged(std.posix.fd_t, std.Io.net.Stream) = .empty,
 };
 
 const RateEntry = struct {
@@ -97,10 +101,11 @@ const RateLimiter = struct {
     }
 };
 
-pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8, ca_store: *nntp.CaStore) !void {
+pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Config, root: []const u8, ca_store: *nntp.CaStore, state: *AppState) !void {
     const address = try std.Io.net.IpAddress.parse("0.0.0.0", cfg.port);
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
+    defer state.shutdown.requested.store(true, .release);
     const root_dir = try std.Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
     defer root_dir.close(io);
     var context = Context{
@@ -113,42 +118,79 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io, db: *Database, cfg: Confi
         .ca_store = ca_store,
         .connections = .{ .permits = cfg.max_connections },
         .limiter = .{},
+        .state = state,
     };
+    defer context.streams.deinit(allocator);
     io.random(std.mem.asBytes(&context.limiter.seed));
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store });
+    group.async(io, worker.run, .{ allocator, io, db, cfg, context.root, ca_store, state });
     var watcher_group: std.Io.Group = .init;
     defer watcher_group.cancel(io);
-    watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener, &context.connections }) catch {};
-    while (!shutdown.requested.load(.acquire)) {
+    try watcher_group.concurrent(io, shutdownWatcher, .{ io, &listener, &context });
+    defer {
+        state.shutdown.requested.store(true, .release);
+        closeStreams(&context);
+        group.cancel(io);
+    }
+    while (!state.shutdown.requested.load(.acquire)) {
         try context.connections.wait(io);
-        if (shutdown.requested.load(.acquire)) {
+        if (state.shutdown.requested.load(.acquire)) {
             context.connections.post(io);
             break;
         }
         const stream = listener.accept(io) catch |err| {
             context.connections.post(io);
-            if (shutdown.requested.load(.acquire)) break;
+            if (state.shutdown.requested.load(.acquire)) break;
             std.log.warn("Accept failed: {t}", .{err});
             continue;
         };
+        context.streams_mutex.lockUncancelable(io);
+        if (state.shutdown.requested.load(.acquire)) {
+            context.streams_mutex.unlock(io);
+            stream.close(io);
+            context.connections.post(io);
+            break;
+        }
+        context.streams.put(allocator, stream.socket.handle, stream) catch |err| {
+            context.streams_mutex.unlock(io);
+            stream.close(io);
+            context.connections.post(io);
+            return err;
+        };
+        context.streams_mutex.unlock(io);
         group.async(io, accept, .{ &context, stream });
     }
     group.await(io) catch {};
 }
 
-fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server, connections: *std.Io.Semaphore) std.Io.Cancelable!void {
-    while (!shutdown.requested.load(.acquire))
+fn shutdownWatcher(io: std.Io, listener: *std.Io.net.Server, context: *Context) std.Io.Cancelable!void {
+    while (!context.state.shutdown.requested.load(.acquire))
         try std.Io.sleep(io, .fromMilliseconds(100), .awake);
     const stream: std.Io.net.Stream = .{ .socket = listener.socket };
     stream.shutdown(io, .both) catch {};
-    connections.post(io);
+    closeStreams(context);
+    context.connections.post(io);
+    try std.Io.sleep(io, .fromSeconds(context.cfg.shutdown_seconds), .awake);
+    std.log.err("Shutdown deadline exceeded; unfinished jobs will recover at the next start.", .{});
+    std.process.exit(1);
+}
+
+fn closeStreams(context: *Context) void {
+    context.streams_mutex.lockUncancelable(context.io);
+    defer context.streams_mutex.unlock(context.io);
+    var streams = context.streams.valueIterator();
+    while (streams.next()) |active| active.shutdown(context.io, .both) catch {};
 }
 
 fn accept(context: *Context, stream: std.Io.net.Stream) void {
     defer context.connections.post(context.io);
     defer stream.close(context.io);
+    defer {
+        context.streams_mutex.lockUncancelable(context.io);
+        _ = context.streams.remove(stream.socket.handle);
+        context.streams_mutex.unlock(context.io);
+    }
     var peer_buffer: [64]u8 = undefined;
     var peer_writer = std.Io.Writer.fixed(&peer_buffer);
     var peer_address = stream.socket.address;
@@ -160,7 +202,7 @@ fn accept(context: *Context, stream: std.Io.net.Stream) void {
     var conn_reader = stream.reader(context.io, &receive_buffer);
     var conn_writer = stream.writer(context.io, &send_buffer);
     var server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
-    while (server.reader.state == .ready and !shutdown.requested.load(.acquire)) {
+    while (server.reader.state == .ready and !context.state.shutdown.requested.load(.acquire)) {
         var request = blk: {
             var header_timeout: std.Io.Group = .init;
             defer header_timeout.cancel(context.io);
@@ -209,7 +251,7 @@ fn route(
     }
     if (std.mem.eql(u8, target, "/readyz")) {
         if (request.head.method != .GET and request.head.method != .HEAD) return methodNotAllowed(request);
-        if (context.db.ready(context.io) and worker.provider_ready.load(.acquire)) return respondText(request, .ok, "ready");
+        if (context.db.ready(context.io) and context.state.storage_ready.load(.acquire) and context.state.database_ready.load(.acquire) and context.state.providerAvailable(context.io, context.cfg) and !context.state.shutdown.requested.load(.acquire)) return respondText(request, .ok, "ready");
         return respondText(request, .service_unavailable, "The service is not ready.");
     }
     if (std.mem.eql(u8, target, "/")) {
@@ -257,7 +299,7 @@ fn upload(
 ) !void {
     const now = std.Io.Clock.real.now(context.io).toSeconds();
     const client = clientAddress(request, peer_address, peer, context.cfg.trusted_proxy_cidrs);
-    if (!context.limiter.allow(context.io, client, context.cfg.uploads_per_minute, now))
+    if (!context.limiter.allow(context.io, client, context.cfg.uploads_per_minute, shutdown.now(context.io)))
         return respondText(request, .too_many_requests, "The upload rate limit is reached.");
     const length = request.head.content_length orelse
         return respondText(request, .length_required, "The Content-Length header is required.");
@@ -273,10 +315,22 @@ fn upload(
     if (!has_capacity)
         return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
 
+    // Account for parser growth, the returned content, and fixed buffers before
+    // reading any body. Admission is independent of HTTP connection capacity.
+    const upload_charge = std.math.add(u64, std.math.mul(u64, context.cfg.max_upload_bytes, 4) catch
+        return respondText(request, .service_unavailable, "Upload capacity is unavailable."), 256 * 1024) catch
+        return respondText(request, .service_unavailable, "Upload capacity is unavailable.");
+    context.state.uploads.reserve(upload_charge) catch
+        return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
+    defer context.state.uploads.release(upload_charge);
+    context.state.storage.reserve(context.io, context.cfg.max_work_bytes) catch
+        return respondText(request, .service_unavailable, "Storage capacity is unavailable. Try again soon.");
+    context.state.storage.release(context.io, context.cfg.max_work_bytes);
+
     var body_buffer: [8192]u8 = undefined;
     const reader = try request.readerExpectContinue(&body_buffer);
     const part = streamMultipart(
-        allocator,
+        context.allocator,
         reader,
         boundary,
         context.cfg.max_upload_bytes,
@@ -287,7 +341,7 @@ fn upload(
         error.WrongFileType => return respondText(request, .bad_request, "Select one .nzb file."),
         else => return respondText(request, .bad_request, "The multipart upload is not valid."),
     };
-    defer part.deinit(allocator);
+    defer part.deinit(context.allocator);
     const filename = try normalizeFilename(allocator, part.filename);
     const id = (context.db.createIfCapacity(
         context.io,
@@ -298,7 +352,7 @@ fn upload(
     ) catch return respondText(request, .internal_server_error, "The job could not be saved.")) orelse
         return respondText(request, .service_unavailable, "The service is busy. Try again soon.");
     defer context.db.allocator.free(id);
-    shutdown.notifyWorker();
+    context.state.shutdown.notifyWorker();
     const location = try std.fmt.allocPrint(allocator, "/job/{s}", .{id});
     return request.respond("", .{
         .status = .see_other,
@@ -342,7 +396,7 @@ fn jobPage(
     try w.writeAll("</span></p>");
     const now = std.Io.Clock.real.now(context.io).toSeconds();
     if (job.status == .processing) {
-        if (worker.progressFor(job.id)) |progress| {
+        if (context.state.progressFor(job.id)) |progress| {
             const percent = if (progress.total == 0) 0 else @min(100, progress.completed * 100 / progress.total);
             try w.writeAll("<p><strong>phase:</strong> ");
             try w.writeAll(progressPhaseName(progress.phase));

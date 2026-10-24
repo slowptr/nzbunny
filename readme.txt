@@ -94,6 +94,12 @@ ENVIRONMENT
      POLL_INTERVAL
              Queue and provider probe interval.  Default: 10s.
 
+     SHUTDOWN_TIMEOUT
+             Maximum shutdown drain time. Default: 5s. Open HTTP connections
+             are closed immediately, and downloads, finalizers, and PAR2 are
+             canceled. If draining exceeds this deadline, the process exits
+             with an error; persisted state is recovered on the next start.
+
      HTTP_HEADER_TIMEOUT
              Timeout for reading HTTP request headers.  Default: 15s.
 
@@ -103,6 +109,32 @@ ENVIRONMENT
      MAX_ARTIFACT_BYTES
              Maximum decoded output bytes and final artifact bytes.
              Default: 209715200 (200 MiB).
+
+     MAX_WORK_BYTES
+             Maximum working bytes for one download, including decoded parts,
+             PAR2 data, assembled output, and repair backups. Reservations are
+             taken before decoding and assembly; repair output is monitored
+             throughout PAR2 execution. Default: 1073741824 (1 GiB).
+
+     MAX_STORAGE_BYTES
+             Maximum logical bytes under the three managed storage directories,
+             including retained artifacts and outstanding reservations.
+             Default: 4294967296 (4 GiB). Downloads reserve MAX_WORK_BYTES and
+             finalizers reserve MAX_ARTIFACT_BYTES. Reservations include existing
+             in-flight data conservatively, so admission can stop before the
+             volume reaches this limit. Set this high enough for working data,
+             concurrent finalizers, and retained artifacts.
+
+     MIN_FREE_BYTES
+             Free filesystem space to preserve in addition to reservations.
+             Default: 67108864 (64 MiB). Storage checks reject new work when
+             this headroom cannot be maintained.
+
+     MAX_UPLOAD_MEMORY_BYTES
+             Shared budget for simultaneous upload buffers. Each upload reserves
+             four times MAX_UPLOAD_BYTES plus 256 KiB before reading its body.
+             Default: 67108864 (64 MiB). This bounds upload admission; HTTP,
+             SQLite, NNTP, and other process memory are separate.
 
      MAX_UPLOAD_BYTES
              Maximum uploaded NZB size.  The hard maximum is 67108864
@@ -130,12 +162,30 @@ HTTP ROUTES
      HEAD /public/*              Check a static file.
      GET /healthz                Process-local health endpoint.
      GET /readyz                 Readiness endpoint.  Requires SQLite and an
-                                 authenticated NNTP provider probe.
+                                 recent authenticated NNTP provider evidence.
+                                 Returns unavailable during known failed
+                                 download-state writes. HTTP starts even when
+                                 the provider is unavailable, so existing
+                                 artifacts remain accessible.
 
 DATA SAFETY
+     One process exclusively owns the database and download root. Starting
+     another process with either storage object in use fails before migrations,
+     recovery, or cleanup can change data. Locks are released when the process
+     exits; they are not lock files that operators must remove.
+
      On startup, nzbunny fails any job that was PROCESSING during a previous
      process lifetime and removes its work and temporary output directories.
-     Queued jobs remain pending.  Finalizing jobs resume artifact preparation.
+     Queued jobs remain pending. Finalizing jobs resume artifact preparation.
+     Download-state write failures are retried without losing task ownership.
+     Abandoned processing rows are reconciled before the next queued download.
+     Generated artifacts remain owned by their job even if publication fails
+     before its database commit, and cleanup removes them before purging the
+     job. Historical unowned artifacts and assembled directories are swept.
+
+     Cleanup, artifact finalization, and provider checks run independently of
+     download execution. Elapsed deadlines use a monotonic clock; persisted
+     creation and expiry times use wall-clock timestamps.
 
      Upgrading operators should mount the old download volume and set
      DOWNLOAD_DIR to the former completed download root until old completed
@@ -152,14 +202,30 @@ SECURITY
      provides authentication.
 
 TESTING
-     Unit tests:
-           zig build test
+     Formatting, unit tests, integration, and operational regressions:
+           make check
+
+     Unit tests only:
+           zig build test -Dskip_integration=true
 
      ReleaseSafe unit tests:
-           ZIG_GLOBAL_CACHE_DIR=/tmp/nzbunny-zig-global zig build test -Doptimize=ReleaseSafe
+           zig build test -Dskip_integration=true -Doptimize=ReleaseSafe
 
      Python integration test suite:
            python3 tests/integration.py zig-out/bin/nzbunny
+           python3 tests/stability.py zig-out/bin/nzbunny
+
+     Reproducible container tests (Zig 0.16.0 and native dependencies included):
+           make test-container
+           docker build --target test --build-arg TEST_OPTIMIZE=ReleaseSafe .
+
+     Runtime container smoke test:
+           make smoke
+
+     CI requires Debug and ReleaseSafe formatting, unit, integration, and
+     operational regression checks, plus Compose validation and runtime smoke
+     tests. Python suites use dynamic ports, isolated storage, bounded process
+     waits, and file-backed logs.
 
 SEE ALSO
      sqlite3(1)

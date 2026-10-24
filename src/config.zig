@@ -18,8 +18,13 @@ pub const Config = struct {
     download_timeout_seconds: u32,
     http_header_seconds: u32,
     http_request_seconds: u32,
+    shutdown_seconds: u32,
     max_artifact_bytes: u64,
     max_upload_bytes: u64,
+    max_work_bytes: u64,
+    max_storage_bytes: u64,
+    min_free_bytes: u64,
+    max_upload_memory_bytes: u64,
     max_active_jobs: u32,
     max_connections: u32,
     uploads_per_minute: u32,
@@ -48,8 +53,13 @@ const Defaults = struct {
     const poll_interval = "10s";
     const http_header_timeout = "15s";
     const http_request_timeout = "5m";
+    const shutdown_timeout = "5s";
     const max_artifact_bytes = "209715200";
     const max_upload_bytes = "2097152";
+    const max_work_bytes = "1073741824";
+    const max_storage_bytes = "4294967296";
+    const min_free_bytes = "67108864";
+    const max_upload_memory_bytes = "67108864";
     const max_active_jobs = "32";
     const max_connections = "128";
     const uploads_per_minute = "20";
@@ -136,8 +146,13 @@ fn loadFromMap(allocator: std.mem.Allocator, env: *const std.process.Environ.Map
         .download_timeout_seconds = download_timeout_seconds,
         .http_header_seconds = http_header_seconds,
         .http_request_seconds = http_request_seconds,
+        .shutdown_seconds = try shortDuration(value(env, "SHUTDOWN_TIMEOUT", Defaults.shutdown_timeout)),
         .max_artifact_bytes = max_artifact_bytes_val,
         .max_upload_bytes = max_upload_bytes_val,
+        .max_work_bytes = try positiveInt(u64, value(env, "MAX_WORK_BYTES", Defaults.max_work_bytes)),
+        .max_storage_bytes = try positiveInt(u64, value(env, "MAX_STORAGE_BYTES", Defaults.max_storage_bytes)),
+        .min_free_bytes = try positiveInt(u64, value(env, "MIN_FREE_BYTES", Defaults.min_free_bytes)),
+        .max_upload_memory_bytes = try positiveInt(u64, value(env, "MAX_UPLOAD_MEMORY_BYTES", Defaults.max_upload_memory_bytes)),
         .max_active_jobs = max_active_jobs,
         .max_connections = max_connections,
         .uploads_per_minute = uploads_per_minute,

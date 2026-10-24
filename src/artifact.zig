@@ -1,4 +1,5 @@
 const std = @import("std");
+const shutdown = @import("shutdown.zig");
 const paths = @import("paths.zig");
 const c = @cImport({
     @cInclude("archive.h");
@@ -17,6 +18,7 @@ const WriteCtx = struct {
     fd: c_int,
     written: u64 = 0,
     cap: u64,
+    control: ?*shutdown.DownloadControl = null,
 };
 
 fn boundedWriteCallback(
@@ -28,6 +30,7 @@ fn boundedWriteCallback(
     _ = a;
     if (length == 0) return 0;
     const ctx: *WriteCtx = @ptrCast(@alignCast(client_data.?));
+    checkControl(ctx.control) catch return -1;
     const new_written = std.math.add(u64, ctx.written, @as(u64, length)) catch return -1;
     if (new_written > ctx.cap) return -1;
     const buf: [*]const u8 = @ptrCast(buffer.?);
@@ -58,6 +61,7 @@ pub const Result = struct {
 
 const Limits = struct {
     max_bytes: u64,
+    control: ?*shutdown.DownloadControl = null,
     entries: usize = 0,
     input_bytes: u64 = 0,
 };
@@ -74,6 +78,34 @@ pub fn prepare(
     max_bytes: u64,
     lease_token: []const u8,
 ) !Result {
+    return prepareControlled(allocator, root, job_id, source, max_bytes, lease_token, null);
+}
+
+pub fn prepareControlled(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    job_id: []const u8,
+    source: []const u8,
+    max_bytes: u64,
+    lease_token: []const u8,
+    control: ?*shutdown.DownloadControl,
+) !Result {
+    return prepareImpl(allocator, root, job_id, source, max_bytes, lease_token, control) catch |err| {
+        try checkControl(control);
+        return err;
+    };
+}
+
+fn prepareImpl(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    job_id: []const u8,
+    source: []const u8,
+    max_bytes: u64,
+    lease_token: []const u8,
+    control: ?*shutdown.DownloadControl,
+) !Result {
+    try checkControl(control);
     const rel = try paths.relativeToRoot(root, source);
     const root_fd = std.posix.openat(std.posix.AT.FDCWD, root, .{
         .DIRECTORY = true,
@@ -164,27 +196,28 @@ pub fn prepare(
 
     if (mode == c.S_IFREG) {
         const source_size: u64 = @intCast(source_fd.stat.st_size);
-        try copyFd(source_fd.fd, temp_fd, source_size, io_buffer);
+        try copyFd(source_fd.fd, temp_fd, source_size, io_buffer, control);
     } else {
         const archive = c.archive_write_new() orelse return error.ArchiveCreateFailed;
         defer _ = c.archive_write_free(archive);
         if (c.archive_write_set_format_zip(archive) != c.ARCHIVE_OK) return error.ArchiveFormatFailed;
         _ = c.archive_write_set_bytes_per_block(archive, 0);
         _ = c.archive_write_set_bytes_in_last_block(archive, 1);
-        var write_ctx = WriteCtx{ .fd = temp_fd, .cap = max_bytes };
+        var write_ctx = WriteCtx{ .fd = temp_fd, .cap = max_bytes, .control = control };
         if (c.archive_write_open2(archive, &write_ctx, null, boundedWriteCallback, archiveCloseCallback, null) != c.ARCHIVE_OK)
             return error.ArchiveOpenFailed;
         var archive_open = true;
         defer {
             if (archive_open) _ = c.archive_write_close(archive);
         }
-        var limits = Limits{ .max_bytes = max_bytes };
+        var limits = Limits{ .max_bytes = max_bytes, .control = control };
         try walkFd(archive, source_fd.fd, "", &limits, 0, io_buffer);
         const close_rc = c.archive_write_close(archive);
         if (close_rc != c.ARCHIVE_OK) return error.ArchiveCloseFailed;
         archive_open = false;
     }
 
+    try checkControl(control);
     if (c.fsync(temp_fd) != 0) return error.ArchiveWriteFailed;
 
     var temp_stat: c.struct_stat = undefined;
@@ -225,6 +258,7 @@ fn walkFd(
     depth: usize,
     io_buffer: []u8,
 ) !void {
+    try checkControl(limits.control);
     if (depth > max_depth) return error.DirectoryTooDeep;
     const scan_fd = c.dup(dir_fd);
     if (scan_fd < 0) return error.DirectoryReadFailed;
@@ -267,13 +301,14 @@ fn walkFd(
         var entry_name: [c.PATH_MAX + 1]u8 = undefined;
         const archive_name = std.fmt.bufPrint(&entry_name, "{s}{s}", .{ prefix, name }) catch
             return error.NameTooLong;
-        try addFd(archive, opened.fd, archive_name, size, io_buffer);
+        try addFd(archive, opened.fd, archive_name, size, io_buffer, limits.control);
     }
 }
 
-fn copyFd(source_fd: c_int, destination_fd: c_int, expected_size: u64, buffer: []u8) !void {
+fn copyFd(source_fd: c_int, destination_fd: c_int, expected_size: u64, buffer: []u8, control: ?*shutdown.DownloadControl) !void {
     var copied: u64 = 0;
     while (copied < expected_size) {
+        try checkControl(control);
         const wanted: usize = @intCast(@min(expected_size - copied, buffer.len));
         const read_count = c.read(source_fd, buffer.ptr, wanted);
         if (read_count < 0) {
@@ -324,7 +359,7 @@ fn openChild(parent_fd: c_int, name: [:0]const u8) !Opened {
     return .{ .fd = fd, .stat = stat, .is_dir = (stat.st_mode & c.S_IFMT) == c.S_IFDIR };
 }
 
-fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buffer: []u8) !void {
+fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buffer: []u8, control: ?*shutdown.DownloadControl) !void {
     const entry = c.archive_entry_new() orelse return error.ArchiveEntryFailed;
     defer c.archive_entry_free(entry);
     var name_z: [c.PATH_MAX + 1]u8 = undefined;
@@ -335,6 +370,7 @@ fn addFd(archive: *c.struct_archive, fd: c_int, name: []const u8, size: u64, buf
     if (c.archive_write_header(archive, entry) != c.ARCHIVE_OK) return error.ArchiveHeaderFailed;
     var copied: u64 = 0;
     while (true) {
+        try checkControl(control);
         const n = c.read(fd, buffer.ptr, buffer.len);
         if (n < 0) {
             if (std.c._errno().* == c.EINTR) continue;
@@ -510,6 +546,7 @@ fn emptyDirFd(dir_fd: c_int, depth: usize) RemoveError!void {
 
 fn existingRegularAt(directory_fd: c_int, name: [:0]const u8, max: u64) !u64 {
     const fd = std.posix.openat(directory_fd, name, .{
+        .NONBLOCK = true,
         .NOFOLLOW = true,
         .CLOEXEC = true,
     }, 0) catch |err| switch (err) {
@@ -687,4 +724,43 @@ test "sweepOrphanTemps removes only temporary staging files and directories" {
     keep_art.close(io);
     var keep_dl = try tmp.dir.openFile(io, "downloads/.nzbunny-downloads/job2/keep.bin", .{});
     keep_dl.close(io);
+}
+
+fn checkControl(control: ?*shutdown.DownloadControl) !void {
+    if (control) |active| {
+        if (active.isTimedOut()) return error.Timeout;
+        if (active.isCanceled()) return error.Canceled;
+        if (shutdown.now(active.io) >= active.deadline_seconds) {
+            active.timeout();
+            return error.Timeout;
+        }
+    }
+}
+
+test "shutdown interrupts zip finalization and removes its temporary artifact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "source", .default_dir);
+    var source = try tmp.dir.createFile(io, "source/payload", .{});
+    try source.setLength(io, 64 * 1024 * 1024);
+    source.close(io);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    var state: shutdown.State = .{};
+    var control = shutdown.DownloadControl.init(io, shutdown.now(io) + 60);
+    control.state = &state;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, stopFinalization, .{ io, &state });
+    try std.testing.expectError(error.Canceled, prepareControlled(std.testing.allocator, root_buffer[0..root_len], "cancel", "source", 128 * 1024 * 1024, "lease-token", &control));
+    var artifacts = try tmp.dir.openDir(io, ".nzbunny-artifacts", .{ .iterate = true });
+    defer artifacts.close(io);
+    var iterator = artifacts.iterate();
+    try std.testing.expect((try iterator.next(io)) == null);
+}
+
+fn stopFinalization(io: std.Io, state: *shutdown.State) std.Io.Cancelable!void {
+    try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    state.requested.store(true, .release);
 }

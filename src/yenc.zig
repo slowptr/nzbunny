@@ -1,4 +1,5 @@
 const std = @import("std");
+const Budget = @import("budget.zig").Budget;
 
 pub const Part = struct {
     name: []const u8,
@@ -14,6 +15,9 @@ pub const Part = struct {
 
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
+    workspace: ?*Budget = null,
+    reserved_bytes: u64 = 0,
+    keep_reservation: bool = false,
     output: *std.Io.Writer,
     max_size: u64 = std.math.maxInt(u64),
     budget: u64 = 0,
@@ -29,6 +33,7 @@ pub const Decoder = struct {
     }
 
     pub fn deinit(self: *Decoder) void {
+        if (!self.keep_reservation) if (self.workspace) |workspace| workspace.release(self.reserved_bytes);
         if (self.meta) |meta| self.allocator.free(meta.name);
         self.meta = null;
     }
@@ -102,6 +107,14 @@ pub const Decoder = struct {
         return self.meta.?;
     }
 
+    fn writeDecoded(self: *Decoder, bytes: []const u8) !void {
+        if (self.workspace) |workspace| {
+            try workspace.reserve(bytes.len);
+            self.reserved_bytes += bytes.len;
+        }
+        try self.output.writeAll(bytes);
+    }
+
     fn decodeData(self: *Decoder, line: []const u8) !void {
         var meta = self.meta.?;
         var chunk: [256]u8 = undefined;
@@ -121,13 +134,13 @@ pub const Decoder = struct {
             chunk[chunk_len] = byte;
             chunk_len += 1;
             if (chunk_len == chunk.len) {
-                try self.output.writeAll(chunk[0..chunk_len]);
+                try self.writeDecoded(chunk[0..chunk_len]);
                 self.crc.update(chunk[0..chunk_len]);
                 chunk_len = 0;
             }
         }
         if (chunk_len > 0) {
-            try self.output.writeAll(chunk[0..chunk_len]);
+            try self.writeDecoded(chunk[0..chunk_len]);
             self.crc.update(chunk[0..chunk_len]);
         }
         self.meta = meta;

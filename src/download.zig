@@ -4,76 +4,17 @@ const nntp = @import("nntp.zig");
 const shutdown = @import("shutdown.zig");
 const yenc = @import("yenc.zig");
 
+const Budget = @import("budget.zig").Budget;
+
 const Config = @import("config.zig").Config;
 
 pub const Result = struct {
     relative_path: []const u8,
 };
 
-pub const Phase = enum(u8) {
-    idle,
-    parsing,
-    preparing,
-    preflight,
-    downloading,
-    assembling,
-    repairing,
-};
-
-pub const ProgressSnapshot = struct {
-    phase: Phase,
-    completed: usize,
-    total: usize,
-    last_activity: i64,
-};
-
-pub const Progress = struct {
-    phase: std.atomic.Value(Phase) = .init(.idle),
-    completed: std.atomic.Value(usize) = .init(0),
-    total: std.atomic.Value(usize) = .init(0),
-    last_activity: std.atomic.Value(i64) = .init(0),
-    last_report_bucket: std.atomic.Value(usize) = .init(0),
-
-    pub fn start(self: *Progress, io: std.Io, total: usize) void {
-        self.total.store(total, .release);
-        self.completed.store(0, .release);
-        self.last_report_bucket.store(0, .release);
-        self.setPhase(io, .preparing);
-    }
-
-    pub fn setTotal(self: *Progress, total: usize) void {
-        self.total.store(total, .release);
-    }
-
-    pub fn setPhase(self: *Progress, io: std.Io, phase: Phase) void {
-        self.phase.store(phase, .release);
-        self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
-    }
-
-    pub fn touch(self: *Progress, io: std.Io) void {
-        self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
-    }
-
-    pub fn advanced(self: *Progress, io: std.Io) void {
-        const completed = self.completed.fetchAdd(1, .acq_rel) + 1;
-        self.last_activity.store(std.Io.Clock.real.now(io).toSeconds(), .release);
-        const total = self.total.load(.acquire);
-        if (total == 0) return;
-        const bucket = @min(10, completed * 10 / total);
-        const previous = self.last_report_bucket.load(.acquire);
-        if (bucket > previous and self.last_report_bucket.cmpxchgStrong(previous, bucket, .acq_rel, .acquire) == null)
-            std.log.info("download progress: {d}/{d} segments ({d}%)", .{ completed, total, completed * 100 / total });
-    }
-
-    pub fn snapshot(self: *const Progress) ProgressSnapshot {
-        return .{
-            .phase = self.phase.load(.acquire),
-            .completed = self.completed.load(.acquire),
-            .total = self.total.load(.acquire),
-            .last_activity = self.last_activity.load(.acquire),
-        };
-    }
-};
+pub const Phase = @import("progress.zig").Phase;
+pub const ProgressSnapshot = @import("progress.zig").ProgressSnapshot;
+pub const Progress = @import("progress.zig").Progress;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -148,9 +89,10 @@ pub fn run(
         allocator.free(sessions);
     }
 
+    var workspace: Budget = .{ .limit = cfg.max_work_bytes };
     progress.setPhase(io, .preflight);
     std.log.info("download phase: checking the first segment of {d} files", .{document.files.len});
-    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, sessions, control, progress);
+    try preflightPhase(allocator, io, root_dir, work_root, manifest, document.files, cfg, ca_store, sessions, control, progress, &workspace);
     const included = try allocator.alloc(bool, manifest.len);
     defer allocator.free(included);
     var included_count: usize = 0;
@@ -181,7 +123,7 @@ pub fn run(
     if (remaining.items.len > 0) {
         progress.setPhase(io, .downloading);
         std.log.info("download phase: fetching {d} remaining segments", .{remaining.items.len});
-        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, sessions, control, progress, has_repair_files);
+        try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, sessions, control, progress, has_repair_files, &workspace);
     }
 
     var damaged = false;
@@ -203,11 +145,22 @@ pub fn run(
             progress.setTotal(total_segments);
             progress.setPhase(io, .downloading);
             std.log.info("download phase: fetching {d} PAR2 repair segments", .{remaining.items.len});
-            try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, sessions, control, progress, true);
+            try downloadPhase(allocator, io, root_dir, work_root, manifest, remaining.items, document.files, cfg, ca_store, sessions, control, progress, true, &workspace);
         }
         if (!hasUsableRepairFile(manifest, included)) return error.InsufficientPar2Data;
     }
 
+    // Parts coexist with assembled output. PAR2 can retain a damaged backup,
+    // so reserve a second payload copy before repair starts.
+    var assembly_bytes: u64 = 0;
+    for (manifest, included) |file, keep| {
+        if (keep or damaged) {
+            assembly_bytes = std.math.add(u64, assembly_bytes, file.size) catch return error.WorkspaceTooLarge;
+            if (damaged and keep) assembly_bytes = std.math.add(u64, assembly_bytes, file.size) catch return error.WorkspaceTooLarge;
+        }
+    }
+    const part_bytes = workspace.used.load(.acquire);
+    try workspace.reserve(assembly_bytes);
     progress.setPhase(io, .assembling);
     std.log.info("download phase: assembling {d} payload files", .{included_count});
     var assembled: usize = 0;
@@ -228,7 +181,7 @@ pub fn run(
         progress.setPhase(io, .repairing);
         const repair_name = try assembleRepairFiles(allocator, io, root_dir, tmp_output_root, manifest, included, control, progress);
         std.log.info("download phase: repairing missing payload data with {s}", .{repair_name});
-        try repairWithPar2(allocator, io, root_dir, tmp_output_root, repair_name, control);
+        try @import("repair.zig").run(allocator, io, root_dir, tmp_output_root, repair_name, control, cfg.max_work_bytes - part_bytes);
         progress.touch(io);
         for (manifest, included) |file, keep| if (keep) {
             try validateRepairedFile(allocator, io, root_dir, tmp_output_root, file);
@@ -256,25 +209,22 @@ pub fn run(
     return .{ .relative_path = try allocator.dupe(u8, output_root) };
 }
 
-const FileManifest = struct {
-    name: []const u8 = "",
-    size: u64 = 0,
-    parts: []Part = &.{},
-    preflight_err: ?anyerror = null,
-
-    fn deinit(self: FileManifest, allocator: std.mem.Allocator) void {
-        if (self.name.len != 0) allocator.free(self.name);
-        for (self.parts) |part| if (part.rel_path.len != 0) allocator.free(part.rel_path);
-        if (self.parts.len > 0) allocator.free(self.parts);
-    }
-};
-
-const Part = struct {
-    begin: u64,
-    end: u64,
-    rel_path: []const u8,
-    crc32: ?u32 = null,
-};
+const isRecoveryName = @import("assembly.zig").isRecoveryName;
+const FileManifest = @import("assembly.zig").FileManifest;
+const Part = @import("assembly.zig").Part;
+const allPartsPresent = @import("assembly.zig").allPartsPresent;
+const hasAnyPartPresent = @import("assembly.zig").hasAnyPartPresent;
+const hasUsableRepairFile = @import("assembly.zig").hasUsableRepairFile;
+const assembleRepairFiles = @import("assembly.zig").assembleRepairFiles;
+const sortPresentParts = @import("assembly.zig").sortPresentParts;
+const assembleDamagedFile = @import("assembly.zig").assembleDamagedFile;
+const cleanupRepairFiles = @import("assembly.zig").cleanupRepairFiles;
+const preadChunk = @import("assembly.zig").preadChunk;
+const pwriteAll = @import("assembly.zig").pwriteAll;
+const expectedFileCrc = @import("assembly.zig").expectedFileCrc;
+const validateRepairedFile = @import("assembly.zig").validateRepairedFile;
+const assembleFile = @import("assembly.zig").assembleFile;
+const validatePartRanges = @import("assembly.zig").validatePartRanges;
 
 const WorkItem = struct {
     file_index: usize,
@@ -292,6 +242,7 @@ const SharedCtx = struct {
     ca_store: *nntp.CaStore,
     control: *shutdown.DownloadControl,
     progress: *Progress,
+    workspace: ?*Budget = null,
     allow_repairable_errors: bool = false,
     mutex: std.Io.Mutex = .init,
     first_error: ?anyerror = null,
@@ -310,6 +261,7 @@ fn preflightPhase(
     sessions: []nntp.Session,
     control: *shutdown.DownloadControl,
     progress: *Progress,
+    workspace: *Budget,
 ) !void {
     if (files.len == 0) return;
     var ctx = SharedCtx{
@@ -323,6 +275,7 @@ fn preflightPhase(
         .ca_store = ca_store,
         .control = control,
         .progress = progress,
+        .workspace = workspace,
     };
     var next: std.atomic.Value(usize) = .init(0);
     const worker_count = @min(files.len, sessions.len);
@@ -426,6 +379,7 @@ fn downloadPhase(
     control: *shutdown.DownloadControl,
     progress: *Progress,
     allow_repairable_errors: bool,
+    workspace: *Budget,
 ) !void {
     var ctx = SharedCtx{
         .allocator = allocator,
@@ -438,6 +392,7 @@ fn downloadPhase(
         .ca_store = ca_store,
         .control = control,
         .progress = progress,
+        .workspace = workspace,
         .allow_repairable_errors = allow_repairable_errors,
     };
     var next: std.atomic.Value(usize) = .init(0);
@@ -520,14 +475,14 @@ fn fetchItemWithSession(
 fn watchDownload(progress: *Progress, control: *shutdown.DownloadControl, job_id: []const u8) std.Io.Cancelable!void {
     var last_warning: i64 = 0;
     while (!control.isCanceled()) {
-        const now = std.Io.Clock.real.now(control.io).toSeconds();
+        const now = shutdown.now(control.io);
         if (now >= control.deadline_seconds) {
             control.timeout();
             return;
         }
         if (now - last_warning >= 30) {
             const snapshot = progress.snapshot();
-            const quiet = now - snapshot.last_activity;
+            const quiet = now - snapshot.last_activity_tick;
             if (quiet >= 30) {
                 std.log.warn("job {s} possible stall: no segment or phase activity for {d}s ({d}/{d} segments)", .{ job_id, quiet, snapshot.completed, snapshot.total });
                 last_warning = now;
@@ -559,6 +514,7 @@ fn fetchItemOnce(
     var file_writer = out_file.writer(ctx.io, &file_buffer);
     var decoder = yenc.Decoder.init(ctx.allocator, &file_writer.interface, ctx.cfg.max_artifact_bytes);
     defer decoder.deinit();
+    decoder.workspace = ctx.workspace;
 
     if (session.tls == null) {
         try session.connect();
@@ -629,6 +585,7 @@ fn fetchItemOnce(
             .rel_path = rel_copy,
             .crc32 = meta.crc32,
         };
+        decoder.keep_reservation = true;
     }
 }
 
@@ -655,271 +612,10 @@ fn validateAggregate(manifest: []FileManifest, included: []const bool, included_
     }
 }
 
-fn allPartsPresent(parts: []const Part) bool {
-    for (parts) |part| if (part.rel_path.len == 0) return false;
-    return true;
-}
-
-fn hasAnyPartPresent(parts: []const Part) bool {
-    for (parts) |part| if (part.rel_path.len != 0) return true;
-    return false;
-}
-
-fn hasUsableRepairFile(manifest: []const FileManifest, included: []const bool) bool {
-    for (manifest, included) |file, keep| {
-        if (!keep and file.name.len != 0 and file.size > 0 and hasAnyPartPresent(file.parts)) return true;
-    }
-    return false;
-}
-
-fn assembleRepairFiles(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    output_root: []const u8,
-    manifest: []FileManifest,
-    included: []const bool,
-    control: *shutdown.DownloadControl,
-    progress: *Progress,
-) ![]const u8 {
-    var repair_name: ?[]const u8 = null;
-    for (manifest, included) |file, keep| {
-        if (keep or file.name.len == 0 or file.size == 0 or !hasAnyPartPresent(file.parts)) continue;
-        if (allPartsPresent(file.parts)) {
-            try validatePartRanges(file.parts, file.size);
-            try assembleFile(allocator, io, root_dir, output_root, file, control, progress);
-        } else {
-            try assembleDamagedFile(allocator, io, root_dir, output_root, file, control, progress);
-        }
-        if (repair_name == null or !isRecoveryName(file.name)) repair_name = file.name;
-    }
-    return repair_name orelse error.InsufficientPar2Data;
-}
-
-fn sortPresentParts(parts: []Part) void {
-    std.mem.sort(Part, parts, {}, struct {
-        fn lessThan(_: void, a: Part, b: Part) bool {
-            const a_present = a.rel_path.len != 0;
-            const b_present = b.rel_path.len != 0;
-            if (a_present != b_present) return a_present;
-            return a.begin < b.begin;
-        }
-    }.lessThan);
-}
-
-fn assembleDamagedFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    output_root: []const u8,
-    output: FileManifest,
-    control: *shutdown.DownloadControl,
-    progress: *Progress,
-) !void {
-    sortPresentParts(output.parts);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
-    defer allocator.free(final_path);
-    var out = try root_dir.createFile(io, final_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
-    defer out.close(io);
-    try out.setLength(io, output.size);
-    var previous_end: u64 = 0;
-    var buffer: [64 * 1024]u8 = undefined;
-    for (output.parts) |part| {
-        if (part.rel_path.len == 0) continue;
-        try checkCanceled(control);
-        if (part.begin <= previous_end or part.end < part.begin or part.end > output.size) return error.InvalidYencRange;
-        previous_end = part.end;
-        var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
-        defer input.close(io);
-        const size = try yenc.inclusiveRangeLength(part.begin, part.end);
-        var offset: u64 = 0;
-        while (offset < size) {
-            const chunk: usize = @intCast(@min(size - offset, buffer.len));
-            const read = try preadChunk(input, io, buffer[0..chunk], offset);
-            try pwriteAll(out, io, buffer[0..read], part.begin - 1 + offset);
-            offset += read;
-        }
-        progress.touch(io);
-    }
-    try out.sync(io);
-}
-
-fn cleanupRepairFiles(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    output_root: []const u8,
-    manifest: []const FileManifest,
-    included: []const bool,
-) void {
-    for (manifest, included) |file, keep| {
-        if (file.name.len == 0) continue;
-        if (!keep) {
-            const par_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, file.name }) catch continue;
-            defer allocator.free(par_path);
-            root_dir.deleteFile(io, par_path) catch {};
-            const par_bak = std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, file.name }) catch continue;
-            defer allocator.free(par_bak);
-            root_dir.deleteFile(io, par_bak) catch {};
-        } else {
-            const bak_path = std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, file.name }) catch continue;
-            defer allocator.free(bak_path);
-            root_dir.deleteFile(io, bak_path) catch {};
-        }
-    }
-}
-
-fn preadChunk(file: std.Io.File, io: std.Io, buffer: []u8, offset: u64) !usize {
-    const count = file.readPositional(io, &.{buffer}, offset) catch return error.DecodedPartChanged;
-    if (count == 0) return error.DecodedPartChanged;
-    return count;
-}
-
-fn pwriteAll(file: std.Io.File, io: std.Io, bytes: []const u8, start_offset: u64) !void {
-    file.writePositionalAll(io, bytes, start_offset) catch return error.DecodedPartChanged;
-}
-
-fn repairWithPar2(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    output_root: []const u8,
-    repair_name: []const u8,
-    control: *shutdown.DownloadControl,
-) !void {
-    try checkCanceled(control);
-    var output_dir = try root_dir.openDir(io, output_root, .{ .follow_symlinks = false });
-    defer output_dir.close(io);
-    const remaining = control.deadline_seconds - std.Io.Clock.real.now(io).toSeconds();
-    if (remaining <= 0) return error.Timeout;
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "/usr/bin/par2", "repair", "-q", "--", repair_name },
-        .cwd = .{ .dir = output_dir },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(remaining) } },
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return,
-        else => {},
-    }
-    try checkCanceled(control);
-    const message = std.mem.trim(u8, result.stderr, " \t\r\n");
-    if (message.len != 0) std.log.err("PAR2 repair failed: {s}", .{message});
-    return error.Par2RepairFailed;
-}
-
-fn expectedFileCrc(parts: []const Part) !?u32 {
-    var expected: ?u32 = null;
-    for (parts) |part| {
-        if (part.crc32) |crc| {
-            if (expected) |prev| {
-                if (prev != crc) return error.InconsistentYencMetadata;
-            } else {
-                expected = crc;
-            }
-        }
-    }
-    return expected;
-}
-
-fn validateRepairedFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    output_root: []const u8,
-    output: FileManifest,
-) !void {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
-    defer allocator.free(path);
-    var file = try root_dir.openFile(io, path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
-    defer file.close(io);
-    if (try file.length(io) != output.size) return error.Par2RepairFailed;
-    const expected = try expectedFileCrc(output.parts);
-    if (!allPartsPresent(output.parts) and expected == null) {
-        const bak_path = try std.fmt.allocPrint(allocator, "{s}/{s}.1", .{ output_root, output.name });
-        defer allocator.free(bak_path);
-        var bak = root_dir.openFile(io, bak_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true }) catch
-            return error.Par2RepairFailed;
-        bak.close(io);
-    }
-    if (expected) |crc| {
-        var actual: std.hash.Crc32 = .init();
-        var buffer: [64 * 1024]u8 = undefined;
-        var offset: u64 = 0;
-        while (offset < output.size) {
-            const chunk: usize = @intCast(@min(output.size - offset, buffer.len));
-            const read = preadChunk(file, io, buffer[0..chunk], offset) catch return error.Par2RepairFailed;
-            actual.update(buffer[0..read]);
-            offset += read;
-        }
-        if (actual.final() != crc) return error.YencCrcMismatch;
-    }
-}
-
 fn zipEnvelope(num_entries: usize) u64 {
     const per_entry: u64 = 30 + 46 + 24 + 510;
     const overhead: u64 = 22 + 56 + 20;
     return per_entry * @as(u64, @intCast(num_entries)) + overhead;
-}
-
-fn assembleFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root_dir: std.Io.Dir,
-    output_root: []const u8,
-    output: FileManifest,
-    control: *shutdown.DownloadControl,
-    progress: *Progress,
-) !void {
-    try checkCanceled(control);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ output_root, output.name });
-    defer allocator.free(final_path);
-    var out = try root_dir.createFile(io, final_path, .{ .exclusive = true, .permissions = @enumFromInt(0o600) });
-    defer out.close(io);
-    var out_buffer: [64 * 1024]u8 = undefined;
-    var writer = out.writer(io, &out_buffer);
-    var reader_buf: [64 * 1024]u8 = undefined;
-    const expected_crc = try expectedFileCrc(output.parts);
-    var file_crc: std.hash.Crc32 = .init();
-    for (output.parts) |part| {
-        try checkCanceled(control);
-        var input = try root_dir.openFile(io, part.rel_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
-        defer input.close(io);
-        const size = try yenc.inclusiveRangeLength(part.begin, part.end);
-        var remaining = size;
-        var off: u64 = 0;
-        while (remaining > 0) {
-            const chunk: usize = @intCast(@min(remaining, reader_buf.len));
-            const n = try preadChunk(input, io, reader_buf[0..chunk], off);
-            file_crc.update(reader_buf[0..n]);
-            try writer.interface.writeAll(reader_buf[0..n]);
-            remaining -= n;
-            off += n;
-        }
-        progress.touch(io);
-    }
-    try writer.interface.flush();
-    try out.sync(io);
-    if (expected_crc) |crc| {
-        if (file_crc.final() != crc) return error.YencCrcMismatch;
-    }
-}
-
-fn validatePartRanges(parts: []Part, size: u64) !void {
-    std.mem.sort(Part, parts, {}, struct {
-        fn lessThan(_: void, a: Part, b: Part) bool {
-            return a.begin < b.begin;
-        }
-    }.lessThan);
-    var expected: u64 = 1;
-    for (parts) |part| {
-        if (part.begin != expected or part.end < part.begin or part.end > size) return error.InvalidYencRange;
-        expected = std.math.add(u64, part.end, 1) catch return error.InvalidYencRange;
-    }
-    if (expected != std.math.add(u64, size, 1) catch return error.InvalidYencRange) return error.InvalidYencRange;
 }
 
 fn rejectDuplicateNames(outputs: []FileManifest, included: []const bool) !void {
@@ -942,10 +638,6 @@ fn rejectUnsupportedSet(outputs: []FileManifest, included: []const bool, include
 
 fn isRepairName(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".par2");
-}
-
-fn isRecoveryName(name: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(name, ".vol") != null and std.ascii.endsWithIgnoreCase(name, ".par2");
 }
 
 fn subjectFileName(subject: []const u8) ?[]const u8 {
@@ -982,7 +674,7 @@ fn splitName(name: []const u8) bool {
 fn checkCanceled(control: *shutdown.DownloadControl) !void {
     if (control.isTimedOut()) return error.Timeout;
     if (control.isCanceled()) return error.Canceled;
-    if (std.Io.Clock.real.now(control.io).toSeconds() >= control.deadline_seconds) {
+    if (shutdown.now(control.io) >= control.deadline_seconds) {
         control.timeout();
         return error.Timeout;
     }

@@ -8,10 +8,10 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration import yenc_encode, FakeNNTPServer, generate_certs
+from support import yenc_encode, FakeNNTPServer, generate_certs, free_port
 
-CONTAINER_PORT = 13371
-IMAGE = "nzbunny:test"
+CONTAINER_PORT = free_port()
+IMAGE = os.environ.get("NZBUNNY_TEST_IMAGE", "nzbunny:test")
 
 def http_get(url):
     with urllib.request.urlopen(url, timeout=5) as resp:
@@ -50,8 +50,8 @@ def build_nzb(file_segments):
     return "\n".join(xml).encode("utf-8")
 
 def wait_for_ready(base_url, timeout=15):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             status, _, _ = http_get(f"{base_url}/readyz")
             if status == 200:
@@ -101,7 +101,7 @@ def main():
             "-e", "NNTP_TIMEOUT=10s",
             "-e", "DOWNLOAD_TIMEOUT=30s",
             IMAGE,
-        ]).decode().strip()
+        ], timeout=20).decode().strip()
         base_url = f"http://127.0.0.1:{CONTAINER_PORT}"
 
         try:
@@ -138,14 +138,14 @@ def main():
             print(f"[smoke] Artifact verified: {len(content)} bytes match")
 
             print("[smoke] Testing SIGTERM shutdown...")
-            start = time.time()
+            start = time.monotonic()
             subprocess.run(["docker", "stop", container_id], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
             assert elapsed < 5, f"Shutdown took {elapsed:.1f}s, expected < 5s"
             print(f"[smoke] Shutdown OK ({elapsed:.1f}s)")
 
         finally:
-            subprocess.run(["docker", "kill", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["docker", "kill", container_id], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             server.stop()
 
     print("[smoke] All stages passed")

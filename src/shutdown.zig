@@ -1,14 +1,26 @@
 const std = @import("std");
 const config = @import("config.zig");
 
-pub var requested: std.atomic.Value(bool) = .init(false);
-pub var wake_worker: std.atomic.Value(bool) = .init(false);
+pub const State = struct {
+    requested: std.atomic.Value(bool) = .init(false),
+    wake_worker: std.atomic.Value(bool) = .init(false),
 
-pub fn notifyWorker() void {
-    wake_worker.store(true, .release);
-}
+    pub fn notifyWorker(self: *State) void {
+        self.wake_worker.store(true, .release);
+    }
 
-pub fn installSignalHandlers() void {
+    pub fn waitForRequest(self: *State, io: std.Io, seconds: i64) std.Io.Cancelable!void {
+        const deadline = now(io) + seconds;
+        while (!self.requested.load(.acquire) and !self.wake_worker.swap(false, .acq_rel) and now(io) < deadline)
+            try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+    }
+};
+
+// A signal handler cannot capture application state. This is its only bridge.
+var signal_state: ?*State = null;
+
+pub fn installSignalHandlers(state: *State) void {
+    signal_state = state;
     const action: std.posix.Sigaction = .{
         .handler = .{ .handler = handleSignal },
         .mask = std.posix.sigemptyset(),
@@ -18,19 +30,28 @@ pub fn installSignalHandlers() void {
     std.posix.sigaction(.INT, &action, null);
 }
 
-fn handleSignal(_: std.posix.SIG) callconv(.c) void {
-    requested.store(true, .release);
+pub fn uninstallSignalHandlers() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.TERM, &action, null);
+    std.posix.sigaction(.INT, &action, null);
+    signal_state = null;
 }
 
-pub fn waitForRequest(io: std.Io, seconds: i64) std.Io.Cancelable!void {
-    const now = std.Io.Clock.real.now(io).toSeconds();
-    const deadline = std.math.add(i64, now, seconds) catch std.math.maxInt(i64);
-    while (!requested.load(.acquire) and !wake_worker.swap(false, .acq_rel) and std.Io.Clock.real.now(io).toSeconds() < deadline)
-        try std.Io.sleep(io, .fromMilliseconds(100), .awake);
+fn handleSignal(_: std.posix.SIG) callconv(.c) void {
+    if (signal_state) |state| state.requested.store(true, .release);
+}
+
+pub fn now(io: std.Io) i64 {
+    return std.Io.Clock.awake.now(io).toSeconds();
 }
 
 pub const DownloadControl = struct {
     io: std.Io,
+    state: ?*State = null,
     deadline_seconds: i64,
     canceled: std.atomic.Value(bool) = .init(false),
     timed_out: std.atomic.Value(bool) = .init(false),
@@ -42,7 +63,9 @@ pub const DownloadControl = struct {
     }
 
     pub fn isCanceled(self: *DownloadControl) bool {
-        if (requested.load(.acquire)) self.cancel();
+        if (self.state) |state| {
+            if (state.requested.load(.acquire)) self.cancel();
+        }
         return self.canceled.load(.acquire);
     }
 
@@ -91,13 +114,13 @@ pub const DownloadControl = struct {
     }
 
     pub fn wait(self: *DownloadControl, seconds: i64) !void {
-        const end = std.math.add(i64, std.Io.Clock.real.now(self.io).toSeconds(), seconds) catch self.deadline_seconds;
+        const end = std.math.add(i64, now(self.io), seconds) catch self.deadline_seconds;
         while (true) {
             if (self.isTimedOut()) return error.Timeout;
             if (self.isCanceled()) return error.Canceled;
-            const now = std.Io.Clock.real.now(self.io).toSeconds();
-            if (now >= end or now >= self.deadline_seconds) {
-                if (now >= self.deadline_seconds) self.timeout();
+            const current = now(self.io);
+            if (current >= end or current >= self.deadline_seconds) {
+                if (current >= self.deadline_seconds) self.timeout();
                 return;
             }
             std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch return error.Canceled;

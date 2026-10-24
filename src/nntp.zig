@@ -82,8 +82,8 @@ pub const Session = struct {
         self.deinit();
         errdefer self.deinit();
         try std.Io.net.HostName.validate(self.host);
-        try self.runWithDeadline(connectTransport, .{self});
-        try self.runWithDeadline(initializeTls, .{self});
+        try self.runWithDeadline(connectTransport, .{self}, true);
+        try self.runWithDeadline(initializeTls, .{self}, false);
         const greeting_code = try self.readStatus();
         if (greeting_code.code != 200 and greeting_code.code != 201) return error.NntpGreetingFailed;
         try self.authenticate();
@@ -108,7 +108,7 @@ pub const Session = struct {
         switch (status.classifyBody()) {
             .ok => {
                 const seconds = try self.operationTimeoutSeconds();
-                const now = std.Io.Clock.real.now(self.io).toSeconds();
+                const now = shutdown.now(self.io);
                 self.body_deadline = std.math.add(i64, now, seconds) catch null;
                 return;
             },
@@ -125,7 +125,7 @@ pub const Session = struct {
             if (control.isTimedOut()) return error.Timeout;
             if (control.isCanceled()) return error.Canceled;
         }
-        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        const now = shutdown.now(self.io);
         if (self.control) |control| {
             if (now >= control.deadline_seconds) {
                 control.timeout();
@@ -203,7 +203,7 @@ pub const Session = struct {
         const stream = while (attempts < self.endpoint_count) : (attempts += 1) {
             const index = self.endpoint_index % self.endpoint_count;
             self.endpoint_index +%= 1;
-            break connectEndpointWithTimeout(&self.endpoints[index], timeout_seconds) catch |err| {
+            break self.connectEndpointWithTimeout(&self.endpoints[index], timeout_seconds) catch |err| {
                 last_error = err;
                 continue;
             };
@@ -237,23 +237,43 @@ pub const Session = struct {
         try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, tv_bytes[0..@sizeOf(@TypeOf(tv))]);
     }
 
-    fn connectEndpointWithTimeout(endpoint: *const std.Io.net.IpAddress, timeout_seconds: i64) !std.Io.net.Stream {
+    fn connectEndpointWithTimeout(self: *Session, endpoint: *const std.Io.net.IpAddress, timeout_seconds: i64) !std.Io.net.Stream {
         const family = std.Io.Threaded.posixAddressFamily(endpoint);
-        const rc = std.posix.system.socket(family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        const rc = std.posix.system.socket(family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0);
         if (std.posix.errno(rc) != .SUCCESS) return error.NntpTransportFailure;
         const fd: std.posix.fd_t = @intCast(rc);
         errdefer _ = std.posix.system.close(fd);
         try setFdTimeouts(fd, timeout_seconds);
         var storage: std.Io.Threaded.PosixAddress = undefined;
         var addr_len = std.Io.Threaded.addressToPosix(endpoint, &storage);
-        while (true) {
-            switch (std.posix.errno(std.posix.system.connect(fd, &storage.any, addr_len))) {
-                .SUCCESS => break,
-                .INTR => continue,
-                .AGAIN, .INPROGRESS, .TIMEDOUT => return error.NntpOperationTimeout,
-                else => return error.ConnectionRefused,
-            }
+        const deadline = shutdown.now(self.io) + timeout_seconds;
+        const connect_error = std.posix.errno(std.posix.system.connect(fd, &storage.any, addr_len));
+        switch (connect_error) {
+            .SUCCESS => {},
+            .INPROGRESS, .AGAIN, .INTR => {
+                while (true) {
+                    if (self.control) |control| {
+                        if (control.isTimedOut()) return error.Timeout;
+                        if (control.isCanceled()) return error.Canceled;
+                    }
+                    if (shutdown.now(self.io) >= deadline) return error.NntpOperationTimeout;
+                    var poll_fd: std.posix.pollfd = .{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 };
+                    const ready = try std.posix.poll((&poll_fd)[0..1], 100);
+                    if (ready == 0) continue;
+                    var socket_error: c_int = 0;
+                    var error_len: std.posix.socklen_t = @sizeOf(c_int);
+                    if (std.os.linux.errno(std.os.linux.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&socket_error), &error_len)) != .SUCCESS or socket_error != 0)
+                        return error.ConnectionRefused;
+                    break;
+                }
+            },
+            else => return error.ConnectionRefused,
         }
+        const flags = std.os.linux.fcntl(fd, std.posix.F.GETFL, 0);
+        if (std.os.linux.errno(flags) != .SUCCESS) return error.NntpTransportFailure;
+        const nonblock_mask: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+        if (std.os.linux.errno(std.os.linux.fcntl(fd, std.posix.F.SETFL, flags & ~@as(usize, nonblock_mask))) != .SUCCESS)
+            return error.NntpTransportFailure;
         _ = std.posix.system.getsockname(fd, &storage.any, &addr_len);
         return .{ .socket = .{ .handle = fd, .address = std.Io.Threaded.addressFromPosix(&storage) } };
     }
@@ -305,7 +325,7 @@ pub const Session = struct {
     }
 
     fn sendParts(self: *Session, first: []const u8, second: []const u8, third: []const u8) !void {
-        try self.runWithDeadline(sendPartsStage, .{ self, first, second, third });
+        try self.runWithDeadline(sendPartsStage, .{ self, first, second, third }, false);
     }
 
     fn sendPartsStage(self: *Session, first: []const u8, second: []const u8, third: []const u8) !void {
@@ -334,7 +354,7 @@ pub const Session = struct {
 
     fn readStatus(self: *Session) !Status {
         var result: ?Status = null;
-        try self.runWithDeadline(readStatusStage, .{ self, &result });
+        try self.runWithDeadline(readStatusStage, .{ self, &result }, false);
         return result orelse error.NntpReadFailed;
     }
 
@@ -360,14 +380,15 @@ pub const Session = struct {
         result.* = try parseStatusLine(buffer[0..len]);
     }
 
-    fn runWithDeadline(self: *Session, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) !void {
+    fn runWithDeadline(self: *Session, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function)), comptime connecting: bool) !void {
         const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
         const Outcome = union(enum) {
             operation: Result,
             timeout: std.Io.Cancelable!void,
+            stopping: std.Io.Cancelable!void,
         };
         const seconds = try self.operationTimeoutSeconds();
-        var outcomes: [2]Outcome = undefined;
+        var outcomes: [3]Outcome = undefined;
         var select = std.Io.Select(Outcome).init(self.io, &outcomes);
         var timed_out = false;
         defer {
@@ -376,13 +397,18 @@ pub const Session = struct {
         }
         try select.concurrent(.operation, function, args);
         try select.concurrent(.timeout, waitForDeadline, .{ self.io, seconds });
+        if (self.control != null) try select.concurrent(.stopping, waitForStop, .{self});
         switch (try select.await()) {
             .operation => |result| result catch |err| return self.normalizeTransportError(err),
+            .stopping => {
+                if (!connecting) if (self.stream) |stream| stream.shutdown(self.io, .both) catch {};
+                return if (self.control.?.isTimedOut()) error.Timeout else error.Canceled;
+            },
             .timeout => {
                 timed_out = true;
-                if (self.stream) |stream| stream.shutdown(self.io, .both) catch {};
+                if (!connecting) if (self.stream) |stream| stream.shutdown(self.io, .both) catch {};
                 if (self.control) |control| {
-                    if (std.Io.Clock.real.now(self.io).toSeconds() >= control.deadline_seconds) {
+                    if (shutdown.now(self.io) >= control.deadline_seconds) {
                         control.timeout();
                         return error.Timeout;
                     }
@@ -392,12 +418,17 @@ pub const Session = struct {
         }
     }
 
+    fn waitForStop(self: *Session) std.Io.Cancelable!void {
+        while (!self.control.?.isCanceled())
+            try std.Io.sleep(self.io, .fromMilliseconds(100), .awake);
+    }
+
     fn operationTimeoutSeconds(self: *Session) !i64 {
         if (self.control) |control| {
             if (control.isTimedOut()) return error.Timeout;
             if (control.isCanceled()) return error.Canceled;
         }
-        const now = std.Io.Clock.real.now(self.io).toSeconds();
+        const now = shutdown.now(self.io);
         const configured_deadline = std.math.add(i64, now, self.timeout_seconds) catch return error.NntpOperationTimeout;
         const deadline = if (self.control) |control| @min(configured_deadline, control.deadline_seconds) else configured_deadline;
         if (now >= deadline) {

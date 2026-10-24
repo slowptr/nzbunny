@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM debian:bookworm-slim AS build
+FROM debian:bookworm-slim AS toolchain
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils libsqlite3-dev libarchive-dev libxml2-dev pkg-config \
@@ -24,6 +24,18 @@ RUN case "$TARGETARCH" in \
     && rm /tmp/zig.tar.xz
 
 WORKDIR /src
+ENV ZIG_GLOBAL_CACHE_DIR=/tmp/nzbunny-zig-global
+
+FROM toolchain AS test
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 par2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY . .
+ARG TEST_OPTIMIZE=Debug
+RUN /opt/zig/zig fmt --check build.zig src \
+    && /opt/zig/zig build test -Doptimize=${TEST_OPTIMIZE} --summary all
+
+FROM toolchain AS build
 COPY build.zig build.zig.zon ./
 COPY src ./src
 RUN /opt/zig/zig build -Doptimize=ReleaseSafe --prefix /out

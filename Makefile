@@ -1,4 +1,4 @@
-.PHONY: build run dev test fmt clean
+.PHONY: build run dev test check test-container smoke fmt clean
 
 build:
 	zig build -Doptimize=ReleaseSafe
@@ -11,6 +11,18 @@ dev:
 
 test:
 	zig build test
+
+check:
+	zig fmt --check build.zig src
+	zig build test
+	zig build test -Doptimize=ReleaseSafe
+
+test-container:
+	docker build --target test --progress=plain .
+
+smoke:
+	docker build -t nzbunny:test .
+	python3 tests/smoke.py
 
 fmt:
 	zig fmt build.zig src

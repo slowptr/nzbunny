@@ -10,3 +10,6 @@
 /deploy/incomplete-downloads/
 /.pi-subagents/
 /tests/__pycache__/
+
+__pycache__/
+*.pyc
