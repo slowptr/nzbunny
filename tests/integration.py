@@ -674,6 +674,29 @@ def main():
             assert code == 200
             assert seg0_repaired_content == repairable_data
             server.missing_articles.remove(first_msg)
+
+            # Verify a completely missing payload file in a multi-file PAR2 set fails instead of being silently omitted
+            totally_missing_msg = "totally-missing-payload@nzbunny.test"
+            server.missing_articles.add(totally_missing_msg)
+            omission_nzb_files = [
+                [(1, len(data_first) + 200, first_msg), (2, len(data_second) + 200, second_msg)],
+                [(1, 500, totally_missing_msg)],
+            ] + repair_nzb_files[1:]
+            omission_nzb = build_nzb(omission_nzb_files)
+            code, loc = http_post_file("http://127.0.0.1:13370/", "omission.nzb", omission_nzb)
+            assert code == 303, (code, loc)
+            omission_id = loc.split("/")[-1]
+            omission_failed = False
+            for _ in range(50):
+                _, html, _ = http_get(f"http://127.0.0.1:13370/job/{omission_id}")
+                html_str = html.decode("utf-8")
+                assert "COMPLETE" not in html_str, "Job with completely missing payload file must not complete with omitted file"
+                if "FAILED" in html_str:
+                    omission_failed = True
+                    break
+                time.sleep(0.2)
+            assert omission_failed, "Job with completely missing payload file did not fail"
+            server.missing_articles.remove(totally_missing_msg)
         except Exception:
             proc.kill()
             stdout, stderr = proc.communicate()
